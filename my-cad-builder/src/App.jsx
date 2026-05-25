@@ -293,7 +293,7 @@ export default function App() {
       <div className="flex-1 overflow-auto p-12 flex justify-center items-start bg-gray-50" onMouseUp={handleMouseUp}>
         <div className="bg-white shadow-2xl border border-gray-200 relative" 
           style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
-          // App.jsx 하단 그리드 렌더링 부분
+          
 {grid.map((row, rIdx) => row.map((cell, cIdx) => {
   const inPreview = isInsidePreview(rIdx, cIdx);
   let bgColor = cell === 1 ? "bg-black" : cell === 2 ? "bg-gray-300" : "bg-white";
