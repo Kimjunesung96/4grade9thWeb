@@ -1,0 +1,65 @@
+import React from 'react';
+
+export default function BuilderDashboard() {
+  return (
+    <div className="flex h-screen bg-gray-50">
+      
+      {/* 1. 좌측 사이드바 */}
+      <aside className="w-64 bg-white border-r flex flex-col">
+        <div className="p-6 font-black text-2xl text-blue-600 border-b">
+          🏗️ MY CAD
+        </div>
+        <nav className="flex-col p-4 space-y-2 text-gray-700 font-semibold">
+          <button className="w-full text-left p-3 bg-blue-50 text-blue-600 rounded-lg">🏠 홈</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📐 디자인</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📁 컬렉션</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📚 튜토리얼</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">🏆 랭킹</button>
+        </nav>
+      </aside>
+
+      {/* 2. 우측 메인 대시보드 */}
+      <main className="flex-1 p-8 overflow-y-auto">
+        <header className="flex justify-end mb-8">
+          <button className="bg-blue-600 text-white px-4 py-2 rounded-full font-bold shadow-md hover:bg-blue-700">
+            + 만들기
+          </button>
+        </header>
+
+        {/* 상단 섹션: 3D 구조물 외형 */}
+        <section className="mb-12">
+          <h2 className="text-2xl font-bold mb-6 text-gray-800">🏢 구조물 or 건축물 외형</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* 카드 컴포넌트 예시 */}
+            <div className="h-56 bg-white border rounded-xl shadow-sm hover:shadow-lg transition cursor-pointer flex flex-col">
+              <div className="h-3/4 bg-gray-200 rounded-t-xl flex items-center justify-center text-gray-400">
+                [3D 미리보기 이미지]
+              </div>
+              <div className="p-4 font-semibold text-gray-700">내 첫 번째 대저택</div>
+            </div>
+          </div>
+        </section>
+
+        {/* 하단 섹션: 2D 집 설계도면 */}
+        <section>
+          <h2 className="text-2xl font-bold mb-6 text-gray-800">📝 집 설계도면</h2>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            {/* 새 도면 만들기 카드 */}
+            <div className="h-40 bg-blue-50 border border-blue-200 rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex items-center justify-center flex-col text-blue-600">
+              <span className="text-3xl mb-2">➕</span>
+              <span className="font-bold">새 50x50 도면 그리기</span>
+            </div>
+            {/* 기존 도면 카드 */}
+            <div className="h-40 bg-white border rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex flex-col">
+              <div className="h-2/3 bg-gray-100 rounded-t-xl p-2 text-xs text-gray-400 overflow-hidden">
+                [격자 도면 미니맵]
+              </div>
+              <div className="p-3 font-semibold text-gray-700 text-sm">1층 평면도_완성본</div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  );
+}
