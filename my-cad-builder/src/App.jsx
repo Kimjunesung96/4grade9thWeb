@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { supabase } from './supabaseClient'; // 🎯 슈퍼베이스 연결 자재 반입
 
 /**
  * 🌊 플러드 필(Flood Fill) 알고리즘
@@ -28,7 +29,7 @@ const formatID = (val) => {
 };
 
 /**
- * 💾 1. 유니티용 12칸 표준 CSV 저장 (벽 5단 적층 / 바닥 1단)
+ * 💾 1. 유니티용 CSV 저장
  */
 const exportToCSV = (grid) => {
   let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
@@ -64,7 +65,7 @@ const exportToCSV = (grid) => {
 };
 
 /**
- * 🖼️ 2. 500px 정밀 PNG 저장 (10배 확장)
+ * 🖼️ 2. 정밀 PNG 저장
  */
 const exportToPNG = (grid) => {
   const cellSize = 10;
@@ -121,6 +122,29 @@ export default function App() {
   const [currentPos, setCurrentPos] = useState(null);
   const [bgImage, setBgImage] = useState(null);     
   const [showBg, setShowBg] = useState(true);
+
+  // 🚀 클라우드 자랑하기 (Supabase 업로드)
+  const uploadToShowcase = async () => {
+    const title = prompt("전시할 작품의 이름을 지어주세요!", "미래도시 프로젝트 #1");
+    if (!title) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('blueprints')
+        .insert([
+          { 
+            name: title, 
+            grid_data: grid, 
+            thumbnail_url: "" 
+          }
+        ]);
+
+      if (error) throw error;
+      alert("🚀 온라인 전시관에 작품이 게시되었습니다!");
+    } catch (error) {
+      alert("❌ 업로드 실패: " + error.message);
+    }
+  };
 
   const saveHistory = () => {
     setHistory((prev) => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
@@ -189,7 +213,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [history]);
 
-  // 🧱 [VIEW 1] 에디터 화면 (모든 기능 포함)
+  // 🧱 [VIEW 1] 에디터 화면
   if (view === 'editor') {
     return (
       <div className="h-screen w-screen bg-gray-100 flex flex-col overflow-hidden text-gray-800 select-none">
@@ -217,6 +241,8 @@ export default function App() {
             )}
           </div>
           <div className="flex space-x-2">
+            {/* 🚀 자랑하기 버튼 */}
+            <button onClick={uploadToShowcase} className="px-4 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-lg font-bold shadow-md hover:scale-105 transition-transform">🌐 클라우드 자랑하기</button>
             <button onClick={() => exportToPNG(grid)} className="px-4 py-2 bg-emerald-600 text-white rounded-lg font-bold shadow-md hover:bg-emerald-700">PNG 저장</button>
             <button onClick={() => exportToCSV(grid)} className="px-4 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md hover:bg-blue-700">CSV 저장</button>
           </div>
@@ -243,7 +269,7 @@ export default function App() {
     );
   }
 
-  // 🏠 [VIEW 2] 팅커캐드 스타일 대시보드
+  // 🏠 [VIEW 2] 대시보드
   return (
     <div className="flex h-screen bg-gray-50 text-gray-800">
       <aside className="w-64 bg-white border-r flex flex-col">

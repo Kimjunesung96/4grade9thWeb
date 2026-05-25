@@ -1,0 +1,12 @@
+anon public
+
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJjZWZ3Y2tvdHNpanFkdHNsbnRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2NzAyNzQsImV4cCI6MjA5NTI0NjI3NH0.kPdEQ4iFM4T5Z8wtTkBpdQFxJFfhlNkAe2VTBIDYbVg
+
+default
+
+sb_publishable_kRbYl1G3QUbie0jmIF577g_9IrxDLZy
+
+
+api url
+
+https://bcefwckotsijqdtslntf.supabase.co/rest/v1/
