@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { supabase } from './supabaseClient'; // 🎯 슈퍼베이스 연결 자재 반입
+import { supabase } from './supabaseClient';
+import CryptoJS from 'crypto-js';
 
 /**
  * 🌊 플러드 필(Flood Fill) 알고리즘
@@ -40,7 +41,6 @@ const exportToCSV = (grid) => {
         const zCoord = rIdx * 3 + 1.5;
         const idX = formatID(xCoord * 10); 
         const idZ = formatID(zCoord * 10);
-
         if (cell === 1) { // 🧱 벽 - 5단 적층
           for (let n = 1; n <= 5; n++) {
             const yCoord = n * 3 - 1.5; 
@@ -113,7 +113,13 @@ const importPNGToGrid = (file, callback) => {
 };
 
 export default function App() {
-  const [view, setView] = useState('dashboard');
+  // 👤 배틀넷 유저 세션
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('auth'); // auth, dashboard, editor
+  const [authMode, setAuthMode] = useState('login'); 
+  const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
+
+  // 📐 에디터 상태
   const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
   const [mode, setMode] = useState('wall_rect'); 
   const [isDrawing, setIsDrawing] = useState(false);
@@ -123,65 +129,63 @@ export default function App() {
   const [bgImage, setBgImage] = useState(null);     
   const [showBg, setShowBg] = useState(true);
 
-  // 🚀 클라우드 자랑하기 (Supabase 업로드)
+  // 📁 대시보드 데이터
+  const [blueprints, setBlueprints] = useState([]);
+
+  // 🔐 암호화 & 인증 로직
+  const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
+
+  const handleSignUp = async () => {
+    const { error } = await supabase.from('users').insert([{ 
+      username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email 
+    }]);
+    if (error) alert("이미 존재하는 ID입니다.");
+    else { alert("Account Created! Please Login."); setAuthMode('login'); }
+  };
+
+  const handleLogin = async () => {
+    const { data, error } = await supabase.from('users')
+      .select('*').eq('username', authForm.id).eq('password_hash', hashPw(authForm.pw)).single();
+    if (data) { setUser(data); setView('dashboard'); }
+    else alert("아이디 혹은 비밀번호가 틀립니다.");
+  };
+
+  const fetchBlueprints = async () => {
+    const { data } = await supabase.from('blueprints').select('*').order('created_at', { ascending: false });
+    setBlueprints(data || []);
+  };
+
+  useEffect(() => { if (view === 'dashboard') fetchBlueprints(); }, [view]);
+
+  // 🚀 클라우드 업로드
   const uploadToShowcase = async () => {
-    const title = prompt("전시할 작품의 이름을 지어주세요!", "미래도시 프로젝트 #1");
+    if (!user) return;
+    const title = prompt("작품 이름을 지어주세요!", "New Project");
     if (!title) return;
-
-    try {
-      const { data, error } = await supabase
-        .from('blueprints')
-        .insert([
-          { 
-            name: title, 
-            grid_data: grid, 
-            thumbnail_url: "" 
-          }
-        ]);
-
-      if (error) throw error;
-      alert("🚀 온라인 전시관에 작품이 게시되었습니다!");
-    } catch (error) {
-      alert("❌ 업로드 실패: " + error.message);
-    }
+    const { error } = await supabase.from('blueprints').insert([{ 
+      name: title, grid_data: grid, user_id: user.id, author: user.username 
+    }]);
+    if (!error) { alert("창고에 입고되었습니다!"); setView('dashboard'); }
   };
 
-  const saveHistory = () => {
-    setHistory((prev) => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
-  };
-
-  const undo = () => {
-    if (history.length === 0) return;
-    setGrid(history[history.length - 1]);
-    setHistory((prev) => prev.slice(0, -1));
-  };
-
-  const handleImportPNG = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    setBgImage(url);
-    setShowBg(true);
-    importPNGToGrid(file, (newGrid) => {
-      saveHistory();
-      setGrid(newGrid);
-    });
-    e.target.value = '';
-  };
+  // 🎨 그리드 에디터 로직
+  const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
+  const undo = () => { if (history.length === 0) return; setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
 
   const handleMouseDown = (r, c) => {
     saveHistory();
-    setIsDrawing(true);
-    setStartPos({ r, c });
-    setCurrentPos({ r, c });
-    if (mode === 'fill_wall' || mode === 'fill_floor') {
-      const val = mode === 'fill_wall' ? 1 : 2;
-      setGrid(floodFill(grid, r, c, val));
+    setIsDrawing(true); setStartPos({ r, c }); setCurrentPos({ r, c });
+    if (mode.includes('fill')) {
+      setGrid(floodFill(grid, r, c, mode === 'fill_wall' ? 1 : 2));
       setIsDrawing(false);
     }
   };
-
-  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c }); };
+  // [추가] 마우스가 격자 위를 지나갈 때 실시간 좌표 업데이트
+const handleMouseEnter = (r, c) => {
+  if (isDrawing) {
+    setCurrentPos({ r, c });
+  }
+};
 
   const handleMouseUp = () => {
     if (isDrawing && mode.includes('rect') && startPos && currentPos) {
@@ -190,9 +194,7 @@ export default function App() {
       const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
       for (let r = startR; r <= endR; r++) {
         for (let c = startC; c <= endC; c++) {
-          if (mode === 'wall_rect') newGrid[r][c] = 1;
-          else if (mode === 'floor_rect') newGrid[r][c] = 2;
-          else if (mode === 'rect_eraser') newGrid[r][c] = 0;
+          newGrid[r][c] = mode === 'wall_rect' ? 1 : mode === 'floor_rect' ? 2 : 0;
         }
       }
       setGrid(newGrid);
@@ -207,105 +209,121 @@ export default function App() {
     return r >= startR && r <= endR && c >= startC && c <= endC;
   };
 
-  useEffect(() => {
-    const handleKeyDown = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'z') undo(); };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [history]);
-
-  // 🧱 [VIEW 1] 에디터 화면
-  if (view === 'editor') {
+  // 🖥️ [View 0] Battle.net Login
+  if (view === 'auth') {
     return (
-      <div className="h-screen w-screen bg-gray-100 flex flex-col overflow-hidden text-gray-800 select-none">
-        <header className="p-4 bg-white border-b flex justify-between items-center shadow-sm">
-          <div className="flex items-center space-x-3">
-            <button onClick={() => setView('dashboard')} className="text-gray-400 hover:text-black font-bold mr-2">◀ BACK</button>
-            <div className="flex bg-gray-100 p-1 rounded-lg border">
-              <button onClick={() => setMode('wall_rect')} className={`px-3 py-1.5 rounded-md text-xs font-bold ${mode === 'wall_rect' ? 'bg-black text-white' : 'text-gray-500'}`}>🧱 벽(Rect)</button>
-              <button onClick={() => setMode('floor_rect')} className={`px-3 py-1.5 rounded-md text-xs font-bold ${mode === 'floor_rect' ? 'bg-gray-400 text-white' : 'text-gray-500'}`}>🏁 바닥(Rect)</button>
-            </div>
-            <div className="flex bg-gray-100 p-1 rounded-lg border">
-              <button onClick={() => setMode('fill_wall')} className={`px-3 py-1.5 rounded-md text-xs font-bold ${mode === 'fill_wall' ? 'bg-orange-600 text-white' : 'text-gray-500'}`}>🪣 벽채우기</button>
-              <button onClick={() => setMode('fill_floor')} className={`px-3 py-1.5 rounded-md text-xs font-bold ${mode === 'fill_floor' ? 'bg-orange-400 text-white' : 'text-gray-500'}`}>🪣 바닥채우기</button>
-            </div>
-            <button onClick={() => setMode('rect_eraser')} className={`px-3 py-1.5 rounded-md text-xs font-bold border ${mode === 'rect_eraser' ? 'bg-red-500 text-white border-red-500' : 'border-gray-300 text-gray-500'}`}>🧼 지우개</button>
-            <button onClick={undo} className="text-xs font-bold px-3 py-1.5 border border-gray-300 rounded-md hover:bg-white active:bg-gray-200">↩ Undo</button>
-            <label className="cursor-pointer px-3 py-1.5 rounded-md text-xs font-bold border border-purple-400 text-purple-600 hover:bg-purple-50">
-              📂 PNG 불러오기
-              <input type="file" accept="image/png,image/jpeg" className="hidden" onChange={handleImportPNG} />
-            </label>
-            {bgImage && (
-              <button onClick={() => setShowBg(v => !v)} className={`px-3 py-1.5 rounded-md text-xs font-bold border ${showBg ? 'bg-purple-500 text-white' : 'text-gray-500'}`}>
-                {showBg ? '🖼️ 오버레이 ON' : '🖼️ 오버레이 OFF'}
-              </button>
+      <div className="h-screen w-screen bg-black flex items-center justify-center font-mono text-blue-500">
+        <div className="border-4 border-blue-900 p-10 bg-gray-900 shadow-[0_0_30px_rgba(0,0,255,0.3)] w-96">
+          <h1 className="text-3xl font-black mb-8 tracking-tighter text-center">BATTLE.NET LOGIN</h1>
+          <div className="space-y-4">
+            <input placeholder="USER ID" className="w-full bg-black border border-blue-900 p-3 outline-none" 
+              onChange={e => setAuthForm({...authForm, id: e.target.value})} />
+            <input type="password" placeholder="PASSWORD" className="w-full bg-black border border-blue-900 p-3 outline-none" 
+              onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
+            {authMode === 'signup' && <input placeholder="EMAIL (Optional)" className="w-full bg-black border border-blue-900 p-3 outline-none" 
+              onChange={e => setAuthForm({...authForm, email: e.target.value})} />}
+            
+            {authMode === 'login' ? (
+              <>
+                <button onClick={handleLogin} className="w-full bg-blue-900 text-white p-3 font-bold hover:bg-blue-700">ENTER GAME</button>
+                <p className="text-xs text-center cursor-pointer" onClick={() => setAuthMode('signup')}>CREATE NEW ACCOUNT</p>
+              </>
+            ) : (
+              <>
+                <button onClick={handleSignUp} className="w-full bg-green-900 text-white p-3 font-bold hover:bg-green-700">JOIN BATTLE.NET</button>
+                <p className="text-xs text-center cursor-pointer" onClick={() => setAuthMode('login')}>BACK TO LOGIN</p>
+              </>
             )}
-          </div>
-          <div className="flex space-x-2">
-            {/* 🚀 자랑하기 버튼 */}
-            <button onClick={uploadToShowcase} className="px-4 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-lg font-bold shadow-md hover:scale-105 transition-transform">🌐 클라우드 자랑하기</button>
-            <button onClick={() => exportToPNG(grid)} className="px-4 py-2 bg-emerald-600 text-white rounded-lg font-bold shadow-md hover:bg-emerald-700">PNG 저장</button>
-            <button onClick={() => exportToCSV(grid)} className="px-4 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md hover:bg-blue-700">CSV 저장</button>
-          </div>
-        </header>
-
-        <div className="flex-1 overflow-auto p-12 flex justify-center items-start bg-gray-100" onMouseUp={handleMouseUp}>
-          <div className="relative" style={{ width: '700px', height: '700px' }}>
-            {bgImage && showBg && (
-              <img src={bgImage} alt="overlay" style={{ position: 'absolute', top: 0, left: 0, width: '700px', height: '700px', opacity: 0.35, pointerEvents: 'none', zIndex: 10, imageRendering: 'pixelated' }} />
-            )}
-            <div className="bg-white shadow-2xl border border-gray-300" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
-              {grid.map((row, rIdx) => row.map((cell, cIdx) => {
-                const inPreview = isInsidePreview(rIdx, cIdx);
-                let bgColor = cell === 1 ? "bg-black" : cell === 2 ? "bg-gray-300" : "bg-white";
-                if (inPreview) bgColor = mode === 'wall_rect' ? "bg-black/50" : mode === 'floor_rect' ? "bg-gray-400/50" : "bg-red-200";
-                return (
-                  <div key={`${rIdx}-${cIdx}`} onMouseDown={() => handleMouseDown(rIdx, cIdx)} onMouseEnter={() => handleMouseEnter(rIdx, cIdx)} className={`w-[14px] h-[14px] border-[0.1px] border-gray-100 ${bgColor}`} />
-                );
-              }))}
-            </div>
           </div>
         </div>
       </div>
     );
   }
 
-  // 🏠 [VIEW 2] 대시보드
-  return (
-    <div className="flex h-screen bg-gray-50 text-gray-800">
-      <aside className="w-64 bg-white border-r flex flex-col">
-        <div className="p-6 font-black text-2xl text-blue-600 border-b tracking-tighter">🏗️ MY CAD</div>
-        <nav className="flex-col p-4 space-y-2 font-semibold text-gray-700">
-          <button className="w-full text-left p-3 bg-blue-50 text-blue-600 rounded-lg">🏠 홈</button>
-          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📐 디자인</button>
-          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📁 컬렉션</button>
-        </nav>
-      </aside>
+  // 🖥️ [View 1] 대시보드
+  if (view === 'dashboard') {
+    return (
+      <div className="flex h-screen bg-gray-950 text-white font-sans">
+        <aside className="w-64 border-r border-gray-800 p-6 flex flex-col space-y-4">
+          <div className="text-2xl font-black text-blue-500 mb-8 italic">MY CAD CENTER</div>
+          <div className="text-sm font-bold text-gray-500 uppercase tracking-widest">User Profile</div>
+          <div className="bg-gray-900 p-4 rounded-lg border border-gray-800">
+            <div className="font-bold text-blue-400">ID: {user?.username}</div>
+            <div className="text-xs text-gray-500 mt-1">Status: Online</div>
+          </div>
+          <nav className="flex-1 space-y-2 pt-10">
+            <button className="w-full text-left p-3 bg-blue-900/20 text-blue-400 rounded-lg font-bold">🏠 Dashboard</button>
+            <button onClick={() => setView('editor')} className="w-full text-left p-3 hover:bg-gray-900 rounded-lg text-gray-400">📐 New Blueprint</button>
+          </nav>
+          <button onClick={() => {setUser(null); setView('auth');}} className="p-3 text-red-500 font-bold hover:bg-red-500/10 rounded-lg">Logout</button>
+        </aside>
 
-      <main className="flex-1 p-8 overflow-y-auto">
-        <header className="flex justify-end mb-8">
-          <button onClick={() => setView('editor')} className="px-12 py-4 bg-black text-white rounded-full font-bold text-xl shadow-xl hover:scale-105 transition-transform active:scale-95">
-            START 📐
-          </button>
-        </header>
-        <section className="mb-12">
-          <h2 className="text-2xl font-bold mb-6">🏢 내 구조물 보관소</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="h-56 bg-white border rounded-xl shadow-sm hover:shadow-lg transition cursor-pointer flex flex-col overflow-hidden group">
-              <div className="flex-1 bg-gray-200 flex items-center justify-center text-gray-400 group-hover:bg-gray-300 transition-colors">3D PREVIEW</div>
-              <div className="p-4 font-bold">테스트 빌딩 #1</div>
+        <main className="flex-1 p-10 overflow-y-auto">
+          <header className="flex justify-between items-center mb-12">
+            <h2 className="text-4xl font-black tracking-tighter uppercase">Operations Center</h2>
+            <button onClick={() => setView('editor')} className="px-8 py-3 bg-blue-600 rounded-full font-bold shadow-lg hover:scale-105 transition-all">START DESIGNING</button>
+          </header>
+
+          <section className="mb-12">
+            <h3 className="text-lg font-bold text-gray-500 mb-6 uppercase">Global Archives</h3>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+              {blueprints.map(bp => (
+                <div key={bp.id} className="bg-gray-900 rounded-xl overflow-hidden border border-gray-800 hover:border-blue-500 transition-all cursor-default">
+                  <div className="h-40 bg-black flex items-center justify-center text-5xl">🏗️</div>
+                  <div className="p-5">
+                    <div className="font-black text-xl mb-1">{bp.name}</div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-blue-500 text-sm font-bold">👤 {bp.author}</span>
+                      <span className="text-gray-600 text-[10px]">{new Date(bp.created_at).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
+  // 🖥️ [View 2] 에디터 화면
+  return (
+    <div className="h-screen w-screen bg-gray-100 flex flex-col overflow-hidden select-none">
+      <header className="p-4 bg-white border-b flex justify-between items-center shadow-sm">
+        <div className="flex items-center space-x-3">
+          <button onClick={() => setView('dashboard')} className="font-bold text-gray-400 hover:text-black">◀ BACK</button>
+          <div className="flex bg-gray-100 p-1 rounded-lg border">
+            <button onClick={() => setMode('wall_rect')} className={`px-3 py-1.5 rounded-md text-xs font-bold ${mode==='wall_rect'?'bg-black text-white':'text-gray-500'}`}>🧱 Wall</button>
+            <button onClick={() => setMode('floor_rect')} className={`px-3 py-1.5 rounded-md text-xs font-bold ${mode==='floor_rect'?'bg-gray-400 text-white':'text-gray-500'}`}>🏁 Floor</button>
           </div>
-        </section>
-        <section>
-          <h2 className="text-2xl font-bold mb-6">📝 집 설계도면 공정</h2>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-            <div onClick={() => setView('editor')} className="h-40 bg-blue-50 border-2 border-dashed border-blue-200 rounded-xl hover:bg-blue-100 transition cursor-pointer flex flex-col items-center justify-center text-blue-600">
-              <span className="text-3xl mb-2">➕</span>
-              <span className="font-bold">새 50x50 도면 그리기</span>
-            </div>
-          </div>
-        </section>
-      </main>
+          <button onClick={() => setMode('rect_eraser')} className={`px-3 py-1.5 rounded-md text-xs font-bold border ${mode==='rect_eraser'?'bg-red-500 text-white':'text-gray-500'}`}>🧼 Eraser</button>
+          <button onClick={undo} className="text-xs font-bold px-3 py-1.5 border rounded-md">↩ Undo</button>
+          <label className="cursor-pointer px-3 py-1.5 rounded-md text-xs font-bold border border-purple-400 text-purple-600">
+            📂 Load PNG
+            <input type="file" accept="image/*" className="hidden" onChange={e => {
+              const file = e.target.files[0]; if(file) importPNGToGrid(file, g => { saveHistory(); setGrid(g); });
+            }} />
+          </label>
+        </div>
+        <div className="flex space-x-2">
+          <button onClick={uploadToShowcase} className="px-4 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-lg font-bold shadow-md">🌐 Share Cloud</button>
+          <button onClick={() => exportToPNG(grid)} className="px-4 py-2 bg-emerald-600 text-white rounded-lg font-bold">Export PNG</button>
+          <button onClick={() => exportToCSV(grid)} className="px-4 py-2 bg-blue-600 text-white rounded-lg font-bold">Export CSV</button>
+        </div>
+      </header>
+
+      <div className="flex-1 overflow-auto p-12 flex justify-center items-start bg-gray-100" onMouseUp={handleMouseUp}>
+        <div className="bg-white shadow-2xl border border-gray-300 relative" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
+          {grid.map((row, rIdx) => row.map((cell, cIdx) => {
+            const inPreview = isInsidePreview(rIdx, cIdx);
+            let bgColor = cell === 1 ? "bg-black" : cell === 2 ? "bg-gray-300" : "bg-white";
+            if (inPreview) bgColor = mode === 'wall_rect' ? "bg-black/50" : mode === 'floor_rect' ? "bg-gray-400/50" : "bg-red-200";
+            return (
+              <div key={`${rIdx}-${cIdx}`} onMouseDown={() => handleMouseDown(rIdx, cIdx)} onMouseEnter={() => handleMouseEnter(rIdx, cIdx)} className={`w-[14px] h-[14px] border-[0.1px] border-gray-100 ${bgColor}`} />
+            );
+          }))}
+        </div>
+      </div>
     </div>
   );
 }
