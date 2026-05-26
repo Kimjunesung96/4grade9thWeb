@@ -124,6 +124,7 @@ export default function App() {
   const [startPos, setStartPos] = useState(null);
   const [currentPos, setCurrentPos] = useState(null);
   const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
+  const [silhouette, setSilhouette] = useState(null); // PNG 불러오기 실루엣 미리보기
 
   const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
 
@@ -172,6 +173,16 @@ export default function App() {
   const undo = () => { if (history.length === 0) return; setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
 
   const handleMouseDown = (r, c) => {
+    if (mode === 'wall_fill') {
+      saveHistory();
+      setGrid(prev => floodFill(prev, r, c, 1));
+      return;
+    }
+    if (mode === 'floor_fill') {
+      saveHistory();
+      setGrid(prev => floodFill(prev, r, c, 2));
+      return;
+    }
     saveHistory();
     setIsDrawing(true); setStartPos({ r, c }); setCurrentPos({ r, c });
   };
@@ -302,14 +313,17 @@ export default function App() {
           <div className="h-6 w-px bg-gray-200 mx-2" />
           <div className="flex bg-gray-100 p-1 rounded-lg">
             <button onClick={() => setMode('wall_rect')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${mode==='wall_rect'?'bg-white text-blue-600 shadow-sm':'text-gray-500'}`}>🧱 벽 그리기</button>
+            <button onClick={() => setMode('wall_fill')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${mode==='wall_fill'?'bg-white text-blue-600 shadow-sm':'text-gray-500'}`}>🪣 벽 채우기</button>
             <button onClick={() => setMode('floor_rect')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${mode==='floor_rect'?'bg-white text-blue-600 shadow-sm':'text-gray-500'}`}>🏁 바닥 그리기</button>
+            <button onClick={() => setMode('floor_fill')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${mode==='floor_fill'?'bg-white text-orange-500 shadow-sm':'text-gray-500'}`}>🪣 바닥 채우기</button>
             <button onClick={() => setMode('rect_eraser')} className={`px-4 py-1.5 rounded-md text-xs font-bold transition-all ${mode==='rect_eraser'?'bg-red-50 text-red-500 shadow-sm':'text-gray-500'}`}>🧼 지우개</button>
           </div>
           <button onClick={undo} className="text-xs font-bold px-3 py-1.5 bg-white border border-gray-200 rounded-md hover:bg-gray-50">↩ 되돌리기</button>
           <label className="cursor-pointer px-3 py-1.5 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
             📂 PNG 불러오기
             <input type="file" accept="image/*" className="hidden" onChange={e => {
-              const file = e.target.files[0]; if (file) importPNGToGrid(file, g => { saveHistory(); setGrid(g); });
+              const file = e.target.files[0]; if (file) importPNGToGrid(file, g => { setSilhouette(g); });
+              e.target.value = '';
             }} />
           </label>
         </div>
@@ -320,12 +334,23 @@ export default function App() {
         </div>
       </header>
 
-      <div className="flex-1 overflow-auto p-12 flex justify-center items-start bg-gray-50" onMouseUp={handleMouseUp}>
+      <div className="flex-1 overflow-auto p-12 flex flex-col justify-start items-center bg-gray-50" onMouseUp={handleMouseUp}>
+        {silhouette && (
+          <div className="mb-4 flex items-center gap-4 bg-yellow-50 border border-yellow-300 px-6 py-3 rounded-xl shadow">
+            <span className="text-sm font-bold text-yellow-700">📋 PNG 실루엣 미리보기 — 적용하시겠어요?</span>
+            <button onClick={() => { saveHistory(); setGrid(silhouette); setSilhouette(null); }}
+              className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700">✅ 적용</button>
+            <button onClick={() => setSilhouette(null)}
+              className="px-4 py-1.5 bg-gray-200 text-gray-700 rounded-lg text-xs font-bold hover:bg-gray-300">❌ 취소</button>
+          </div>
+        )}
         <div className="bg-white shadow-2xl border border-gray-200 relative"
           style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
           {grid.map((row, rIdx) => row.map((cell, cIdx) => {
             const inPreview = isInsidePreview(rIdx, cIdx);
+            const inSilhouette = silhouette && silhouette[rIdx][cIdx] === 1;
             let bgColor = cell === 1 ? "bg-black" : cell === 2 ? "bg-gray-300" : "bg-white";
+            if (inSilhouette) bgColor = "bg-blue-400/50";
             if (inPreview) bgColor = mode === 'wall_rect' ? "bg-blue-500/40" : mode === 'floor_rect' ? "bg-blue-300/40" : "bg-red-200";
             return (
               <div
