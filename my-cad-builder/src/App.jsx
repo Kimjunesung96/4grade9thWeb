@@ -124,7 +124,8 @@ export default function App() {
   const [startPos, setStartPos] = useState(null);
   const [currentPos, setCurrentPos] = useState(null);
   const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
-  const [silhouette, setSilhouette] = useState(null); // PNG 불러오기 실루엣 미리보기
+  const [silhouette, setSilhouette] = useState(null); // PNG 이미지 URL (배경 오버레이용)
+  const [silhouetteOpacity, setSilhouetteOpacity] = useState(0.35); // 실루엣 투명도
 
   const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
 
@@ -322,7 +323,11 @@ export default function App() {
           <label className="cursor-pointer px-3 py-1.5 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
             📂 PNG 불러오기
             <input type="file" accept="image/*" className="hidden" onChange={e => {
-              const file = e.target.files[0]; if (file) importPNGToGrid(file, g => { setSilhouette(g); });
+              const file = e.target.files[0];
+              if (file) {
+                if (silhouette) URL.revokeObjectURL(silhouette);
+                setSilhouette(URL.createObjectURL(file));
+              }
               e.target.value = '';
             }} />
           </label>
@@ -337,34 +342,48 @@ export default function App() {
       <div className="flex-1 overflow-auto p-12 flex flex-col justify-start items-center bg-gray-50" onMouseUp={handleMouseUp}>
         {silhouette && (
           <div className="mb-4 flex items-center gap-3 bg-blue-50 border border-blue-200 px-5 py-2.5 rounded-xl shadow-sm">
-            <span className="text-xs font-bold text-blue-600">🖼️ 실루엣 참고선 표시 중 — 위에 자유롭게 그리세요</span>
-            <button onClick={() => setSilhouette(null)}
-              className="px-3 py-1 bg-white border border-blue-200 text-blue-500 rounded-lg text-xs font-bold hover:bg-blue-100">✕ 실루엣 숨기기</button>
+            <span className="text-xs font-bold text-blue-600">🖼️ 도면 참고선 표시 중 — 위에 자유롭게 트레이싱하세요</span>
+            <span className="text-xs text-blue-400 font-medium">투명도</span>
+            <input type="range" min="0.1" max="0.9" step="0.05" value={silhouetteOpacity}
+              onChange={e => setSilhouetteOpacity(parseFloat(e.target.value))}
+              className="w-24 accent-blue-500" />
+            <button onClick={() => { URL.revokeObjectURL(silhouette); setSilhouette(null); }}
+              className="px-3 py-1 bg-white border border-blue-200 text-blue-500 rounded-lg text-xs font-bold hover:bg-blue-100">✕ 숨기기</button>
           </div>
         )}
-        <div className="bg-white shadow-2xl border border-gray-200 relative"
+        <div className="relative bg-white shadow-2xl border border-gray-200"
           style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
+          {silhouette && (
+            <img
+              src={silhouette}
+              alt="silhouette"
+              style={{
+                position: 'absolute', top: 0, left: 0,
+                width: '100%', height: '100%',
+                opacity: silhouetteOpacity,
+                pointerEvents: 'none',
+                objectFit: 'fill',
+                zIndex: 10,
+              }}
+            />
+          )}
           {grid.map((row, rIdx) => row.map((cell, cIdx) => {
             const inPreview = isInsidePreview(rIdx, cIdx);
-            const inSilhouette = silhouette && silhouette[rIdx][cIdx] === 1;
             let bgColor = cell === 1 ? '#000000' : cell === 2 ? '#D1D5DB' : '#FFFFFF';
             let overlayStyle = {};
-            if (inSilhouette && cell === 0) {
-              overlayStyle = { backgroundColor: 'rgba(96,165,250,0.4)' };
-            }
             if (inPreview) {
               overlayStyle = mode === 'wall_rect'
-                ? { backgroundColor: 'rgba(59,130,246,0.4)' }
+                ? { backgroundColor: 'rgba(59,130,246,0.5)' }
                 : mode === 'floor_rect'
-                ? { backgroundColor: 'rgba(251,146,60,0.4)' }
-                : { backgroundColor: 'rgba(248,113,113,0.4)' };
+                ? { backgroundColor: 'rgba(251,146,60,0.5)' }
+                : { backgroundColor: 'rgba(248,113,113,0.5)' };
             }
             return (
               <div
                 key={`${rIdx}-${cIdx}`}
                 onMouseDown={() => handleMouseDown(rIdx, cIdx)}
                 onMouseEnter={() => handleMouseEnter(rIdx, cIdx)}
-                style={{ width: 14, height: 14, backgroundColor: bgColor, border: '0.1px solid #F9FAFB', boxSizing: 'border-box', ...overlayStyle }}
+                style={{ width: 14, height: 14, backgroundColor: bgColor, border: '0.1px solid #F3F4F6', boxSizing: 'border-box', position: 'relative', zIndex: 20, ...overlayStyle }}
               />
             );
           }))}
