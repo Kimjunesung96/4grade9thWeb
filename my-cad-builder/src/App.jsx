@@ -363,7 +363,7 @@ export default function App() {
                 opacity: silhouetteOpacity,
                 pointerEvents: 'none',
                 objectFit: 'fill',
-                zIndex: 10,
+                zIndex: 5,
               }}
             />
           )}
@@ -383,7 +383,14 @@ export default function App() {
                 key={`${rIdx}-${cIdx}`}
                 onMouseDown={() => handleMouseDown(rIdx, cIdx)}
                 onMouseEnter={() => handleMouseEnter(rIdx, cIdx)}
-                style={{ width: 14, height: 14, backgroundColor: bgColor, border: '0.1px solid #F3F4F6', boxSizing: 'border-box', position: 'relative', zIndex: 20, ...overlayStyle }}
+            style={{
+                width: 14, height: 14,
+                backgroundColor: cell === 0 ? 'transparent' : bgColor,
+                border: '0.1px solid rgba(243,244,246,0.5)',
+                boxSizing: 'border-box',
+                position: 'relative', zIndex: 20,
+                ...overlayStyle
+              }}
               />
             );
           }))}
