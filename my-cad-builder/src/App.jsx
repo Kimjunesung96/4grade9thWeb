@@ -336,12 +336,10 @@ export default function App() {
 
       <div className="flex-1 overflow-auto p-12 flex flex-col justify-start items-center bg-gray-50" onMouseUp={handleMouseUp}>
         {silhouette && (
-          <div className="mb-4 flex items-center gap-4 bg-yellow-50 border border-yellow-300 px-6 py-3 rounded-xl shadow">
-            <span className="text-sm font-bold text-yellow-700">📋 PNG 실루엣 미리보기 — 적용하시겠어요?</span>
-            <button onClick={() => { saveHistory(); setGrid(silhouette); setSilhouette(null); }}
-              className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700">✅ 적용</button>
+          <div className="mb-4 flex items-center gap-3 bg-blue-50 border border-blue-200 px-5 py-2.5 rounded-xl shadow-sm">
+            <span className="text-xs font-bold text-blue-600">🖼️ 실루엣 참고선 표시 중 — 위에 자유롭게 그리세요</span>
             <button onClick={() => setSilhouette(null)}
-              className="px-4 py-1.5 bg-gray-200 text-gray-700 rounded-lg text-xs font-bold hover:bg-gray-300">❌ 취소</button>
+              className="px-3 py-1 bg-white border border-blue-200 text-blue-500 rounded-lg text-xs font-bold hover:bg-blue-100">✕ 실루엣 숨기기</button>
           </div>
         )}
         <div className="bg-white shadow-2xl border border-gray-200 relative"
@@ -349,15 +347,24 @@ export default function App() {
           {grid.map((row, rIdx) => row.map((cell, cIdx) => {
             const inPreview = isInsidePreview(rIdx, cIdx);
             const inSilhouette = silhouette && silhouette[rIdx][cIdx] === 1;
-            let bgColor = cell === 1 ? "bg-black" : cell === 2 ? "bg-gray-300" : "bg-white";
-            if (inSilhouette) bgColor = "bg-blue-400/50";
-            if (inPreview) bgColor = mode === 'wall_rect' ? "bg-blue-500/40" : mode === 'floor_rect' ? "bg-blue-300/40" : "bg-red-200";
+            let bgColor = cell === 1 ? '#000000' : cell === 2 ? '#D1D5DB' : '#FFFFFF';
+            let overlayStyle = {};
+            if (inSilhouette && cell === 0) {
+              overlayStyle = { backgroundColor: 'rgba(96,165,250,0.4)' };
+            }
+            if (inPreview) {
+              overlayStyle = mode === 'wall_rect'
+                ? { backgroundColor: 'rgba(59,130,246,0.4)' }
+                : mode === 'floor_rect'
+                ? { backgroundColor: 'rgba(251,146,60,0.4)' }
+                : { backgroundColor: 'rgba(248,113,113,0.4)' };
+            }
             return (
               <div
                 key={`${rIdx}-${cIdx}`}
                 onMouseDown={() => handleMouseDown(rIdx, cIdx)}
                 onMouseEnter={() => handleMouseEnter(rIdx, cIdx)}
-                className={`w-[14px] h-[14px] border-[0.1px] border-gray-50 ${bgColor} hover:bg-blue-50 transition-colors`}
+                style={{ width: 14, height: 14, backgroundColor: bgColor, border: '0.1px solid #F9FAFB', boxSizing: 'border-box', ...overlayStyle }}
               />
             );
           }))}
