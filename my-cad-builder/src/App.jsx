@@ -48,9 +48,12 @@ export default function App() {
   };
 
   const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
-  const undo = () => { if (history.length === 0) return; setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
-  const handleMouseDown = (r, c) => { saveHistory(); setIsDrawing(true); setStartPos({ r, c }); setCurrentPos({ r, c }); };
-  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c }); };
+  const undo = () => { if (history.length === 0) return;
+  setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
+  const handleMouseDown = (r, c) => { saveHistory(); setIsDrawing(true);
+  setStartPos({ r, c }); setCurrentPos({ r, c }); };
+  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c });
+  };
   
   const handleMouseUp = () => {
     if (isDrawing && mode.includes('rect') && startPos && currentPos) {
@@ -58,7 +61,8 @@ export default function App() {
       const startR = Math.min(startPos.r, currentPos.r), endR = Math.max(startPos.r, currentPos.r);
       const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
       for (let r = startR; r <= endR; r++) {
-        for (let c = startC; c <= endC; c++) { newGrid[r][c] = mode === 'wall_rect' ? 1 : mode === 'floor_rect' ? 2 : 0; }
+        for (let c = startC; c <= endC; c++) { newGrid[r][c] = mode === 'wall_rect' ?
+        1 : mode === 'floor_rect' ? 2 : 0; }
       }
       setGrid(newGrid);
     }
@@ -73,7 +77,19 @@ export default function App() {
   return (
     <>
       {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
-      {view === 'dashboard' && <DashboardView user={user} blueprints={blueprints} setView={setView} setUser={setUser} />}
+      {view === 'dashboard' && (
+        <DashboardView 
+          user={user} 
+          blueprints={blueprints} 
+          setView={setView} 
+          setUser={setUser} 
+          onSelectBlueprint={(bp) => {
+            setGrid(bp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
+            setHistory([]);
+            setView('editor');
+          }} 
+        />
+      )}
       {view === 'editor' && <EditorView grid={grid} setGrid={setGrid} mode={mode} setMode={setMode} setView={setView} undo={undo} saveHistory={saveHistory} uploadToShowcase={uploadToShowcase} isInsidePreview={isInsidePreview} handleMouseDown={handleMouseDown} handleMouseEnter={handleMouseEnter} handleMouseUp={handleMouseUp} />}
     </>
   );

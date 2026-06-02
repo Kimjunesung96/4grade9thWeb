@@ -1,11 +1,8 @@
 import React from 'react';
 
-export default function BlueprintCard({ bp, onClick }) {
+export default function BlueprintCard({ bp }) {
   return (
-    <div 
-      onClick={onClick} 
-      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98"
-    >
+    <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group">
       <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">🏗️</div>
       <div className="p-5">
         <div className="font-bold text-lg text-gray-900">{bp.name}</div>
