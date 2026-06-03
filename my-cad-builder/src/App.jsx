@@ -4,6 +4,7 @@ import { hashPw } from './utils/cadUtils';
 import AuthView from './views/AuthView';
 import DashboardView from './views/DashboardView';
 import EditorView from './views/EditorView';
+import DetailView from './views/DetailView';
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -17,6 +18,12 @@ export default function App() {
   const [startPos, setStartPos] = useState(null);
   const [currentPos, setCurrentPos] = useState(null);
   const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
+
+  // 소셜 상태 데이터 전역 상태 관리 저장소
+  const [selectedBp, setSelectedBp] = useState(null);
+  const [commentInput, setCommentInput] = useState('');
+  const [likesData, setLikesData] = useState({}); // { 도면ID: [유저ID리스트] }
+  const [commentsData, setCommentsData] = useState({}); // { 도면ID: [댓글배열] }
 
   const handleSignUp = async () => {
     const { error } = await supabase.from('users').insert([{ username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email }]);
@@ -74,9 +81,35 @@ export default function App() {
     return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
   };
 
+  // 1인 1회 토글형 좋아요 알고리즘 구현
+  const handleLikeToggle = (bpId) => {
+    if (!user) return;
+    const currentLikedUsers = likesData[bpId] || [];
+    if (currentLikedUsers.includes(user.id)) {
+      setLikesData({ ...likesData, [bpId]: currentLikedUsers.filter(uid => uid !== user.id) });
+    } else {
+      setLikesData({ ...likesData, [bpId]: [...currentLikedUsers, user.id] });
+    }
+  };
+
+  // 고유 도면 아이디 기반 독립형 댓글 작성 처리
+  const handleAddComment = (bpId) => {
+    if (!commentInput.trim() || !user) return;
+    const newComment = {
+      id: Date.now(),
+      username: user.username,
+      content: commentInput,
+      created_at: new Date().toISOString()
+    };
+    const currentComments = commentsData[bpId] || [];
+    setCommentsData({ ...commentsData, [bpId]: [...currentComments, newComment] });
+    setCommentInput('');
+  };
+
   return (
     <>
       {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
+      
       {view === 'dashboard' && (
         <DashboardView 
           user={user} 
@@ -84,13 +117,32 @@ export default function App() {
           setView={setView} 
           setUser={setUser} 
           onSelectBlueprint={(bp) => {
-            setGrid(bp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
-            setHistory([]);
-            setView('editor');
+            setSelectedBp(bp);
+            setView('detail'); // 💡 팝업 모달 대신 상세페이지('detail') 뷰로 화면 라우팅 전환
           }} 
         />
       )}
+      
       {view === 'editor' && <EditorView grid={grid} setGrid={setGrid} mode={mode} setMode={setMode} setView={setView} undo={undo} saveHistory={saveHistory} uploadToShowcase={uploadToShowcase} isInsidePreview={isInsidePreview} handleMouseDown={handleMouseDown} handleMouseEnter={handleMouseEnter} handleMouseUp={handleMouseUp} />}
+
+      {view === 'detail' && selectedBp && (
+        <DetailView
+          selectedBp={selectedBp}
+          setView={setView}
+          comments={commentsData[selectedBp.id] || []}
+          commentInput={commentInput}
+          setCommentInput={setCommentInput}
+          likeCount={(likesData[selectedBp.id] || []).length}
+          hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
+          onLikeToggle={() => handleLikeToggle(selectedBp.id)}
+          onAddComment={() => handleAddComment(selectedBp.id)}
+          onEditBlueprint={() => {
+            setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
+            setHistory([]);
+            setView('editor');
+          }}
+        />
+      )}
     </>
   );
 }
