@@ -1,9 +1,34 @@
 import CryptoJS from 'crypto-js';
 
-// 비밀번호 암호화 로직 [cite: 29]
+// 비밀번호 암호화 로직
 export const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
 
-// Flood Fill 알고리즘 [cite: 2-7]
+// ===================== 층별 벽 색상 매핑 =====================
+// grid 값 체계: 0=빈칸, 1~5=벽(1~5층), 9=바닥
+export const FLOOR_COLORS = {
+  1: { hex: '#9CA3AF', tw: 'bg-gray-400', label: '1층' },   // 회색
+  2: { hex: '#EF4444', tw: 'bg-red-500',  label: '2층' },   // 빨강
+  3: { hex: '#F97316', tw: 'bg-orange-500', label: '3층' }, // 주황
+  4: { hex: '#EAB308', tw: 'bg-yellow-500', label: '4층' }, // 노랑
+  5: { hex: '#000000', tw: 'bg-black',    label: '5층' },   // 검정
+};
+export const FLOOR_VALUE = 9; // 바닥 칸 값 (기존 2에서 변경 → 1~5 벽 값과 충돌 방지)
+
+// 셀 값을 기준으로 표시 색상(hex)을 반환
+export const getCellColorHex = (cell) => {
+  if (cell === FLOOR_VALUE) return '#D2D2D2';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].hex;
+  return '#FFFFFF';
+};
+
+// 셀 값을 기준으로 표시 색상(tailwind 클래스)을 반환
+export const getCellColorClass = (cell) => {
+  if (cell === FLOOR_VALUE) return 'bg-gray-300';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].tw;
+  return 'bg-white';
+};
+
+// Flood Fill 알고리즘
 export const floodFill = (grid, r, c, replacementVal) => {
   const targetVal = grid[r][c];
   if (targetVal === replacementVal) return grid;
@@ -19,32 +44,52 @@ export const floodFill = (grid, r, c, replacementVal) => {
   return newGrid;
 };
 
-// 블록 ID 포맷 생성기 [cite: 7-8]
+// 블록 ID 포맷 생성기
 export const formatID = (val) => {
   const absVal = Math.round(Math.abs(val));
   const sign = val < 0 ? "-" : "0";
   return sign + absVal.toString().padStart(3, '0');
 };
 
-// CSV 구조 데이터 파일 추출 [cite: 9-14]
+// 사각형 테두리(두께 2칸)만 칠하고 안쪽은 비우는 벽 그리기 로직
+// startR/endR/startC/endC: 드래그 영역의 행/열 범위 (min~max 정렬된 값)
+// thickness: 테두리 두께 (기본 2칸)
+export const applyWallBorder = (gridRef, startR, endR, startC, endC, floorValue, thickness = 2) => {
+  for (let r = startR; r <= endR; r++) {
+    for (let c = startC; c <= endC; c++) {
+      const distFromTop = r - startR;
+      const distFromBottom = endR - r;
+      const distFromLeft = c - startC;
+      const distFromRight = endC - c;
+      const minDist = Math.min(distFromTop, distFromBottom, distFromLeft, distFromRight);
+      // 테두리(바깥쪽 thickness칸)에 해당하면 칠하고, 안쪽이면 건드리지 않음
+      if (minDist < thickness) {
+        gridRef[r][c] = floorValue;
+      }
+    }
+  }
+  return gridRef;
+};
+
+// CSV 구조 데이터 파일 추출 (1~5층 벽 + 바닥)
 export const exportToCSV = (grid) => {
   let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
   grid.forEach((row, rIdx) => {
     row.forEach((cell, cIdx) => {
-      if (cell !== 0) {
-        const xCoord = cIdx * 3 + 1.5;
-        const zCoord = rIdx * 3 + 1.5;
-        const idX = formatID(xCoord * 10);
-        const idZ = formatID(zCoord * 10);
-        if (cell === 1) {
-          for (let n = 1; n <= 5; n++) {
-            const yCoord = n * 3 - 1.5;
-            const idY = formatID(yCoord * 10);
-            csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Wall\n`;
-          }
-        } else if (cell === 2) {
-          csvContent += `${idX}_${idZ}_015,${xCoord.toFixed(2)},1.50,${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Floor\n`;
-        }
+      if (cell === 0) return;
+      const xCoord = cIdx * 3 + 1.5;
+      const zCoord = rIdx * 3 + 1.5;
+      const idX = formatID(xCoord * 10);
+      const idZ = formatID(zCoord * 10);
+
+      if (cell >= 1 && cell <= 5) {
+        // cell 값 = 층 번호. 해당 층 높이에만 벽 블록 생성
+        const floorNum = cell;
+        const yCoord = floorNum * 3 - 1.5;
+        const idY = formatID(yCoord * 10);
+        csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Wall_F${floorNum}\n`;
+      } else if (cell === FLOOR_VALUE) {
+        csvContent += `${idX}_${idZ}_015,${xCoord.toFixed(2)},1.50,${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Floor\n`;
       }
     });
   });
@@ -55,25 +100,32 @@ export const exportToCSV = (grid) => {
   link.click();
 };
 
-// PNG 캔버스 이미지 저장 [cite: 14-17]
-export const exportToPNG = (grid) => {
+// PNG 캔버스 이미지 저장 (mbs_ 접두사 자동 부여)
+export const exportToPNG = (grid, fileName) => {
   const cellSize = 10;
   const canvas = document.createElement('canvas');
   canvas.width = 50 * cellSize; canvas.height = 50 * cellSize;
   const ctx = canvas.getContext('2d');
   grid.forEach((row, rIdx) => {
     row.forEach((cell, cIdx) => {
-      ctx.fillStyle = cell === 1 ? '#000000' : cell === 2 ? '#D2D2D2' : '#FFFFFF';
+      ctx.fillStyle = getCellColorHex(cell);
       ctx.fillRect(cIdx * cellSize, rIdx * cellSize, cellSize, cellSize);
     });
   });
+
+  // 유니티 스캐너 인식용 mbs_ 접두사 강제 부여
+  let baseName = (fileName && fileName.trim()) ? fileName.trim() : 'blueprint_draw';
+  baseName = baseName.replace(/\.png$/i, ''); // 혹시 사용자가 .png까지 입력해도 중복 방지
+  baseName = baseName.replace(/^mbs_/i, '');   // 이미 mbs_가 붙어있으면 중복 방지
+  const finalName = `mbs_${baseName}.png`;
+
   const link = document.createElement('a');
-  link.download = `blueprint_draw.png`;
+  link.download = finalName;
   link.href = canvas.toDataURL('image/png');
   link.click();
 };
 
-// 이미지 파일에서 격자판 역추적 로드 [cite: 18-23]
+// 이미지 파일에서 격자판 역추적 로드 (층별 색상 인식)
 export const importPNGToGrid = (file, callback) => {
   const img = new Image();
   const url = URL.createObjectURL(file);
@@ -84,11 +136,38 @@ export const importPNGToGrid = (file, callback) => {
     ctx.drawImage(img, 0, 0, 50, 50);
     const imageData = ctx.getImageData(0, 0, 50, 50).data;
     const newGrid = Array(50).fill(null).map(() => Array(50).fill(0));
+
+    // 색상 → grid 값 역매핑 테이블 준비 (RGB 거리 기준 최근접 매칭)
+    const colorTable = [
+      { val: FLOOR_VALUE, rgb: [210, 210, 210] }, // 바닥
+      ...Object.entries(FLOOR_COLORS).map(([val, info]) => {
+        const hex = info.hex.replace('#', '');
+        const rgb = [
+          parseInt(hex.substring(0, 2), 16),
+          parseInt(hex.substring(2, 4), 16),
+          parseInt(hex.substring(4, 6), 16),
+        ];
+        return { val: Number(val), rgb };
+      }),
+    ];
+
     for (let r = 0; r < 50; r++) {
       for (let c = 0; c < 50; c++) {
-        if ((imageData[(r * 50 + c) * 4] + imageData[(r * 50 + c) * 4 + 1] + imageData[(r * 50 + c) * 4 + 2]) / 3 < 128) {
-          newGrid[r][c] = 1;
+        const idx = (r * 50 + c) * 4;
+        const px = [imageData[idx], imageData[idx + 1], imageData[idx + 2]];
+        // 흰색(빈칸)에 가까우면 0으로 처리
+        if (px[0] > 245 && px[1] > 245 && px[2] > 245) {
+          newGrid[r][c] = 0;
+          continue;
         }
+        // 가장 가까운 색을 찾아 매핑
+        let bestVal = 0;
+        let bestDist = Infinity;
+        for (const entry of colorTable) {
+          const d = Math.pow(px[0] - entry.rgb[0], 2) + Math.pow(px[1] - entry.rgb[1], 2) + Math.pow(px[2] - entry.rgb[2], 2);
+          if (d < bestDist) { bestDist = d; bestVal = entry.val; }
+        }
+        newGrid[r][c] = bestVal;
       }
     }
     URL.revokeObjectURL(url);

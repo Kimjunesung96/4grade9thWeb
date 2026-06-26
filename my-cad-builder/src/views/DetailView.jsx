@@ -1,5 +1,5 @@
 import React from 'react';
-import { exportToPNG, exportToCSV } from '../utils/cadUtils';
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
 
 export default function DetailView({
   selectedBp,
@@ -18,6 +18,12 @@ export default function DetailView({
     if (!selectedBp?.grid_data) return "0.00 KB";
     const strLen = JSON.stringify(selectedBp.grid_data).length;
     return (strLen / 1024).toFixed(2) + " KB";
+  };
+
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
   };
 
   return (
@@ -51,9 +57,7 @@ export default function DetailView({
               {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
                 <div
                   key={`detail-cell-${rIdx}-${cIdx}`}
-                  className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${
-                    cell === 1 ? 'bg-black' : cell === 2 ? 'bg-gray-400' : 'bg-white'
-                  }`}
+                  className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
                 />
               )))}
             </div>
@@ -61,8 +65,8 @@ export default function DetailView({
           
           <div className="w-full flex flex-col gap-3 mt-6">
             <div className="grid grid-cols-2 gap-3">
-              <button onClick={() => exportToPNG(selectedBp.grid_data)} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
-                📸 PNG 이미지 다운로드
+              <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
+                📸 PNG 이미지 다운로드 (mbs_)
               </button>
               <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
                 📊 CSV 데이터 내보내기

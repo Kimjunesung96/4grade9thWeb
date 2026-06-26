@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { hashPw } from './utils/cadUtils';
+import { hashPw, applyWallBorder, floodFill, FLOOR_VALUE } from './utils/cadUtils';
 import AuthView from './views/AuthView';
 import DashboardView from './views/DashboardView';
 import EditorView from './views/EditorView';
@@ -13,6 +13,7 @@ export default function App() {
   const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
   const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
   const [mode, setMode] = useState('wall_rect');
+  const [activeFloor, setActiveFloor] = useState(1); // 현재 선택된 층 (1~5)
   const [isDrawing, setIsDrawing] = useState(false);
   const [history, setHistory] = useState([]);
   const [startPos, setStartPos] = useState(null);
@@ -57,19 +58,42 @@ export default function App() {
   const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
   const undo = () => { if (history.length === 0) return;
   setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
-  const handleMouseDown = (r, c) => { saveHistory(); setIsDrawing(true);
-  setStartPos({ r, c }); setCurrentPos({ r, c }); };
+
+  const handleMouseDown = (r, c) => {
+    // 바닥 채우기(클릭) 모드는 드래그 개념이 없으므로 즉시 flood fill 실행
+    if (mode === 'floor_fill') {
+      saveHistory();
+      setGrid(prevGrid => floodFill(prevGrid, r, c, FLOOR_VALUE));
+      return;
+    }
+    saveHistory();
+    setIsDrawing(true);
+    setStartPos({ r, c });
+    setCurrentPos({ r, c });
+  };
+
   const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c });
   };
-  
+
   const handleMouseUp = () => {
     if (isDrawing && mode.includes('rect') && startPos && currentPos) {
-      const newGrid = [...grid];
+      let newGrid = grid.map(row => [...row]);
       const startR = Math.min(startPos.r, currentPos.r), endR = Math.max(startPos.r, currentPos.r);
       const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
-      for (let r = startR; r <= endR; r++) {
-        for (let c = startC; c <= endC; c++) { newGrid[r][c] = mode === 'wall_rect' ?
-        1 : mode === 'floor_rect' ? 2 : 0; }
+
+      if (mode === 'wall_rect') {
+        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 층 값으로)
+        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, activeFloor, 2);
+      } else if (mode === 'floor_rect') {
+        // 바닥(드래그): 영역 전체를 채움
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = FLOOR_VALUE; }
+        }
+      } else if (mode === 'rect_eraser') {
+        // 지우개: 영역 전체를 비움
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = 0; }
+        }
       }
       setGrid(newGrid);
     }
@@ -123,7 +147,24 @@ export default function App() {
         />
       )}
       
-      {view === 'editor' && <EditorView grid={grid} setGrid={setGrid} mode={mode} setMode={setMode} setView={setView} undo={undo} saveHistory={saveHistory} uploadToShowcase={uploadToShowcase} isInsidePreview={isInsidePreview} handleMouseDown={handleMouseDown} handleMouseEnter={handleMouseEnter} handleMouseUp={handleMouseUp} />}
+      {view === 'editor' && (
+        <EditorView
+          grid={grid}
+          setGrid={setGrid}
+          mode={mode}
+          setMode={setMode}
+          activeFloor={activeFloor}
+          setActiveFloor={setActiveFloor}
+          setView={setView}
+          undo={undo}
+          saveHistory={saveHistory}
+          uploadToShowcase={uploadToShowcase}
+          isInsidePreview={isInsidePreview}
+          handleMouseDown={handleMouseDown}
+          handleMouseEnter={handleMouseEnter}
+          handleMouseUp={handleMouseUp}
+        />
+      )}
 
       {view === 'detail' && selectedBp && (
         <DetailView
