@@ -1,5 +1,7 @@
-import React from 'react';
+import React, { useMemo } from 'react'; // useMemo 추가
 import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+// ⭐ 1. 우리가 만든 3D 라이브 데모 뷰어 컴포넌트 불러오기
+import LiveDemoViewer from '../components/LiveDemoViewer';
 
 export default function DetailView({
   selectedBp,
@@ -25,6 +27,8 @@ export default function DetailView({
     if (name === null) return;
     exportToPNG(selectedBp.grid_data, name);
   };
+
+
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
@@ -52,7 +56,12 @@ export default function DetailView({
         <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
           <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">구조물 설계도 평면도 미리보기</div>
           
-          <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[380px] w-full">
+          {/* ⭐ 3. 기존 2D 평면도 윗부분에 3D 라이브 데모 추가 */}
+          <div className="w-full h-[300px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+            <LiveDemoViewer grid={selectedBp?.grid_data} mode="static" maxBlocks={10000} />
+          </div>
+
+          <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
               {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
                 <div
@@ -78,19 +87,17 @@ export default function DetailView({
           </div>
         </div>
 
-        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 */}
+        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 (기존 코드 완벽 유지) */}
         <div className="w-full md:w-[400px] bg-white border border-gray-200 rounded-2xl p-6 flex flex-col shadow-sm justify-between">
           <div>
             <h3 className="text-base font-black text-gray-900 mb-4 pb-2 border-b border-gray-100">📋 설계 도면 정보</h3>
             
-            {/* 요청 항목: 제작자, 제작일자, 파일 크기 컴포넌트 */}
             <div className="bg-gray-50 p-4 rounded-xl text-xs space-y-3 text-gray-600 font-medium mb-5 border border-gray-100">
               <div className="flex justify-between"><span>👤 설계자</span> <span className="text-blue-600 font-bold">{selectedBp.author}</span></div>
               <div className="flex justify-between"><span>📅 제작일자</span> <span className="text-gray-900 font-bold">{new Date(selectedBp.created_at).toLocaleString()}</span></div>
               <div className="flex justify-between"><span>💾 파일 용량</span> <span className="text-green-600 font-bold">{calculateFileSize()}</span></div>
             </div>
 
-            {/* 요청 항목: 1인 1회 토글식 좋아요 시스템 */}
             <div className="mb-6">
               <button 
                 onClick={onLikeToggle} 
@@ -103,7 +110,6 @@ export default function DetailView({
               </button>
             </div>
 
-            {/* 댓글 리스트 */}
             <div className="border-t border-gray-100 pt-5">
               <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">💬 피드백 및 댓글 ({comments.length})</h4>
               <div className="space-y-3 max-h-[260px] overflow-y-auto pr-1">
@@ -126,7 +132,6 @@ export default function DetailView({
             </div>
           </div>
 
-          {/* 하단 댓글 입력 폼 */}
           <div className="border-t border-gray-100 pt-4 mt-6 flex gap-2">
             <input 
               type="text" 
@@ -140,8 +145,8 @@ export default function DetailView({
               등록
             </button>
           </div>
-
         </div>
+
       </main>
     </div>
   );

@@ -175,3 +175,23 @@ export const importPNGToGrid = (file, callback) => {
   };
   img.src = url;
 };
+// 2D 격자 데이터를 3D 뷰어용 배열(x, y, z, mat)로 변환해주는 함수
+export const convertGridTo3DData = (grid) => {
+  if (!grid) return [];
+  const blocks = [];
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell) {
+        // 셀 값이 숫자면 해당 층수, 아니면 기본 1층으로 계산
+        const floorHeight = typeof cell === 'number' ? cell : 1; 
+        blocks.push({
+          x: cIdx * 3.0, 
+          y: floorHeight * 3.0 - 1.5, 
+          z: rIdx * 3.0, 
+          mat: 'Concrete' // 기본 뷰는 콘크리트 재질로 통일
+        });
+      }
+    });
+  });
+  return blocks;
+};
