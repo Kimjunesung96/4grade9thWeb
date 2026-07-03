@@ -46,13 +46,25 @@ export default function App() {
 
   useEffect(() => { if (view === 'dashboard' && user) fetchBlueprints(); }, [view, user]);
 
-  const uploadToShowcase = async () => {
+  // 매개변수 payload를 받아서 유연하게 DB에 넣도록 수정
+  const uploadToShowcase = async (payload) => {
     if (!user) return;
     const title = prompt("작품 이름을 지어주세요!", "새 프로젝트");
     if (!title) return;
-    const { error } = await supabase.from('blueprints').insert([{ name: title, grid_data: grid, user_id: user.id, author: user.username }]);
-    if (!error) { alert("업로드 완료!"); setView('dashboard'); }
-    else alert("에러: " + error.message);
+
+    const { error } = await supabase.from('blueprints').insert([{ 
+      name: title, 
+      user_id: user.id, 
+      author: user.username,
+      ...payload // grid_data, csv_data, thumbnail_url 등이 알아서 들어감
+    }]);
+
+    if (!error) { 
+      alert("업로드 완료!"); 
+      setView('dashboard'); 
+    } else {
+      alert("에러: " + error.message);
+    }
   };
 
   const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));

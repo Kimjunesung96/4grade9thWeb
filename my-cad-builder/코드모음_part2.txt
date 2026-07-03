@@ -1,3 +1,475 @@
+// FILE PATH: src/backend/main.py
+// MODIFIED: 26-07-01 18:06 | LINES: 221
+```py
+import io
+import pillow_avif  # noqa: F401  (AVIF 포맷 지원 — PIL 기본 탑재 아님, import만 해도 등록됨)
+import requests
+import trimesh
+import numpy as np
+import uvicorn
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from PIL import Image
+
+app = FastAPI()
+
+# 리액트(Vite) 프론트엔드에서 API를 호출할 수 있도록 CORS 허용 세팅
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 실제 배포 시에는 "http://localhost:5173" 등으로 제한
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ====================================================================
+# 🌟 콜랍에서 띄운 ngrok 주소. 콜랍 노트북을 다시 켤 때마다 바뀌니
+#    매번 여기를 갱신해줘야 합니다!
+# ====================================================================
+COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
+
+MAX_BLOCKS = 10000          # 유니티 렌더링 한도 (블록 렌더링 X / 10,000 MAX)
+GRID_PITCH = 3.0            # 기존 스케일 약속: 3유닛 = 15cm
+UNITS_PER_METER = 20.0      # 1m = 20유닛 (3유닛=15cm 이므로 1m = 6.667*3유닛 -> 20유닛)
+
+
+def format_id(val):
+    """
+    JS의 formatID 완벽 재현!
+    소수점을 10배수로 날리고 015, -105 형태로 포맷팅합니다.
+    """
+    abs_val = round(abs(val))
+    sign = "-" if val < 0 else "0"
+    return f"{sign}{str(abs_val).zfill(3)}"
+
+
+def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
+    """
+    콜랍에 올려둔 TripoSR API에 사진을 보내고, 생성된 3D 메시(.glb)를 받아옵니다.
+    (정면 사진 한 장 → AI가 뒷면/옆면까지 추론해서 만든 입체 메시)
+    """
+    resp = requests.post(
+        COLAB_API_URL,
+        files={"image": ("input.png", img_bytes, "image/png")},
+        timeout=180,
+    )
+    resp.raise_for_status()
+
+    mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
+    # GLB는 여러 메시가 묶인 Scene으로 로드될 수 있어서 하나로 합쳐줍니다
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(mesh.dump())
+    return mesh
+
+
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
+    """
+    🌟 건프라 축소 비율 방식: 건물 표면적에 맞춰 블록 크기(pitch)를 역산해서,
+    랜덤 솎아내기 없이 max_blocks 예산 안에서 표면 전체를 빈틈없이 덮습니다.
+    """
+    # 0. 🌟 축 보정: range가 제일 큰 축 = 실제 "높이"라고 보고, 그 축을 Y로 맞춤
+    #    (고정 90도 보정 대신, TripoSR 결과물 방향이 들쭉날쭉해도 항상 맞도록 자동 판별)
+    extents = mesh.bounds[1] - mesh.bounds[0]  # [x_range, y_range, z_range]
+    tallest_axis = int(np.argmax(extents))
+
+    if tallest_axis == 2:  # 높이가 Z축 -> X축 기준 -90도 회전해서 Y로
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    elif tallest_axis == 0:  # 높이가 X축 -> Z축 기준 90도 회전해서 Y로
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    # tallest_axis == 1이면 이미 Y축이 높이니까 회전 안 함
+
+    # 🌟 앞뒤(Z축) 반전 보정: TripoSR/GLB 결과물이 항상 앞뒤가 뒤집혀서 나오므로
+    #    여기서 실제 메시 좌표 자체를 거울처럼 뒤집어서 CSV/미리보기가 처음부터 올바르게 나오게 함.
+    #    (프론트엔드에서 화면용으로 임시로 뒤집던 방식은 제거했음 — 이제 데이터 자체가 정답)
+    mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
+    mesh.apply_transform(mirror)
+    mesh.invert()  # 미러링하면 face winding이 뒤집혀서 법선이 반대로 계산됨 → 다시 뒤집어서 복구
+
+    print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
+
+    # 1. AI가 만든 메시는 임의 크기라, 사용자가 입력한 실제 건물 높이에 맞춰 스케일 보정
+    mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
+    if mesh_height_raw <= 0:
+        raise ValueError("메시 높이를 계산할 수 없습니다 (생성된 메시가 비정상일 수 있음)")
+
+    target_height_units = real_height_m * UNITS_PER_METER
+    mesh.apply_scale(target_height_units / mesh_height_raw)
+    mesh.apply_translation([0, -mesh.bounds[0][1], 0])  # 바닥을 Y=0(유니티 그라운드)에 맞춤
+
+    surface_area = mesh.area
+    pitch = max(GRID_PITCH, round(((surface_area / max_blocks) ** 0.5) / GRID_PITCH) * GRID_PITCH)
+
+
+    # 2. 안전장치: 예산을 넘기면 랜덤 제거 대신 pitch를 키워 재시도 (균일 압축 유지, 구멍 방지)
+    raw_blocks = []
+    for attempt in range(5):
+        estimated_cells = surface_area / (pitch ** 2)
+        sample_count = max(int(estimated_cells * 6), 5000)
+        points, face_indices = trimesh.sample.sample_surface(mesh, count=sample_count)
+        normals = mesh.face_normals[face_indices]
+
+        raw_blocks = []
+        seen_ids = set()
+        for (x, y, z), normal in zip(points, normals):
+            grid_x = round((x - 1.5) / pitch)
+            grid_y = round((y - 1.5) / pitch)
+            grid_z = round((z - 1.5) / pitch)
+
+            # 🌟 칸 번호(grid_x/y/z)는 그대로 유지, 저장 좌표는 항상 GRID_PITCH(3)로 압축
+            #    → 점 개수/모양은 안 바뀌고, 점들 사이 실제 거리만 좁아짐 (유니티 코드 안 건드려도 됨)
+            pos_x = grid_x * GRID_PITCH + 1.5
+            pos_y = grid_y * GRID_PITCH + 1.5
+            pos_z = grid_z * GRID_PITCH + 1.5
+
+            id_x = format_id(pos_x * 10)
+            id_z = format_id(pos_z * 10)
+            id_y = format_id(pos_y * 10)
+            block_id = f"{id_x}_{id_z}_{id_y}"
+            if block_id in seen_ids:
+                continue
+            seen_ids.add(block_id)
+
+            # 표면 법선의 Y성분으로 바닥/지붕(Floor) vs 벽(Wall) 자동 판정
+            block_type = "Floor" if abs(normal[1]) > 0.7 else "Wall"
+
+            raw_blocks.append({
+                "BlockID": block_id,
+                "PosX": round(pos_x, 2),
+                "PosY": round(pos_y, 2),
+                "PosZ": round(pos_z, 2),
+                "Stress": 0.00,
+                "RiskLevel": "Safe",
+                "Prescription": "N",
+                "Material": "Default",
+                "Tensile": 400.0,
+                "Compressive": 400.0,
+                "Tool": "Existing",
+                "Type": block_type,
+            })
+
+        print(f"📐 시도 {attempt + 1}: pitch={pitch} → {len(raw_blocks)}개 블록")
+        if len(raw_blocks) <= max_blocks:
+            break
+        pitch += GRID_PITCH  # 넘쳤으면 한 칸 더 키워서 재시도
+
+    return raw_blocks
+
+
+@app.post("/api/extract-3d-csv")
+async def extract_3d_csv(
+    file: UploadFile = File(...),
+    startX: float = Form(...),
+    startY: float = Form(...),
+    endX: float = Form(...),
+    endY: float = Form(...),
+    realHeightMeters: float = Form(...),
+):
+    print(f"📥 사진 데이터 및 박스 좌표 수신: ({startX}, {startY}) ~ ({endX}, {endY}) | 실제 높이: {realHeightMeters}m")
+
+    # 1. 이미지 로드 (박스 영역만 잘라서 콜랍으로 보내면 결과가 더 정확함)
+    img_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이미지를 읽을 수 없습니다 (지원하지 않는 포맷일 수 있음): {e}",
+        )
+
+    sx, sy = max(0, int(startX)), max(0, int(startY))
+    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
+    cropped = image.crop((sx, sy, ex, ey))
+
+    crop_bytes_io = io.BytesIO()
+    cropped.save(crop_bytes_io, format="PNG")
+    crop_bytes = crop_bytes_io.getvalue()
+
+    # 2. 콜랍 TripoSR 모델로 단일 사진 → 3D 메시 생성 (뒷면/옆면까지 AI가 추론)
+    print("🤖 콜랍 AI 모델에 메시 생성 요청 중...")
+    mesh = get_mesh_from_colab(crop_bytes)
+    print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
+
+    # 3. 메시를 실제 크기로 스케일 보정 후, 표면(겉면)만 빈틈없이 블록화
+    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
+
+    # 4. Pandas 데이터프레임화
+    df = pd.DataFrame(raw_blocks)
+    df = df.drop_duplicates(subset=["BlockID"])
+    df = df.sort_values(by=["PosZ", "PosX", "PosY"])
+
+    print(f"✅ 총 {len(df)}개의 3D 빌딩 블록 엑셀 변환 완료! (속은 비어있는 표면 전용 구조)")
+
+    # 5. CSV 스트리밍 반환
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    output.seek(0)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ai_extracted_3d.csv"},
+    )
+
+
+if __name__ == "__main__":
+    print("🚀 CAD AI 백엔드 서버를 시작합니다. (포트 8000)")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+// FILE PATH: 요약2.py
+// MODIFIED: 26-06-29 00:49 | LINES: 83
+```py
+import os
+import datetime
+
+def gather_files():
+    # 🔍 수집할 핵심 파일 확장자 (.js, .css 등 추가 가능)
+    target_extensions = ('.py', '.jsx', '.html', '.bat', '.js')
+    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+    
+    # 💡 1000줄 넘으면 다음 part로 분할
+    MAX_LINES_PER_FILE = 1000 
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_data = []
+    
+    print("📦 파일 스캔 및 내용 수집 중...")
+    
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_folders]
+        
+        for file in files:
+            if file.endswith(target_extensions):
+                # 💡 만들어진 결과물이 다시 스캔되는 것을 방지
+                if file.startswith("코드모음_"):
+                    continue
+                    
+                filepath = os.path.join(root, file)
+                # AI가 파일 구조를 이해하기 쉽도록 절대경로 대신 상대경로 추출
+                rel_path = os.path.relpath(filepath, base_dir) 
+                
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
+                    
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                        content = "".join(lines)
+                        line_count = len(lines)
+                        
+                    files_data.append({
+                        'path': rel_path.replace("\\", "/"), # 윈도우 경로(\)를 표준(/)으로 변경
+                        'time': dt,
+                        'line_count': line_count,
+                        'content': content,
+                        'extension': file.split('.')[-1]
+                    })
+                except Exception as e:
+                    print(f"⚠️ {file} 읽기 실패: {e}")
+                    
+    files_data.sort(key=lambda x: x['time'], reverse=True)
+    
+    if not files_data:
+        print("❌ 수집할 파일이 없습니다.")
+        return
+
+    current_part = 1
+    current_lines = 0
+    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+    
+    for f_data in files_data:
+        # 💡 AI가 완벽하게 파싱할 수 있는 파일 헤더와 마크다운 코드 블록 양식
+        header = f"// FILE PATH: {f_data['path']}\n"
+        header += f"// MODIFIED: {f_data['time']} | LINES: {f_data['line_count']}\n"
+        code_block_start = f"```{f_data['extension']}\n"
+        code_block_end = "\n```\n\n"
+        
+        formatted_content = header + code_block_start + f_data['content'] + code_block_end
+        
+        added_lines = f_data['line_count'] + 6 
+        
+        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
+            out_f.close()
+            current_part += 1
+            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+            current_lines = 0
+            
+        out_f.write(formatted_content)
+        current_lines += added_lines
+        
+    out_f.close()
+    print(f"✅ 총 {current_part}개의 파트로 AI 최적화 코드 모음이 생성되었습니다.")
+
+if __name__ == "__main__":
+    gather_files()
+```
+
+// FILE PATH: src/views/DetailView.jsx
+// MODIFIED: 26-06-28 14:47 | LINES: 153
+```jsx
+import React, { useMemo } from 'react'; // useMemo 추가
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+// ⭐ 1. 우리가 만든 3D 라이브 데모 뷰어 컴포넌트 불러오기
+import LiveDemoViewer from '../components/LiveDemoViewer';
+
+export default function DetailView({
+  selectedBp,
+  setView,
+  comments,
+  commentInput,
+  setCommentInput,
+  likeCount,
+  hasLiked,
+  onLikeToggle,
+  onAddComment,
+  onEditBlueprint
+}) {
+  // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
+  const calculateFileSize = () => {
+    if (!selectedBp?.grid_data) return "0.00 KB";
+    const strLen = JSON.stringify(selectedBp.grid_data).length;
+    return (strLen / 1024).toFixed(2) + " KB";
+  };
+
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
+  };
+
+
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
+      {/* 상단 네비게이션 헤더 */}
+      <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shadow-sm sticky top-0 z-10">
+        <div className="flex items-center space-x-4">
+          <button 
+            onClick={() => setView('dashboard')} 
+            className="p-2 hover:bg-gray-100 rounded-xl text-gray-600 font-bold transition-all flex items-center space-x-1 text-sm"
+          >
+            <span>◀</span> <span>대시보드로 가기</span>
+          </button>
+          <div className="h-6 w-[1px] bg-gray-200" />
+          <h2 className="text-xl font-black text-gray-900">{selectedBp.name}</h2>
+        </div>
+        <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
+          설계도 뷰어 모드
+        </div>
+      </header>
+
+      {/* 대화형 메인 그리드 및 소셜 시스템 (2분할 구성) */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 flex flex-col md:flex-row gap-8">
+        
+        {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
+        <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
+          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">구조물 설계도 평면도 미리보기</div>
+          
+          {/* ⭐ 3. 기존 2D 평면도 윗부분에 3D 라이브 데모 추가 */}
+          <div className="w-full h-[300px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+            <LiveDemoViewer grid={selectedBp?.grid_data} mode="static" maxBlocks={10000} />
+          </div>
+
+          <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
+              {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
+                <div
+                  key={`detail-cell-${rIdx}-${cIdx}`}
+                  className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
+                />
+              )))}
+            </div>
+          </div>
+          
+          <div className="w-full flex flex-col gap-3 mt-6">
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
+                📸 PNG 이미지 다운로드 (mbs_)
+              </button>
+              <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
+                📊 CSV 데이터 내보내기
+              </button>
+            </div>
+            <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
+              📐 이 도면 편집기로 열기 (CAD 작업실 이동)
+            </button>
+          </div>
+        </div>
+
+        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 (기존 코드 완벽 유지) */}
+        <div className="w-full md:w-[400px] bg-white border border-gray-200 rounded-2xl p-6 flex flex-col shadow-sm justify-between">
+          <div>
+            <h3 className="text-base font-black text-gray-900 mb-4 pb-2 border-b border-gray-100">📋 설계 도면 정보</h3>
+            
+            <div className="bg-gray-50 p-4 rounded-xl text-xs space-y-3 text-gray-600 font-medium mb-5 border border-gray-100">
+              <div className="flex justify-between"><span>👤 설계자</span> <span className="text-blue-600 font-bold">{selectedBp.author}</span></div>
+              <div className="flex justify-between"><span>📅 제작일자</span> <span className="text-gray-900 font-bold">{new Date(selectedBp.created_at).toLocaleString()}</span></div>
+              <div className="flex justify-between"><span>💾 파일 용량</span> <span className="text-green-600 font-bold">{calculateFileSize()}</span></div>
+            </div>
+
+            <div className="mb-6">
+              <button 
+                onClick={onLikeToggle} 
+                className={`flex items-center space-x-2 px-5 py-2.5 rounded-full border text-xs font-bold transition-all shadow-sm ${
+                  hasLiked ? 'bg-red-50 border-red-200 text-red-500 shadow-red-100/30' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <span>{hasLiked ? '❤️' : '🤍'}</span>
+                <span>좋아요 {likeCount}개</span>
+              </button>
+            </div>
+
+            <div className="border-t border-gray-100 pt-5">
+              <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">💬 피드백 및 댓글 ({comments.length})</h4>
+              <div className="space-y-3 max-h-[260px] overflow-y-auto pr-1">
+                {comments.length === 0 ? (
+                  <div className="text-center py-10 bg-gray-50 rounded-xl border border-dashed border-gray-200 text-xs text-gray-400 font-medium">
+                    등록된 피드백이 없습니다.<br/>첫 댓글을 달아 칭찬해보세요!
+                  </div>
+                ) : (
+                  comments.map(comment => (
+                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs border border-gray-100">
+                      <div className="flex justify-between font-bold text-gray-700 mb-1">
+                        <span>{comment.username || '익명'}</span>
+                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
+                      </div>
+                      <p className="text-gray-600 font-medium break-all whitespace-pre-wrap">{comment.content}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-100 pt-4 mt-6 flex gap-2">
+            <input 
+              type="text" 
+              value={commentInput}
+              onChange={e => setCommentInput(e.target.value)}
+              placeholder="댓글을 남겨보세요..."
+              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 focus:bg-white transition-all font-medium"
+              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
+            />
+            <button onClick={onAddComment} className="px-5 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 shadow-sm transition-all whitespace-nowrap">
+              등록
+            </button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  );
+}
+```
+
 // FILE PATH: src/utils/cadUtils.js
 // MODIFIED: 26-06-28 02:35 | LINES: 197
 ```js
@@ -505,471 +977,6 @@ export default function BlueprintDetailModal({
             </button>
           </div>
 
-        </div>
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: trace_deps.py
-// MODIFIED: 26-06-14 19:17 | LINES: 90
-```py
-import os
-import re
-from collections import defaultdict
-
-# 탐색할 최상위 경로 (현재 스크립트가 있는 폴더 기준)
-BASE_DIR = '.'
-# 무시할 폴더 (스캔 속도를 높이고 불필요한 추적 방지)
-IGNORE_DIRS = {'node_modules', '.git', '.vite', 'dist', 'build', 'public'}
-
-# 그래프 딕셔너리 초기화
-# forward_graph: 이 파일이 가져다 쓰는 코드 목록 (Imports)
-# reverse_graph: 이 파일을 가져다 쓰는 코드 목록 (Used By)
-forward_graph = defaultdict(set)
-reverse_graph = defaultdict(set)
-
-def scan_project():
-    print("🔍 프로젝트 전체 코드를 스캔하여 관계 지도를 그리는 중입니다...\n")
-    
-    # 1. 모든 JS/JSX 파일 찾기
-    all_files = []
-    for root, dirs, files in os.walk(BASE_DIR):
-        # 무시할 폴더 제외
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
-        for file in files:
-            if file.endswith('.js') or file.endswith('.jsx'):
-                all_files.append(os.path.normpath(os.path.join(root, file)))
-
-    # import 구문 찾는 정규식
-    import_pattern = re.compile(r"import\s+.*?(?:from\s+)?['\"](.*?)['\"]")
-
-    # 2. 각 파일의 import 분석하여 관계망 형성
-    for file_path in all_files:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            
-        matches = import_pattern.findall(content)
-        
-        for match in matches:
-            # 경로에서 마지막 파일명만 추출 (예: ../components/Button -> Button)
-            target_name = match.split('/')[-1] 
-            target_base = target_name.replace('.jsx', '').replace('.js', '')
-            
-            # 스캔된 전체 로컬 파일 중 이름이 일치하는 파일 찾기 (외부 패키지 제외 효과)
-            for target_file in all_files:
-                target_filename_base = os.path.basename(target_file).replace('.jsx', '').replace('.js', '')
-                if target_base == target_filename_base:
-                    forward_graph[file_path].add(target_file)
-                    reverse_graph[target_file].add(file_path)
-
-    print(f"✅ 스캔 완료! 총 {len(all_files)}개의 코드를 분석하여 지도를 완성했습니다.")
-
-def search_dependencies():
-    while True:
-        print("=" * 60)
-        query = input("💡 검색할 파일명 입력 (예: App, cadUtils) / 종료는 q: ").strip()
-        
-        if query.lower() == 'q':
-            print("🚀 프로그램을 종료합니다. 커피 한 잔 하시면서 쉬세요!")
-            break
-            
-        if not query:
-            continue
-            
-        # 검색어와 부분 일치하는 파일 찾기
-        found_files = [f for f in forward_graph.keys() | reverse_graph.keys() if query.lower() in os.path.basename(f).lower()]
-        
-        if not found_files:
-            print(f"❌ '{query}'(이)가 포함된 코드를 찾을 수 없거나, 연결된 의존성이 없습니다.")
-            continue
-            
-        for target in found_files:
-            print(f"\n📂 [선택된 파일]: {target}")
-            
-            print("\n  [⬇️ 이 파일이 가져다 쓰는 코드 (Imports)]")
-            if forward_graph[target]:
-                for dep in sorted(forward_graph[target]):
-                    print(f"    - {dep}")
-            else:
-                print("    (없음)")
-                
-            print("\n  [⬆️ 이 파일을 가져다 쓰는 코드 (Used By)]")
-            if reverse_graph[target]:
-                for dep in sorted(reverse_graph[target]):
-                    print(f"    - {dep}")
-            else:
-                print("    (없음)")
-
-if __name__ == "__main__":
-    scan_project()
-    search_dependencies()
-```
-
-// FILE PATH: eslint.config.js
-// MODIFIED: 26-06-03 17:04 | LINES: 21
-```js
-import js from '@eslint/js'
-import globals from 'globals'
-import reactHooks from 'eslint-plugin-react-hooks'
-import reactRefresh from 'eslint-plugin-react-refresh'
-import { defineConfig, globalIgnores } from 'eslint/config'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{js,jsx}'],
-    extends: [
-      js.configs.recommended,
-      reactHooks.configs.flat.recommended,
-      reactRefresh.configs.vite,
-    ],
-    languageOptions: {
-      globals: globals.browser,
-      parserOptions: { ecmaFeatures: { jsx: true } },
-    },
-  },
-])
-
-```
-
-// FILE PATH: hometinker.html
-// MODIFIED: 26-06-03 17:04 | LINES: 65
-```html
-import React from 'react';
-
-export default function BuilderDashboard() {
-  return (
-    <div className="flex h-screen bg-gray-50">
-      
-      {/* 1. 좌측 사이드바 */}
-      <aside className="w-64 bg-white border-r flex flex-col">
-        <div className="p-6 font-black text-2xl text-blue-600 border-b">
-          🏗️ MY CAD
-        </div>
-        <nav className="flex-col p-4 space-y-2 text-gray-700 font-semibold">
-          <button className="w-full text-left p-3 bg-blue-50 text-blue-600 rounded-lg">🏠 홈</button>
-          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📐 디자인</button>
-          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📁 컬렉션</button>
-          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📚 튜토리얼</button>
-          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">🏆 랭킹</button>
-        </nav>
-      </aside>
-
-      {/* 2. 우측 메인 대시보드 */}
-      <main className="flex-1 p-8 overflow-y-auto">
-        <header className="flex justify-end mb-8">
-          <button className="bg-blue-600 text-white px-4 py-2 rounded-full font-bold shadow-md hover:bg-blue-700">
-            + 만들기
-          </button>
-        </header>
-
-        {/* 상단 섹션: 3D 구조물 외형 */}
-        <section className="mb-12">
-          <h2 className="text-2xl font-bold mb-6 text-gray-800">🏢 구조물 or 건축물 외형</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {/* 카드 컴포넌트 예시 */}
-            <div className="h-56 bg-white border rounded-xl shadow-sm hover:shadow-lg transition cursor-pointer flex flex-col">
-              <div className="h-3/4 bg-gray-200 rounded-t-xl flex items-center justify-center text-gray-400">
-                [3D 미리보기 이미지]
-              </div>
-              <div className="p-4 font-semibold text-gray-700">내 첫 번째 대저택</div>
-            </div>
-          </div>
-        </section>
-
-        {/* 하단 섹션: 2D 집 설계도면 */}
-        <section>
-          <h2 className="text-2xl font-bold mb-6 text-gray-800">📝 집 설계도면</h2>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-            {/* 새 도면 만들기 카드 */}
-            <div className="h-40 bg-blue-50 border border-blue-200 rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex items-center justify-center flex-col text-blue-600">
-              <span className="text-3xl mb-2">➕</span>
-              <span className="font-bold">새 50x50 도면 그리기</span>
-            </div>
-            {/* 기존 도면 카드 */}
-            <div className="h-40 bg-white border rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex flex-col">
-              <div className="h-2/3 bg-gray-100 rounded-t-xl p-2 text-xs text-gray-400 overflow-hidden">
-                [격자 도면 미니맵]
-              </div>
-              <div className="p-3 font-semibold text-gray-700 text-sm">1층 평면도_완성본</div>
-            </div>
-          </div>
-        </section>
-
-      </main>
-    </div>
-  );
-}
-```
-
-// FILE PATH: index.html
-// MODIFIED: 26-06-03 17:04 | LINES: 13
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>my-cad-builder</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
-
-```
-
-// FILE PATH: postcss.config.js
-// MODIFIED: 26-06-03 17:04 | LINES: 6
-```js
-export default {
-  plugins: {
-    "@tailwindcss/postcss": {},
-    autoprefixer: {},
-  },
-}
-```
-
-// FILE PATH: tailwind.config.js
-// MODIFIED: 26-06-03 17:04 | LINES: 11
-```js
-/** @type {import('tailwindcss').Config} */
-export default {
-  content: [
-    "./index.html",
-    "./src/**/*.{js,ts,jsx,tsx}",
-  ],
-  theme: {
-    extend: {},
-  },
-  plugins: [],
-}
-```
-
-// FILE PATH: vite.config.js
-// MODIFIED: 26-06-03 17:04 | LINES: 7
-```js
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [react()],
-})
-
-```
-
-// FILE PATH: 요약.py
-// MODIFIED: 26-06-03 17:04 | LINES: 90
-```py
-import os
-import datetime
-
-def gather_files():
-    # 🔍 수집할 핵심 파일 확장자
-    target_extensions = ('.py', '.jsx', '.html', '.bat')
-    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
-    
-    # 💡 한 텍스트 파일당 최대 몇 줄까지 담을지 설정 (원하시면 숫자를 수정하세요!)
-    MAX_LINES_PER_FILE = 1000 
-    
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    files_data = []
-    
-    print("📦 파일 스캔 및 내용 수집 중...")
-    
-    for root, dirs, files in os.walk(base_dir):
-        dirs[:] = [d for d in dirs if d not in ignore_folders]
-        
-        for file in files:
-            if file.endswith(target_extensions):
-                # 💡 만들어진 결과물(코드모음_*.txt)이 다시 스캔되는 것을 방지
-                if file.startswith("코드모음_"):
-                    continue
-                    
-                filepath = os.path.join(root, file)
-                
-                try:
-                    mtime = os.path.getmtime(filepath)
-                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
-                    
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        lines = f.readlines()
-                        content = "".join(lines)
-                        line_count = len(lines) # 글자 수가 아닌 '줄 수' 계산!
-                    
-                    files_data.append({
-                        'path': os.path.relpath(filepath, base_dir),
-                        'time': dt,
-                        'line_count': line_count,
-                        'mtime': mtime,
-                        'content': content
-                    })
-                    
-                except Exception as e:
-                    pass 
-
-    # 최근 수정된 순서대로 정렬
-    files_data.sort(key=lambda x: x['mtime'], reverse=True)
-    
-    if not files_data:
-        print("❌ 수집할 파일이 없습니다.")
-        return
-
-    # ---------------------------------------------------------
-    # 💡 수집된 내용들을 여러 개의 텍스트 파일로 쪼개서 저장하기
-    # ---------------------------------------------------------
-    current_part = 1
-    current_lines = 0
-    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
-    
-    for f_data in files_data:
-        # 파일별 제목 헤더 (예: [26-05-12 16:44] main.py (50줄))
-        header = f"\n\n{'='*60}\n[{f_data['time']}] {f_data['path']} ({f_data['line_count']}줄)\n{'='*60}\n\n"
-        
-        # 파일 하나를 추가할 때 예상되는 줄 수
-        added_lines = f_data['line_count'] + 6 
-        
-        # 만약 이 파일을 넣었을 때 제한(MAX_LINES_PER_FILE)을 넘는다면 새 파일 만들기
-        # 단, current_lines가 0일 때는 파일 하나가 1000줄이 넘더라도 일단 무조건 넣습니다.
-        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
-            out_f.close()
-            current_part += 1
-            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
-            current_lines = 0
-            
-        out_f.write(header)
-        out_f.write(f_data['content'])
-        current_lines += added_lines
-
-    out_f.close()
-    
-    print("=" * 60)
-    print(f"✅ 총 {len(files_data)}개의 파일 코드를 성공적으로 수집했습니다!")
-    print(f"📁 '코드모음_part1.txt' ~ '코드모음_part{current_part}.txt' 에 나뉘어 저장되었습니다.")
-    print("=" * 60)
-
-if __name__ == "__main__":
-    gather_files()
-    input("\n엔터를 누르면 종료됩니다...")
-```
-
-// FILE PATH: src/main.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 10
-```jsx
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
-import App from './App.jsx'
-
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-
-```
-
-// FILE PATH: src/supabaseClient.js
-// MODIFIED: 26-06-03 17:04 | LINES: 7
-```js
-import { createClient } from '@supabase/supabase-js'
-
-// 금고(.env)에서 자재 꺼내오기
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
-```
-
-// FILE PATH: src/components/BlueprintCard.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 19
-```jsx
-import React from 'react';
-
-export default function BlueprintCard({ bp, onClick }) {
-  return (
-    <div 
-      onClick={onClick} 
-      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98"
-    >
-      <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">🏗️</div>
-      <div className="p-5">
-        <div className="font-bold text-lg text-gray-900">{bp.name}</div>
-        <div className="flex justify-between items-center mt-2">
-          <span className="text-sm text-blue-600 font-bold">{bp.author}</span>
-          <span className="text-xs text-gray-400">{new Date(bp.created_at).toLocaleDateString()}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/components/ui/Button.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 13
-```jsx
-import React from 'react';
-
-export default function Button({ children, variant = 'primary', className = '', ...props }) {
-  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
-  const styles = {
-    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
-    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
-    dark: "bg-gray-800 text-white hover:bg-black",
-    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
-    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
-  };
-  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
-}
-```
-
-// FILE PATH: src/components/ui/Input.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 10
-```jsx
-import React from 'react';
-
-export default function Input({ label, className = '', ...props }) {
-  return (
-    <div className="space-y-1 w-full">
-      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
-      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/AuthView.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 29
-```jsx
-import React from 'react';
-import Input from '../components/ui/Input';
-import Button from '../components/ui/Button';
-
-export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
-  return (
-    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
-      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
-        <div className="text-blue-600 text-center mb-8">
-          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
-          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
-        </div>
-        <div className="space-y-4">
-          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
-          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
-          {authMode === 'signup' && (
-            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
-          )}
-          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
-            {authMode === 'login' ? '로그인' : '회원가입 하기'}
-          </Button>
-          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
-            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
-          </p>
         </div>
       </div>
     </div>

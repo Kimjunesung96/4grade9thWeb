@@ -48,13 +48,20 @@ function parseCsvToBlocks(csvText) {
 
 // 🌟 쿼터니언 회전을 블록 좌표에 적용하고, 회전 후 바닥이 Y=1.5 근처로 오도록 다시 정렬
 function applyRotationToBlocks(blocks, quatArray) {
+  if (blocks.length === 0) return blocks;
   const q = new THREE.Quaternion(...quatArray);
+
+  // 🌟 미리보기(RotatableGroup)와 동일하게 "바운딩박스 중심"을 피벗으로 잡는다.
+  //    (기존엔 원점(0,0,0) 기준으로 회전시켜서 건물이 원래 자리에서 확 벗어나 버렸음)
+  const cx = (Math.min(...blocks.map(b => b.x)) + Math.max(...blocks.map(b => b.x))) / 2;
+  const cy = (Math.min(...blocks.map(b => b.y)) + Math.max(...blocks.map(b => b.y))) / 2;
+  const cz = (Math.min(...blocks.map(b => b.z)) + Math.max(...blocks.map(b => b.z))) / 2;
+
   const rotated = blocks.map(b => {
-    const v = new THREE.Vector3(b.x, b.y, b.z).applyQuaternion(q);
-    return { ...b, x: v.x, y: v.y, z: v.z };
+    const v = new THREE.Vector3(b.x - cx, b.y - cy, b.z - cz).applyQuaternion(q);
+    return { ...b, x: v.x + cx, y: v.y + cy, z: v.z + cz };
   });
 
-  if (rotated.length === 0) return rotated;
   const minY = Math.min(...rotated.map(b => b.y));
   const yOffset = 1.5 - minY; // 바닥 블록 중심이 1.5에 오도록 평행이동
 
@@ -71,10 +78,14 @@ function blocksToCsvText(blocks, headers) {
   const finalHeaders = headers.length > 0
     ? headers
     : ['BlockID', 'PosX', 'PosY', 'PosZ', 'Stress', 'RiskLevel', 'Prescription', 'Material', 'Tensile', 'Compressive', 'Tool', 'Type'];
-
+  
   const rows = blocks.map(b => {
+    // 🔥 핵심: 웹(RH) -> 유니티(LH) 완벽 동기화를 위해 Z축 좌표 부호를 반전!
+    const exportZ = -b.z; 
+
+    // ID 생성 (반전된 Z값 적용)
     const idX = formatID(b.x * 10);
-    const idZ = formatID(b.z * 10);
+    const idZ = formatID(exportZ * 10);
     const idY = formatID(b.y * 10);
     const blockId = `${idX}_${idZ}_${idY}`;
 
@@ -82,12 +93,12 @@ function blocksToCsvText(blocks, headers) {
       if (h === 'BlockID') return blockId;
       if (h === 'PosX') return b.x;
       if (h === 'PosY') return b.y;
-      if (h === 'PosZ') return b.z;
-      // 그 외 컬럼은 원본 raw 값 그대로 (없으면 빈칸)
+      if (h === 'PosZ') return exportZ; // 반전된 Z값 내보내기
+      // 그 외 원본 컬럼 유지
       return b.raw?.[h] ?? '';
     }).join(',');
   });
-
+  
   return [finalHeaders.join(','), ...rows].join('\n');
 }
 
@@ -102,6 +113,14 @@ function downloadCsvText(csvText, filename) {
 }
 
 const IDENTITY_QUAT = [0, 0, 0, 1];
+
+// 🌟 화면(라이브데모)은 지금 보이는 그대로 유지하고,
+//    "엑셀(CSV) 다운로드" 할 때만 여기에 오른쪽 225도를 추가로 얹어서 내보냄.
+//    즉: 엑셀 = (라이브데모에 보이는 회전) + (오른쪽 225도 추가)
+const EXPORT_EXTRA_RIGHT_225_QUAT = (() => {
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), (3 * Math.PI) / 4);
+  return [q.x, q.y, q.z, q.w];
+})();
 
 export default function EditorView({
   grid, setGrid, mode, setMode, activeFloor, setActiveFloor, setView,
@@ -120,6 +139,12 @@ export default function EditorView({
   // 🌟 회전 상태 (쿼터니언 [x,y,z,w]) — 버튼/기즈모 둘 다 이 상태를 공유
   const [rotationQuat, setRotationQuat] = useState(IDENTITY_QUAT);
 
+  // 🌟 "영점(0점)" — 90도 버튼만으로는 못 맞추는 애매한 각도(예: 135도)를
+  //    기즈모로 자유롭게 맞춘 뒤 "여기를 0점으로 저장"하면 이 값이 바뀜.
+  //    이후 "초기화" 버튼은 진짜 원본이 아니라 이 저장된 영점으로 돌아가고,
+  //    90도 버튼도 이 영점을 기준으로 이어서 돌게 됨.
+  const [baseRotationQuat, setBaseRotationQuat] = useState(IDENTITY_QUAT);
+
   // 🌟 AI 사진 추출용 추가 상태들
   const [imageSrc, setImageSrc] = useState(null);
   const [imageFile, setImageFile] = useState(null);
@@ -137,6 +162,33 @@ export default function EditorView({
     if (rotationQuat === IDENTITY_QUAT) return extracted3DData;
     return applyRotationToBlocks(extracted3DData, rotationQuat);
   }, [extracted3DData, rotationQuat]);
+
+  // 🎯 묶여있던 handleCloudSave 함수를 useMemo 바깥으로 독립시켰습니다.
+  const handleCloudSave = () => {
+    if (editorTab === 'grid') {
+      // 1. 2D 모드일 때 저장
+      uploadToShowcase({ grid_data: grid });
+    } else {
+      // 2. 3D 모드일 때 저장
+      if (rotatedBlocks.length === 0) {
+        alert("추출된 3D 데이터가 없습니다.");
+        return;
+      }
+
+      // 화면에 있는 3D 캔버스를 찾아 사진(Base64)으로 찰칵!
+      const canvas = document.querySelector('canvas');
+      const thumbnailBase64 = canvas ? canvas.toDataURL('image/png') : null;
+
+      // 3D 데이터를 CSV 텍스트로 직렬화
+      const csvText = blocksToCsvText(rotatedBlocks, csvHeaders);
+
+      // App.jsx의 업로드 함수로 전달
+      uploadToShowcase({ 
+        csv_data: csvText, 
+        thumbnail_url: thumbnailBase64 
+      });
+    }
+  };
 
   const handlePngSave = () => {
     const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", "신축도면");
@@ -193,7 +245,8 @@ export default function EditorView({
       setExtracted3DData(blocks);
       setCsvHeaders(headers);
       setRawCsvText(csvText);
-      setRotationQuat(IDENTITY_QUAT); // 새로 추출했으니 회전 초기화
+      setRotationQuat(IDENTITY_QUAT); // 새로 추출했으니 화면(라이브데모) 회전은 원본 그대로
+      setBaseRotationQuat(IDENTITY_QUAT); // 영점도 원본(0도)으로
 
       // 🌟 "원본" CSV는 추출 직후 자동으로 다운로드 (백업용)
       downloadCsvText(csvText, `ai_extracted_원본_${Date.now()}.csv`);
@@ -226,6 +279,7 @@ export default function EditorView({
       setCsvHeaders(headers);
       setRawCsvText(csvText);
       setRotationQuat(IDENTITY_QUAT);
+      setBaseRotationQuat(IDENTITY_QUAT);
       alert(`📂 ${blocks.length.toLocaleString()}개 블록을 불러왔습니다. 회전을 조정해보세요.`);
     };
     reader.readAsText(file);
@@ -241,11 +295,21 @@ export default function EditorView({
     setRotationQuat([current.x, current.y, current.z, current.w]);
   };
 
-  const handleDownloadEdited = () => {
-    if (rotatedBlocks.length === 0) return;
-    const csvText = blocksToCsvText(rotatedBlocks, csvHeaders);
-    downloadCsvText(csvText, `ai_extracted_편집본_${Date.now()}.csv`);
+  // 🌟 지금 기즈모/버튼으로 맞춰놓은 각도(135도 같은 애매한 값도 포함)를
+  //    그대로 "0점"으로 저장 — 이후 초기화/90도 버튼은 이 각도를 기준으로 동작
+  const handleSetZeroPoint = () => {
+    setBaseRotationQuat(rotationQuat);
+    alert("📍 현재 각도를 0점으로 저장했습니다. 이제부터 '초기화'를 누르면 이 각도로 돌아옵니다.");
   };
+
+  const handleDownloadEdited = () => {
+  if (rotatedBlocks.length === 0) return;
+  
+  // 예전 코드에 있던 임의의 각도(225도 등) 추가 로직을 완전 제거합니다.
+  // 화면에 보이는 블록 배열(rotatedBlocks) 상태 그대로 CSV 직렬화!
+  const csvText = blocksToCsvText(rotatedBlocks, csvHeaders);
+  downloadCsvText(csvText, `ai_extracted_편집본_${Date.now()}.csv`);
+};
 
   const handleDownloadOriginal = () => {
     if (!rawCsvText) return;
@@ -263,7 +327,7 @@ export default function EditorView({
           <h1 className="text-xl font-black text-gray-800">CAD 에디터</h1>
         </div>
         <div className="flex space-x-2">
-          <Button variant="primary" onClick={uploadToShowcase}>🌐 클라우드 저장</Button>
+          <Button variant="primary" onClick={handleCloudSave}>🌐 클라우드 저장</Button>
           <Button variant="dark" onClick={handlePngSave}>PNG 저장 (mbs_)</Button>
           <Button variant="secondary" onClick={() => exportToCSV(grid)}>CSV 내보내기</Button>
         </div>
@@ -446,19 +510,23 @@ export default function EditorView({
                 {extracted3DData.length > 0 && (
                   <div className="w-full max-w-2xl mt-6 bg-white p-5 rounded-2xl shadow-sm border border-gray-200">
                     <h3 className="font-bold text-gray-800 mb-3">🔄 회전 편집</h3>
-                    <p className="text-xs text-gray-500 mb-3">버튼으로 90도씩 빠르게 돌리거나, 오른쪽 미리보기의 기즈모를 드래그해서 자유롭게 맞춰보세요.</p>
+                    <p className="text-xs text-gray-500 mb-3">버튼으로 90도씩 빠르게 돌리거나, 오른쪽 미리보기의 기즈모를 드래그해서 자유롭게 맞춰보세요. 이 화면이 곧 최종 모습은 아니고, <b>다운로드 시 여기서 오른쪽으로 225도가 추가로 더 돌아간 상태</b>로 엑셀이 만들어집니다 (Unity 좌표계 보정용). 90도로 안 맞는 애매한 각도는 기즈모로 맞춘 뒤 <b>"📍 이 각도를 0점으로 저장"</b>을 눌러두면 초기화/90도 버튼이 그 각도를 기준으로 움직여요.</p>
 
                     <div className="flex flex-wrap items-center gap-2 mb-4">
                       <Button variant="secondary" onClick={() => rotateBy90('x', 1)}>X축 +90°</Button>
                       <Button variant="secondary" onClick={() => rotateBy90('x', -1)}>X축 -90°</Button>
                       <Button variant="secondary" onClick={() => rotateBy90('y', 1)}>Y축 +90°</Button>
                       <Button variant="secondary" onClick={() => rotateBy90('y', -1)}>Y축 -90°</Button>
-                      <Button variant="secondary" onClick={() => setRotationQuat(IDENTITY_QUAT)}>↺ 초기화</Button>
+                      <Button variant="secondary" onClick={() => setRotationQuat(baseRotationQuat)}>↺ 초기화 (저장된 0점으로)</Button>
+                    </div>
+
+                    <div className="flex items-center gap-2 mb-4">
+                      <Button variant="dark" onClick={handleSetZeroPoint}>📍 이 각도를 0점으로 저장</Button>
                     </div>
 
                     <div className="flex items-center gap-2">
                       <Button variant="secondary" onClick={handleDownloadOriginal}>📥 원본 다운로드</Button>
-                      <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(회전 적용) 다운로드</Button>
+                      <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(화면+225°) 다운로드</Button>
                     </div>
                   </div>
                 )}

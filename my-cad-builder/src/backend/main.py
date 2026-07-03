@@ -66,12 +66,31 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
     🌟 건프라 축소 비율 방식: 건물 표면적에 맞춰 블록 크기(pitch)를 역산해서,
     랜덤 솎아내기 없이 max_blocks 예산 안에서 표면 전체를 빈틈없이 덮습니다.
     """
-    # 0. 🌟 TripoSR 출력 메시는 좌표축이 누운 상태로 나오는 경향이 있어 세로로 세움
-    #    (X축 기준 +90도 회전 — TripoSR 커뮤니티에서 알려진 표준 보정값)
-    rotation_matrix = trimesh.transformations.rotation_matrix(
-        angle=np.radians(90), direction=[1, 0, 0], point=mesh.centroid
-    )
-    mesh.apply_transform(rotation_matrix)
+    # 0. 🌟 축 보정: range가 제일 큰 축 = 실제 "높이"라고 보고, 그 축을 Y로 맞춤
+    #    (고정 90도 보정 대신, TripoSR 결과물 방향이 들쭉날쭉해도 항상 맞도록 자동 판별)
+    extents = mesh.bounds[1] - mesh.bounds[0]  # [x_range, y_range, z_range]
+    tallest_axis = int(np.argmax(extents))
+
+    if tallest_axis == 2:  # 높이가 Z축 -> X축 기준 -90도 회전해서 Y로
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    elif tallest_axis == 0:  # 높이가 X축 -> Z축 기준 90도 회전해서 Y로
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    # tallest_axis == 1이면 이미 Y축이 높이니까 회전 안 함
+
+    # 🌟 앞뒤(Z축) 반전 보정: TripoSR/GLB 결과물이 항상 앞뒤가 뒤집혀서 나오므로
+    #    여기서 실제 메시 좌표 자체를 거울처럼 뒤집어서 CSV/미리보기가 처음부터 올바르게 나오게 함.
+    #    (프론트엔드에서 화면용으로 임시로 뒤집던 방식은 제거했음 — 이제 데이터 자체가 정답)
+    mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
+    mesh.apply_transform(mirror)
+    mesh.invert()  # 미러링하면 face winding이 뒤집혀서 법선이 반대로 계산됨 → 다시 뒤집어서 복구
+
+    print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
 
     # 1. AI가 만든 메시는 임의 크기라, 사용자가 입력한 실제 건물 높이에 맞춰 스케일 보정
     mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]

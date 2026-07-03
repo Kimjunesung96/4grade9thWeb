@@ -1,3 +1,468 @@
+// FILE PATH: trace_deps.py
+// MODIFIED: 26-06-14 19:17 | LINES: 90
+```py
+import os
+import re
+from collections import defaultdict
+
+# 탐색할 최상위 경로 (현재 스크립트가 있는 폴더 기준)
+BASE_DIR = '.'
+# 무시할 폴더 (스캔 속도를 높이고 불필요한 추적 방지)
+IGNORE_DIRS = {'node_modules', '.git', '.vite', 'dist', 'build', 'public'}
+
+# 그래프 딕셔너리 초기화
+# forward_graph: 이 파일이 가져다 쓰는 코드 목록 (Imports)
+# reverse_graph: 이 파일을 가져다 쓰는 코드 목록 (Used By)
+forward_graph = defaultdict(set)
+reverse_graph = defaultdict(set)
+
+def scan_project():
+    print("🔍 프로젝트 전체 코드를 스캔하여 관계 지도를 그리는 중입니다...\n")
+    
+    # 1. 모든 JS/JSX 파일 찾기
+    all_files = []
+    for root, dirs, files in os.walk(BASE_DIR):
+        # 무시할 폴더 제외
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for file in files:
+            if file.endswith('.js') or file.endswith('.jsx'):
+                all_files.append(os.path.normpath(os.path.join(root, file)))
+
+    # import 구문 찾는 정규식
+    import_pattern = re.compile(r"import\s+.*?(?:from\s+)?['\"](.*?)['\"]")
+
+    # 2. 각 파일의 import 분석하여 관계망 형성
+    for file_path in all_files:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+        matches = import_pattern.findall(content)
+        
+        for match in matches:
+            # 경로에서 마지막 파일명만 추출 (예: ../components/Button -> Button)
+            target_name = match.split('/')[-1] 
+            target_base = target_name.replace('.jsx', '').replace('.js', '')
+            
+            # 스캔된 전체 로컬 파일 중 이름이 일치하는 파일 찾기 (외부 패키지 제외 효과)
+            for target_file in all_files:
+                target_filename_base = os.path.basename(target_file).replace('.jsx', '').replace('.js', '')
+                if target_base == target_filename_base:
+                    forward_graph[file_path].add(target_file)
+                    reverse_graph[target_file].add(file_path)
+
+    print(f"✅ 스캔 완료! 총 {len(all_files)}개의 코드를 분석하여 지도를 완성했습니다.")
+
+def search_dependencies():
+    while True:
+        print("=" * 60)
+        query = input("💡 검색할 파일명 입력 (예: App, cadUtils) / 종료는 q: ").strip()
+        
+        if query.lower() == 'q':
+            print("🚀 프로그램을 종료합니다. 커피 한 잔 하시면서 쉬세요!")
+            break
+            
+        if not query:
+            continue
+            
+        # 검색어와 부분 일치하는 파일 찾기
+        found_files = [f for f in forward_graph.keys() | reverse_graph.keys() if query.lower() in os.path.basename(f).lower()]
+        
+        if not found_files:
+            print(f"❌ '{query}'(이)가 포함된 코드를 찾을 수 없거나, 연결된 의존성이 없습니다.")
+            continue
+            
+        for target in found_files:
+            print(f"\n📂 [선택된 파일]: {target}")
+            
+            print("\n  [⬇️ 이 파일이 가져다 쓰는 코드 (Imports)]")
+            if forward_graph[target]:
+                for dep in sorted(forward_graph[target]):
+                    print(f"    - {dep}")
+            else:
+                print("    (없음)")
+                
+            print("\n  [⬆️ 이 파일을 가져다 쓰는 코드 (Used By)]")
+            if reverse_graph[target]:
+                for dep in sorted(reverse_graph[target]):
+                    print(f"    - {dep}")
+            else:
+                print("    (없음)")
+
+if __name__ == "__main__":
+    scan_project()
+    search_dependencies()
+```
+
+// FILE PATH: eslint.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 21
+```js
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      globals: globals.browser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+  },
+])
+
+```
+
+// FILE PATH: hometinker.html
+// MODIFIED: 26-06-03 17:04 | LINES: 65
+```html
+import React from 'react';
+
+export default function BuilderDashboard() {
+  return (
+    <div className="flex h-screen bg-gray-50">
+      
+      {/* 1. 좌측 사이드바 */}
+      <aside className="w-64 bg-white border-r flex flex-col">
+        <div className="p-6 font-black text-2xl text-blue-600 border-b">
+          🏗️ MY CAD
+        </div>
+        <nav className="flex-col p-4 space-y-2 text-gray-700 font-semibold">
+          <button className="w-full text-left p-3 bg-blue-50 text-blue-600 rounded-lg">🏠 홈</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📐 디자인</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📁 컬렉션</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📚 튜토리얼</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">🏆 랭킹</button>
+        </nav>
+      </aside>
+
+      {/* 2. 우측 메인 대시보드 */}
+      <main className="flex-1 p-8 overflow-y-auto">
+        <header className="flex justify-end mb-8">
+          <button className="bg-blue-600 text-white px-4 py-2 rounded-full font-bold shadow-md hover:bg-blue-700">
+            + 만들기
+          </button>
+        </header>
+
+        {/* 상단 섹션: 3D 구조물 외형 */}
+        <section className="mb-12">
+          <h2 className="text-2xl font-bold mb-6 text-gray-800">🏢 구조물 or 건축물 외형</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* 카드 컴포넌트 예시 */}
+            <div className="h-56 bg-white border rounded-xl shadow-sm hover:shadow-lg transition cursor-pointer flex flex-col">
+              <div className="h-3/4 bg-gray-200 rounded-t-xl flex items-center justify-center text-gray-400">
+                [3D 미리보기 이미지]
+              </div>
+              <div className="p-4 font-semibold text-gray-700">내 첫 번째 대저택</div>
+            </div>
+          </div>
+        </section>
+
+        {/* 하단 섹션: 2D 집 설계도면 */}
+        <section>
+          <h2 className="text-2xl font-bold mb-6 text-gray-800">📝 집 설계도면</h2>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            {/* 새 도면 만들기 카드 */}
+            <div className="h-40 bg-blue-50 border border-blue-200 rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex items-center justify-center flex-col text-blue-600">
+              <span className="text-3xl mb-2">➕</span>
+              <span className="font-bold">새 50x50 도면 그리기</span>
+            </div>
+            {/* 기존 도면 카드 */}
+            <div className="h-40 bg-white border rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex flex-col">
+              <div className="h-2/3 bg-gray-100 rounded-t-xl p-2 text-xs text-gray-400 overflow-hidden">
+                [격자 도면 미니맵]
+              </div>
+              <div className="p-3 font-semibold text-gray-700 text-sm">1층 평면도_완성본</div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  );
+}
+```
+
+// FILE PATH: index.html
+// MODIFIED: 26-06-03 17:04 | LINES: 13
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>my-cad-builder</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+```
+
+// FILE PATH: postcss.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 6
+```js
+export default {
+  plugins: {
+    "@tailwindcss/postcss": {},
+    autoprefixer: {},
+  },
+}
+```
+
+// FILE PATH: tailwind.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 11
+```js
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+```
+
+// FILE PATH: vite.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 7
+```js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+
+```
+
+// FILE PATH: 요약.py
+// MODIFIED: 26-06-03 17:04 | LINES: 90
+```py
+import os
+import datetime
+
+def gather_files():
+    # 🔍 수집할 핵심 파일 확장자
+    target_extensions = ('.py', '.jsx', '.html', '.bat')
+    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+    
+    # 💡 한 텍스트 파일당 최대 몇 줄까지 담을지 설정 (원하시면 숫자를 수정하세요!)
+    MAX_LINES_PER_FILE = 1000 
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_data = []
+    
+    print("📦 파일 스캔 및 내용 수집 중...")
+    
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_folders]
+        
+        for file in files:
+            if file.endswith(target_extensions):
+                # 💡 만들어진 결과물(코드모음_*.txt)이 다시 스캔되는 것을 방지
+                if file.startswith("코드모음_"):
+                    continue
+                    
+                filepath = os.path.join(root, file)
+                
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
+                    
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                        content = "".join(lines)
+                        line_count = len(lines) # 글자 수가 아닌 '줄 수' 계산!
+                    
+                    files_data.append({
+                        'path': os.path.relpath(filepath, base_dir),
+                        'time': dt,
+                        'line_count': line_count,
+                        'mtime': mtime,
+                        'content': content
+                    })
+                    
+                except Exception as e:
+                    pass 
+
+    # 최근 수정된 순서대로 정렬
+    files_data.sort(key=lambda x: x['mtime'], reverse=True)
+    
+    if not files_data:
+        print("❌ 수집할 파일이 없습니다.")
+        return
+
+    # ---------------------------------------------------------
+    # 💡 수집된 내용들을 여러 개의 텍스트 파일로 쪼개서 저장하기
+    # ---------------------------------------------------------
+    current_part = 1
+    current_lines = 0
+    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+    
+    for f_data in files_data:
+        # 파일별 제목 헤더 (예: [26-05-12 16:44] main.py (50줄))
+        header = f"\n\n{'='*60}\n[{f_data['time']}] {f_data['path']} ({f_data['line_count']}줄)\n{'='*60}\n\n"
+        
+        # 파일 하나를 추가할 때 예상되는 줄 수
+        added_lines = f_data['line_count'] + 6 
+        
+        # 만약 이 파일을 넣었을 때 제한(MAX_LINES_PER_FILE)을 넘는다면 새 파일 만들기
+        # 단, current_lines가 0일 때는 파일 하나가 1000줄이 넘더라도 일단 무조건 넣습니다.
+        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
+            out_f.close()
+            current_part += 1
+            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+            current_lines = 0
+            
+        out_f.write(header)
+        out_f.write(f_data['content'])
+        current_lines += added_lines
+
+    out_f.close()
+    
+    print("=" * 60)
+    print(f"✅ 총 {len(files_data)}개의 파일 코드를 성공적으로 수집했습니다!")
+    print(f"📁 '코드모음_part1.txt' ~ '코드모음_part{current_part}.txt' 에 나뉘어 저장되었습니다.")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    gather_files()
+    input("\n엔터를 누르면 종료됩니다...")
+```
+
+// FILE PATH: src/main.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+```
+
+// FILE PATH: src/supabaseClient.js
+// MODIFIED: 26-06-03 17:04 | LINES: 7
+```js
+import { createClient } from '@supabase/supabase-js'
+
+// 금고(.env)에서 자재 꺼내오기
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+```
+
+// FILE PATH: src/components/BlueprintCard.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 19
+```jsx
+import React from 'react';
+
+export default function BlueprintCard({ bp, onClick }) {
+  return (
+    <div 
+      onClick={onClick} 
+      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98"
+    >
+      <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">🏗️</div>
+      <div className="p-5">
+        <div className="font-bold text-lg text-gray-900">{bp.name}</div>
+        <div className="flex justify-between items-center mt-2">
+          <span className="text-sm text-blue-600 font-bold">{bp.author}</span>
+          <span className="text-xs text-gray-400">{new Date(bp.created_at).toLocaleDateString()}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/components/ui/Button.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 13
+```jsx
+import React from 'react';
+
+export default function Button({ children, variant = 'primary', className = '', ...props }) {
+  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
+  const styles = {
+    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
+    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
+    dark: "bg-gray-800 text-white hover:bg-black",
+    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
+    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
+  };
+  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
+}
+```
+
+// FILE PATH: src/components/ui/Input.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import React from 'react';
+
+export default function Input({ label, className = '', ...props }) {
+  return (
+    <div className="space-y-1 w-full">
+      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
+      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/views/AuthView.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 29
+```jsx
+import React from 'react';
+import Input from '../components/ui/Input';
+import Button from '../components/ui/Button';
+
+export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
+  return (
+    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
+      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
+        <div className="text-blue-600 text-center mb-8">
+          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
+          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
+        </div>
+        <div className="space-y-4">
+          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
+          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
+          {authMode === 'signup' && (
+            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
+          )}
+          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
+            {authMode === 'login' ? '로그인' : '회원가입 하기'}
+          </Button>
+          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
+            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
 // FILE PATH: src/views/DashboardView.jsx
 // MODIFIED: 26-06-03 17:04 | LINES: 54
 ```jsx

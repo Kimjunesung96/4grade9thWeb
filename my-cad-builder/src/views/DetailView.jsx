@@ -1,7 +1,38 @@
-import React, { useMemo } from 'react'; // useMemo 추가
+// LINE 1 ~ 7: 에디터에 있던 CSV 문자열 파싱 알고리즘을 가져오고, 파일 용량 계산 함수가 3D text 용량도 지원하도록 수정합니다.
+import React, { useMemo } from 'react';
 import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
-// ⭐ 1. 우리가 만든 3D 라이브 데모 뷰어 컴포넌트 불러오기
 import LiveDemoViewer from '../components/LiveDemoViewer';
+
+// 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
+function parseCsvToBlocks(csvText) {
+  if (!csvText) return [];
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const idx = {
+    x: headers.indexOf('PosX'),
+    y: headers.indexOf('PosY'),
+    z: headers.indexOf('PosZ'),
+    mat: headers.indexOf('Material'),
+  };
+
+  const MATERIAL_HEX = { Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50', Glass: '#3498db', Default: '#bdc3c7' };
+  const blocks = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const cols = lines[i].split(',');
+    const matName = idx.mat !== -1 ? cols[idx.mat] : 'Default';
+    blocks.push({
+      x: parseFloat(cols[idx.x]),
+      y: parseFloat(cols[idx.y]),
+      z: parseFloat(cols[idx.z]),
+      mat: matName,
+      color: MATERIAL_HEX[matName] || MATERIAL_HEX.Default,
+    });
+  }
+  return blocks;
+}
 
 export default function DetailView({
   selectedBp,
@@ -16,11 +47,20 @@ export default function DetailView({
   onEditBlueprint
 }) {
   // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
+// LINE 205 ~ 207: grid_data가 없으면 csv_data 문자열 길이로 파일 용량을 대신 계산하고, 3D 블록 데이터를 메모이제이션합니다.
+  // 🌟 2D/3D 유연하게 대응하는 용량 계산 함수
   const calculateFileSize = () => {
-    if (!selectedBp?.grid_data) return "0.00 KB";
-    const strLen = JSON.stringify(selectedBp.grid_data).length;
+    const targetData = selectedBp?.grid_data || selectedBp?.csv_data;
+    if (!targetData) return "0.00 KB";
+    const strLen = typeof targetData === 'string' ? targetData.length : JSON.stringify(targetData).length;
     return (strLen / 1024).toFixed(2) + " KB";
   };
+
+  // 🌟 현재 도면이 3D AI 기반 프로젝트인지 판별하고 블록 파싱 수행
+  const is3D = !!selectedBp?.csv_data;
+  const parsed3DBlocks = useMemo(() => {
+    return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
+  }, [selectedBp?.csv_data, is3D]);
 
   const handlePngDownload = () => {
     const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
@@ -54,23 +94,34 @@ export default function DetailView({
         
         {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
         <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
-          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">구조물 설계도 평면도 미리보기</div>
+          // LINE 211 ~ 216: 프로젝트 유형(is3D)에 맞게 제목을 매칭하고, LiveDemoViewer에 알맞은 prop 분배 및 하단 2D 격자 패널 조건부 노출을 처리합니다.
+          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
+            {is3D ? "3D AI 건축물 입체 프리뷰" : "구조물 설계도 평면도 미리보기"}
+          </div>
           
-          {/* ⭐ 3. 기존 2D 평면도 윗부분에 3D 라이브 데모 추가 */}
-          <div className="w-full h-[300px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
-            <LiveDemoViewer grid={selectedBp?.grid_data} mode="static" maxBlocks={10000} />
+          {/* 🌟 3D 모드라면 parsed3DBlocks 데이터를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
+          <div className="w-full h-[350px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+            <LiveDemoViewer 
+              grid={!is3D ? selectedBp?.grid_data : null} 
+              data={is3D ? parsed3DBlocks : null} 
+              mode="static" 
+              maxBlocks={10000} 
+            />
           </div>
 
-          <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
-              {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
-                <div
-                  key={`detail-cell-${rIdx}-${cIdx}`}
-                  className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
-                />
-              )))}
+          {/* 🌟 2D 설계도일 때만 하단의 미니 격자판(2D 레고 도면)을 렌더링하고, 3D 건축물일 때는 공간을 차지하지 않도록 숨깁니다. */}
+          {!is3D && selectedBp.grid_data && (
+            <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
+                {selectedBp.grid_data.map((row, rIdx) => row.map((cell, cIdx) => (
+                  <div
+                    key={`detail-cell-${rIdx}-${cIdx}`}
+                    className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
+                  />
+                )))}
+              </div>
             </div>
-          </div>
+          )}
           
           <div className="w-full flex flex-col gap-3 mt-6">
             <div className="grid grid-cols-2 gap-3">
