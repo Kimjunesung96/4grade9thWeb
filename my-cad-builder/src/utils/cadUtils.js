@@ -100,6 +100,57 @@ export const exportToCSV = (grid) => {
   link.click();
 };
 
+// ===================== 무한 누적(페이지 스택) 시스템 =====================
+// 페이지(한 장) 안에서는 셀 값(1~5)이 "그 페이지 안에서의 상대 높이(색)"를 의미.
+// 페이지를 기입(commit)할 때, 그 페이지에서 실제 쓰인 최고 색번호(maxColorUsed)를
+// 이전 페이지의 (pageBase + maxColorUsed) + 1 에 이어붙여서 다음 페이지의 시작 높이를 정한다.
+// → 종이(페이지)를 한 장씩 쌓아 올리되, 페이지마다 두께(1~5칸)가 달라도 절대 안 겹침.
+
+// 현재 grid에서 실제 쓰인 색(1~5) 중 최댓값을 찾는다 (안 쓰였으면 1)
+export const getMaxColorUsed = (grid) => {
+  let maxColorUsed = 0;
+  grid.forEach(row => row.forEach(cell => {
+    if (cell >= 1 && cell <= 5 && cell > maxColorUsed) maxColorUsed = cell;
+  }));
+  return maxColorUsed || 1;
+};
+
+// 이전 스택 정보를 바탕으로 다음 페이지가 시작될 pageBase를 계산
+export const getNextPageBase = (stackedFloors) => {
+  if (stackedFloors.length === 0) return 0;
+  const prev = stackedFloors[stackedFloors.length - 1];
+  return prev.pageBase + prev.maxColorUsed;
+};
+
+// 누적된 모든 페이지를 하나의 CSV로 합쳐서 내보내기
+// 🌟 셀 값(cell, 1~5)은 "그 칸에 쌓을 블록 개수(반복 층수)"를 의미한다.
+//    예: 색=2(빨강)면 pageBase+1층, pageBase+2층 이렇게 2칸을 그 자리에 쌓아 올린다.
+export const exportStackedFloorsToCSV = (stackedFloors) => {
+  let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
+  stackedFloors.forEach(({ pageBase, grid }) => {
+    grid.forEach((row, rIdx) => {
+      row.forEach((cell, cIdx) => {
+        if (cell < 1 || cell > 5) return; // 0(빈칸)은 무시.
+        const xCoord = cIdx * 3 + 1.5;
+        const zCoord = rIdx * 3 + 1.5;
+        const idX = formatID(xCoord * 10);
+        const idZ = formatID(zCoord * 10);
+        for (let layer = 1; layer <= cell; layer++) {
+          const n = pageBase + layer; // 절대 누적 높이 인덱스
+          const yCoord = 1.5 + 3 * n;
+          const idY = formatID(yCoord * 10);
+          csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Block_N${n}\n`;
+        }
+      });
+    });
+  });
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `blueprint_stacked.csv`;
+  link.click();
+};
+
 // PNG 캔버스 이미지 저장 (mbs_ 접두사 자동 부여)
 export const exportToPNG = (grid, fileName) => {
   const cellSize = 10;

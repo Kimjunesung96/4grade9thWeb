@@ -1,797 +1,490 @@
-// FILE PATH: src/views/EditorView.jsx
-// MODIFIED: 26-07-01 21:17 | LINES: 536
+// FILE PATH: src/App.jsx
+// MODIFIED: 26-07-25 19:17 | LINES: 232
 ```jsx
-import React, { useState, useRef, useMemo } from 'react';
-import * as THREE from 'three';
-import Button from '../components/ui/Button';
-import { exportToPNG, exportToCSV, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID } from '../utils/cadUtils';
-import LiveDemoViewer from '../components/LiveDemoViewer';
+import React, { useState, useEffect } from 'react';
+import { supabase } from './supabaseClient';
+import { hashPw, applyWallBorder, floodFill, getMaxColorUsed, getNextPageBase, exportStackedFloorsToCSV } from './utils/cadUtils';
+import AuthView from './views/AuthView';
+import DashboardView from './views/DashboardView';
+import EditorView from './views/EditorView';
+import DetailView from './views/DetailView';
 
-// 🌟 백엔드 CSV 행({PosX,PosY,PosZ,Material,...}) → LiveDemoViewer가 기대하는 블록 형태({x,y,z,mat,color})로 변환
-//    + 원본 컬럼 전체(raw)도 같이 보관해둬서, 나중에 회전 적용 후 CSV를 다시 만들 때 그대로 재사용
-const MATERIAL_HEX = {
-  Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50',
-  Glass: '#3498db', Default: '#bdc3c7'
-};
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('auth');
+  const [authMode, setAuthMode] = useState('login');
+  const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
+  const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
+  const [mode, setMode] = useState('wall_rect');
+  const [paintColor, setPaintColor] = useState(1); // 지금 그리는 페이지 안에서 쓸 색(1~5, = 상대 높이)
+  const [stackedFloors, setStackedFloors] = useState([]); // 기입 완료된 페이지들: [{ pageBase, maxColorUsed, grid }]
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [startPos, setStartPos] = useState(null);
+  const [currentPos, setCurrentPos] = useState(null);
+  const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
 
-function parseCsvToBlocks(csvText) {
-  const lines = csvText.trim().split(/\r?\n/);
-  if (lines.length < 2) return { blocks: [], headers: [] };
+  // 소셜 상태 데이터 전역 상태 관리 저장소
+  const [selectedBp, setSelectedBp] = useState(null);
+  const [commentInput, setCommentInput] = useState('');
+  const [likesData, setLikesData] = useState({}); // { 도면ID: [유저ID리스트] }
+  const [commentsData, setCommentsData] = useState({}); // { 도면ID: [댓글배열] }
 
-  const headers = lines[0].split(',').map(h => h.trim());
-  const idx = {
-    blockId: headers.indexOf('BlockID'),
-    x: headers.indexOf('PosX'),
-    y: headers.indexOf('PosY'),
-    z: headers.indexOf('PosZ'),
-    mat: headers.indexOf('Material'),
-    type: headers.indexOf('Type'),
+  const handleSignUp = async () => {
+    const { error } = await supabase.from('users').insert([{ username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email }]);
+    if (error) alert("이미 존재하는 ID입니다.");
+    else { alert("계정이 생성되었습니다! 로그인해주세요."); setAuthMode('login'); }
   };
 
-  const blocks = [];
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i]) continue;
-    const cols = lines[i].split(',');
-    const matName = idx.mat !== -1 ? cols[idx.mat] : 'Default';
-    const rawRow = {};
-    headers.forEach((h, hi) => { rawRow[h] = cols[hi]; });
-
-    blocks.push({
-      x: parseFloat(cols[idx.x]),
-      y: parseFloat(cols[idx.y]),
-      z: parseFloat(cols[idx.z]),
-      mat: matName,
-      color: MATERIAL_HEX[matName] || MATERIAL_HEX.Default,
-      type: idx.type !== -1 ? cols[idx.type] : undefined,
-      raw: rawRow, // 🌟 원본 전체 컬럼 보관 (Stress, RiskLevel 등 회전과 무관한 값들 보존용)
-    });
-  }
-  return { blocks, headers };
-}
-
-// 🌟 쿼터니언 회전을 블록 좌표에 적용하고, 회전 후 바닥이 Y=1.5 근처로 오도록 다시 정렬
-function applyRotationToBlocks(blocks, quatArray) {
-  if (blocks.length === 0) return blocks;
-  const q = new THREE.Quaternion(...quatArray);
-
-  // 🌟 미리보기(RotatableGroup)와 동일하게 "바운딩박스 중심"을 피벗으로 잡는다.
-  //    (기존엔 원점(0,0,0) 기준으로 회전시켜서 건물이 원래 자리에서 확 벗어나 버렸음)
-  const cx = (Math.min(...blocks.map(b => b.x)) + Math.max(...blocks.map(b => b.x))) / 2;
-  const cy = (Math.min(...blocks.map(b => b.y)) + Math.max(...blocks.map(b => b.y))) / 2;
-  const cz = (Math.min(...blocks.map(b => b.z)) + Math.max(...blocks.map(b => b.z))) / 2;
-
-  const rotated = blocks.map(b => {
-    const v = new THREE.Vector3(b.x - cx, b.y - cy, b.z - cz).applyQuaternion(q);
-    return { ...b, x: v.x + cx, y: v.y + cy, z: v.z + cz };
-  });
-
-  const minY = Math.min(...rotated.map(b => b.y));
-  const yOffset = 1.5 - minY; // 바닥 블록 중심이 1.5에 오도록 평행이동
-
-  return rotated.map(b => ({
-    ...b,
-    x: Math.round((b.x) * 100) / 100,
-    y: Math.round((b.y + yOffset) * 100) / 100,
-    z: Math.round((b.z) * 100) / 100,
-  }));
-}
-
-// 🌟 회전 적용된 블록들을 다시 CSV 텍스트로 직렬화 (원본 헤더/기타 컬럼 그대로 유지, 좌표+BlockID만 갱신)
-function blocksToCsvText(blocks, headers) {
-  const finalHeaders = headers.length > 0
-    ? headers
-    : ['BlockID', 'PosX', 'PosY', 'PosZ', 'Stress', 'RiskLevel', 'Prescription', 'Material', 'Tensile', 'Compressive', 'Tool', 'Type'];
-
-  const rows = blocks.map(b => {
-    const idX = formatID(b.x * 10);
-    const idZ = formatID(b.z * 10);
-    const idY = formatID(b.y * 10);
-    const blockId = `${idX}_${idZ}_${idY}`;
-
-    return finalHeaders.map(h => {
-      if (h === 'BlockID') return blockId;
-      if (h === 'PosX') return b.x;
-      if (h === 'PosY') return b.y;
-      if (h === 'PosZ') return b.z;
-      // 그 외 컬럼은 원본 raw 값 그대로 (없으면 빈칸)
-      return b.raw?.[h] ?? '';
-    }).join(',');
-  });
-
-  return [finalHeaders.join(','), ...rows].join('\n');
-}
-
-function downloadCsvText(csvText, filename) {
-  const blob = new Blob([csvText], { type: 'text/csv' });
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  window.URL.revokeObjectURL(url);
-}
-
-const IDENTITY_QUAT = [0, 0, 0, 1];
-
-// 🌟 화면(라이브데모)은 지금 보이는 그대로 유지하고,
-//    "엑셀(CSV) 다운로드" 할 때만 여기에 오른쪽 225도를 추가로 얹어서 내보냄.
-//    즉: 엑셀 = (라이브데모에 보이는 회전) + (오른쪽 225도 추가)
-const EXPORT_EXTRA_RIGHT_225_QUAT = (() => {
-  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), (3 * Math.PI) / 4);
-  return [q.x, q.y, q.z, q.w];
-})();
-
-export default function EditorView({
-  grid, setGrid, mode, setMode, activeFloor, setActiveFloor, setView,
-  undo, saveHistory, uploadToShowcase, isInsidePreview,
-  handleMouseDown, handleMouseEnter, handleMouseUp
-}) {
-
-  // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
-  const [editorTab, setEditorTab] = useState('grid');
-
-  // AI 사진 추출 결과 → 3D 뷰어에 띄울 데이터 (원본, 회전 미적용)
-  const [extracted3DData, setExtracted3DData] = useState([]);
-  const [csvHeaders, setCsvHeaders] = useState([]);
-  const [rawCsvText, setRawCsvText] = useState(''); // 🌟 "원본 다운로드"용 — 추출/업로드 당시 그대로
-
-  // 🌟 회전 상태 (쿼터니언 [x,y,z,w]) — 버튼/기즈모 둘 다 이 상태를 공유
-  const [rotationQuat, setRotationQuat] = useState(IDENTITY_QUAT);
-
-  // 🌟 "영점(0점)" — 90도 버튼만으로는 못 맞추는 애매한 각도(예: 135도)를
-  //    기즈모로 자유롭게 맞춘 뒤 "여기를 0점으로 저장"하면 이 값이 바뀜.
-  //    이후 "초기화" 버튼은 진짜 원본이 아니라 이 저장된 영점으로 돌아가고,
-  //    90도 버튼도 이 영점을 기준으로 이어서 돌게 됨.
-  const [baseRotationQuat, setBaseRotationQuat] = useState(IDENTITY_QUAT);
-
-  // 🌟 AI 사진 추출용 추가 상태들
-  const [imageSrc, setImageSrc] = useState(null);
-  const [imageFile, setImageFile] = useState(null);
-  const [box, setBox] = useState(null); // 박스 좌표 {startX, startY, endX, endY}
-  const [isDrawingBox, setIsDrawingBox] = useState(false);
-  const [snapshots, setSnapshots] = useState([]); // 3스냅샷 제한 관리
-  const [isExtracting, setIsExtracting] = useState(false);
-  const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
-  const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
-  const csvUploadRef = useRef(null);
-
-  // 🌟 현재 회전 상태가 적용된 블록 (미리보기 + "편집본 다운로드"에 사용)
-  const rotatedBlocks = useMemo(() => {
-    if (extracted3DData.length === 0) return [];
-    if (rotationQuat === IDENTITY_QUAT) return extracted3DData;
-    return applyRotationToBlocks(extracted3DData, rotationQuat);
-  }, [extracted3DData, rotationQuat]);
-
-  const handlePngSave = () => {
-    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", "신축도면");
-    if (name === null) return;
-    exportToPNG(grid, name);
+  const handleLogin = async () => {
+    const { data } = await supabase.from('users').select('*').eq('username', authForm.id).eq('password_hash', hashPw(authForm.pw)).single();
+    if (data) { setUser(data); setView('dashboard'); }
+    else alert("아이디 혹은 비밀번호가 틀립니다.");
   };
 
-  // 1. 사진 업로드 처리 (3스냅샷 리미터 작동!)
-  const handleImageUpload = (e) => {
-    if (snapshots.length >= 3) {
-      alert("🚨 사진 3D 추출은 프로젝트당 최대 3개의 스냅샷까지만 저장 가능합니다! 기존 스냅샷을 삭제해 주세요.");
+  const fetchBlueprints = async () => {
+    const { data: allData } = await supabase.from('blueprints').select('*').order('created_at', { ascending: false });
+    const all = allData || [];
+    setBlueprints({ mine: all.filter(bp => bp.user_id === user?.id), others: all.filter(bp => bp.user_id !== user?.id) });
+  };
+
+  useEffect(() => { if (view === 'dashboard' && user) fetchBlueprints(); }, [view, user]);
+
+  // 매개변수 payload를 받아서 유연하게 DB에 넣도록 수정
+  const uploadToShowcase = async (payload) => {
+    if (!user) return;
+    const title = prompt("작품 이름을 지어주세요!", "새 프로젝트");
+    if (!title) return;
+
+    const { error } = await supabase.from('blueprints').insert([{ 
+      name: title, 
+      user_id: user.id, 
+      author: user.username,
+      ...payload // grid_data, csv_data, thumbnail_url 등이 알아서 들어감
+    }]);
+
+    if (!error) { 
+      alert("업로드 완료!"); 
+      setView('dashboard'); 
+    } else {
+      alert("에러: " + error.message);
+    }
+  };
+
+  const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
+  const undo = () => { if (history.length === 0) return;
+  setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
+
+  const handleMouseDown = (r, c) => {
+    // 바닥 채우기(클릭) 모드는 드래그 개념이 없으므로 즉시 flood fill 실행
+    if (mode === 'floor_fill') {
+      saveHistory();
+      setGrid(prevGrid => floodFill(prevGrid, r, c, paintColor));
       return;
     }
-    const file = e.target.files[0];
-    if (file) {
-      setImageFile(file);
-      setImageSrc(URL.createObjectURL(file));
-      setBox(null);
-    }
+    saveHistory();
+    setIsDrawing(true);
+    setStartPos({ r, c });
+    setCurrentPos({ r, c });
   };
 
-  // 2. 파이썬 서버로 데이터 쏘기
-  const handleExtract3D = async () => {
-    if (!box || !imageFile || !imgRef.current || !realHeightMeters) return;
-    setIsExtracting(true);
-
-    try {
-      const scaleX = imgRef.current.naturalWidth / imgRef.current.width;
-      const scaleY = imgRef.current.naturalHeight / imgRef.current.height;
-
-      const realStartX = Math.min(box.startX, box.endX) * scaleX;
-      const realStartY = Math.min(box.startY, box.endY) * scaleY;
-      const realEndX = Math.max(box.startX, box.endX) * scaleX;
-      const realEndY = Math.max(box.startY, box.endY) * scaleY;
-
-      const formData = new FormData();
-      formData.append('file', imageFile);
-      formData.append('startX', realStartX);
-      formData.append('startY', realStartY);
-      formData.append('endX', realEndX);
-      formData.append('endY', realEndY);
-      formData.append('realHeightMeters', realHeightMeters);
-
-      const response = await fetch('http://localhost:8000/api/extract-3d-csv', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error("서버 변환 실패");
-
-      const csvText = await response.text();
-      const { blocks, headers } = parseCsvToBlocks(csvText);
-
-      setExtracted3DData(blocks);
-      setCsvHeaders(headers);
-      setRawCsvText(csvText);
-      setRotationQuat(IDENTITY_QUAT); // 새로 추출했으니 화면(라이브데모) 회전은 원본 그대로
-      setBaseRotationQuat(IDENTITY_QUAT); // 영점도 원본(0도)으로
-
-      // 🌟 "원본" CSV는 추출 직후 자동으로 다운로드 (백업용)
-      downloadCsvText(csvText, `ai_extracted_원본_${Date.now()}.csv`);
-
-      const blob = new Blob([csvText], { type: 'text/csv' });
-      setSnapshots(prev => [...prev, blob]);
-      alert(`✅ 성공적으로 ${blocks.length.toLocaleString()}개 3D 블록을 추출했습니다! 오른쪽에서 회전을 맞춘 후 "편집본 다운로드"를 눌러주세요.`);
-
-    } catch (error) {
-      console.error(error);
-      alert("❌ AI 추출 중 오류가 발생했습니다. 파이썬 서버가 켜져 있는지 확인하세요.");
-    } finally {
-      setIsExtracting(false);
-    }
+  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c });
   };
 
-  // 3. 🌟 다운로드해둔 CSV를 다시 불러와서 회전 편집 재개
-  const handleCsvReupload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      const csvText = evt.target.result;
-      const { blocks, headers } = parseCsvToBlocks(csvText);
-      if (blocks.length === 0) {
-        alert("❌ CSV를 읽을 수 없습니다. 형식을 확인해주세요.");
-        return;
+  const handleMouseUp = () => {
+    if (isDrawing && mode.includes('rect') && startPos && currentPos) {
+      let newGrid = grid.map(row => [...row]);
+      const startR = Math.min(startPos.r, currentPos.r), endR = Math.max(startPos.r, currentPos.r);
+      const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
+
+      if (mode === 'wall_rect') {
+        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 색 값으로)
+        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, paintColor, 2);
+      } else if (mode === 'floor_rect') {
+        // 바닥(드래그): 영역 전체를 채움 (선택된 색 값으로)
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = paintColor; }
+        }
+      } else if (mode === 'rect_eraser') {
+        // 지우개: 영역 전체를 비움
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = 0; }
+        }
       }
-      setExtracted3DData(blocks);
-      setCsvHeaders(headers);
-      setRawCsvText(csvText);
-      setRotationQuat(IDENTITY_QUAT);
-      setBaseRotationQuat(IDENTITY_QUAT);
-      alert(`📂 ${blocks.length.toLocaleString()}개 블록을 불러왔습니다. 회전을 조정해보세요.`);
+      setGrid(newGrid);
+    }
+    setIsDrawing(false); setStartPos(null); setCurrentPos(null);
+  };
+
+  // 현재 페이지(grid)를 "기입"해서 stackedFloors에 누적하고, 다음 페이지를 위해 캔버스 초기화
+  const commitCurrentFloor = () => {
+    const maxColorUsed = getMaxColorUsed(grid);
+    const pageBase = getNextPageBase(stackedFloors);
+    setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
+  };
+
+  // 마지막으로 기입한 페이지를 되돌려서 다시 편집 가능하게
+  const goBackToPreviousFloor = () => {
+    if (stackedFloors.length === 0) return;
+    const last = stackedFloors[stackedFloors.length - 1];
+    setGrid(last.grid); // 마지막 페이지 grid를 다시 캔버스로 복원
+    setStackedFloors(prev => prev.slice(0, -1)); // 스택에서 제거
+    setHistory([]);
+  };
+
+  // 전체 페이지 + 현재 캔버스 다 날리고 처음 상태로
+  const resetAllFloors = () => {
+    if (!window.confirm("전체 페이지를 초기화하시겠습니까? 되돌릴 수 없습니다.")) return;
+    setStackedFloors([]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
+  };
+
+  const isInsidePreview = (r, c) => {
+    if (!isDrawing || !startPos || !currentPos || !mode.includes('rect')) return false;
+    return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
+  };
+
+  // 1인 1회 토글형 좋아요 알고리즘 구현
+  const handleLikeToggle = (bpId) => {
+    if (!user) return;
+    const currentLikedUsers = likesData[bpId] || [];
+    if (currentLikedUsers.includes(user.id)) {
+      setLikesData({ ...likesData, [bpId]: currentLikedUsers.filter(uid => uid !== user.id) });
+    } else {
+      setLikesData({ ...likesData, [bpId]: [...currentLikedUsers, user.id] });
+    }
+  };
+
+  // 고유 도면 아이디 기반 독립형 댓글 작성 처리
+  const handleAddComment = (bpId) => {
+    if (!commentInput.trim() || !user) return;
+    const newComment = {
+      id: Date.now(),
+      username: user.username,
+      content: commentInput,
+      created_at: new Date().toISOString()
     };
-    reader.readAsText(file);
-    e.target.value = ''; // 같은 파일 다시 선택해도 onChange 트리거되게
-  };
-
-  // 🌟 90도씩 회전 버튼 (X/Y축)
-  const rotateBy90 = (axis, sign) => {
-    const axisVec = axis === 'x' ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
-    const delta = new THREE.Quaternion().setFromAxisAngle(axisVec, sign * Math.PI / 2);
-    const current = new THREE.Quaternion(...rotationQuat);
-    current.premultiply(delta);
-    setRotationQuat([current.x, current.y, current.z, current.w]);
-  };
-
-  // 🌟 지금 기즈모/버튼으로 맞춰놓은 각도(135도 같은 애매한 값도 포함)를
-  //    그대로 "0점"으로 저장 — 이후 초기화/90도 버튼은 이 각도를 기준으로 동작
-  const handleSetZeroPoint = () => {
-    setBaseRotationQuat(rotationQuat);
-    alert("📍 현재 각도를 0점으로 저장했습니다. 이제부터 '초기화'를 누르면 이 각도로 돌아옵니다.");
-  };
-
-  const handleDownloadEdited = () => {
-    if (rotatedBlocks.length === 0) return;
-
-    // 🌟 엑셀 = (화면에 보이는 회전) + (오른쪽 225도 추가)
-    //    화면(rotatedBlocks)은 그대로 두고, 여기서만 225도를 한 번 더 얹어서 최종 CSV를 만듦
-    const current = new THREE.Quaternion(...rotationQuat);
-    const extra = new THREE.Quaternion(...EXPORT_EXTRA_RIGHT_225_QUAT);
-    current.premultiply(extra); // rotateBy90과 같은 방식으로, 화면 회전 위에 225도를 이어서 적용
-    const exportQuat = [current.x, current.y, current.z, current.w];
-
-    const exportBlocks = applyRotationToBlocks(extracted3DData, exportQuat);
-    const csvText = blocksToCsvText(exportBlocks, csvHeaders);
-    downloadCsvText(csvText, `ai_extracted_편집본_${Date.now()}.csv`);
-  };
-
-  const handleDownloadOriginal = () => {
-    if (!rawCsvText) return;
-    downloadCsvText(rawCsvText, `ai_extracted_원본_${Date.now()}.csv`);
+    const currentComments = commentsData[bpId] || [];
+    setCommentsData({ ...commentsData, [bpId]: [...currentComments, newComment] });
+    setCommentInput('');
   };
 
   return (
-    <div className="h-screen w-screen bg-gray-50 flex flex-col overflow-hidden select-none">
+    <>
+      {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
+      
+      {view === 'dashboard' && (
+        <DashboardView 
+          user={user} 
+          blueprints={blueprints} 
+          setView={setView} 
+          setUser={setUser} 
+          onSelectBlueprint={(bp) => {
+            setSelectedBp(bp);
+            setView('detail'); // 💡 팝업 모달 대신 상세페이지('detail') 뷰로 화면 라우팅 전환
+          }} 
+        />
+      )}
+      
+      {view === 'editor' && (
+        <EditorView
+          grid={grid}
+          setGrid={setGrid}
+          mode={mode}
+          setMode={setMode}
+          paintColor={paintColor}
+          setPaintColor={setPaintColor}
+          stackedFloors={stackedFloors}
+          commitCurrentFloor={commitCurrentFloor}
+          goBackToPreviousFloor={goBackToPreviousFloor}
+          resetAllFloors={resetAllFloors}
+          setView={setView}
+          undo={undo}
+          saveHistory={saveHistory}
+          uploadToShowcase={uploadToShowcase}
+          isInsidePreview={isInsidePreview}
+          handleMouseDown={handleMouseDown}
+          handleMouseEnter={handleMouseEnter}
+          handleMouseUp={handleMouseUp}
+        />
+      )}
 
-      {/* --- 최상단 공통 헤더 --- */}
-      <header className="p-4 bg-white border-b border-gray-200 flex justify-between items-center shadow-sm z-10">
-        <div className="flex items-center space-x-3">
-          <button onClick={() => setView('dashboard')} className="p-2 text-gray-400 hover:text-blue-600 font-bold">◀ 뒤로가기</button>
-          <div className="h-6 w-px bg-gray-200 mx-2" />
-          <h1 className="text-xl font-black text-gray-800">CAD 에디터</h1>
-        </div>
-        <div className="flex space-x-2">
-          <Button variant="primary" onClick={uploadToShowcase}>🌐 클라우드 저장</Button>
-          <Button variant="dark" onClick={handlePngSave}>PNG 저장 (mbs_)</Button>
-          <Button variant="secondary" onClick={() => exportToCSV(grid)}>CSV 내보내기</Button>
-        </div>
-      </header>
-
-      {/* --- 메인 작업 영역: 2단 분할 --- */}
-      <div className="flex-1 flex overflow-hidden bg-gray-50">
-
-        {/* [왼쪽 영역] : 탭 및 작업 공간 */}
-        <div className="flex-1 flex flex-col border-r border-gray-200">
-
-          {/* ⭐ 탭 네비게이션 */}
-          <div className="flex bg-white border-b border-gray-200">
-            <button
-              onClick={() => setEditorTab('grid')}
-              className={`flex-1 py-3 text-sm font-bold border-b-2 transition-colors ${editorTab === 'grid' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
-            >
-              📐 정밀 격자 제작 모드
-            </button>
-            <button
-              onClick={() => setEditorTab('photo')}
-              className={`flex-1 py-3 text-sm font-bold border-b-2 transition-colors ${editorTab === 'photo' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
-            >
-              📷 AI 사진 3D 추출 모드
-            </button>
-          </div>
-
-          <div className="flex-1 overflow-hidden">
-            {/* 1️⃣ 정밀 격자 제작 모드 */}
-            {editorTab === 'grid' && (
-              <div className="flex flex-col h-full">
-                {/* 툴바 (벽 그리기, 바닥 채우기 등) */}
-                <div className="p-3 bg-white border-b border-gray-200 flex items-center space-x-2 shadow-sm justify-center">
-                  <div className="flex bg-gray-100 p-1 rounded-lg">
-                    <Button variant={mode === 'wall_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('wall_rect')}>🧱 벽 그리기</Button>
-                    <Button variant={mode === 'floor_fill' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_fill')}>🪣 바닥 채우기</Button>
-                    <Button variant={mode === 'floor_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_rect')}>🏁 바닥 드래그</Button>
-                    <Button variant={mode === 'rect_eraser' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('rect_eraser')} className={mode === 'rect_eraser' ? '!text-red-500' : ''}>🧼 지우개</Button>
-                  </div>
-                  {mode === 'wall_rect' && (
-                    <div className="flex items-center bg-gray-100 p-1 rounded-lg space-x-1">
-                      {[1, 2, 3, 4, 5].map(floorNum => (
-                        <button
-                          key={floorNum}
-                          onClick={() => setActiveFloor(floorNum)}
-                          className={`w-7 h-7 rounded-md border-2 flex items-center justify-center text-[10px] font-bold transition-all ${
-                            activeFloor === floorNum ? 'border-blue-500 scale-110' : 'border-transparent opacity-70 hover:opacity-100'
-                          }`}
-                          style={{ backgroundColor: FLOOR_COLORS[floorNum].hex, color: floorNum === 1 ? '#111' : '#fff' }}
-                        >
-                          {floorNum}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  <Button variant="secondary" onClick={undo}>↩ 되돌리기</Button>
-                  <label className="cursor-pointer px-3 py-2 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
-                    📂 PNG 불러오기
-                    <input type="file" accept="image/*" className="hidden" onChange={e => {
-                      const file = e.target.files[0];
-                      if (file) importPNGToGrid(file, g => { saveHistory(); setGrid(g); });
-                    }} />
-                  </label>
-                </div>
-
-                {/* 50x50 캔버스 영역 */}
-                <div className="flex-1 p-10 flex justify-center items-start" onMouseUp={handleMouseUp}>
-                  <div className="bg-white shadow-2xl border border-gray-200 relative" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
-                    {grid.map((row, rIdx) => row.map((cell, cIdx) => {
-                      const inPreview = isInsidePreview(rIdx, cIdx);
-                      let bgColor = getCellColorClass(cell);
-                      if (inPreview) {
-                        if (mode === 'wall_rect') bgColor = FLOOR_COLORS[activeFloor].tw + '/60';
-                        else if (mode === 'floor_rect') bgColor = "bg-blue-300/40";
-                        else bgColor = "bg-red-200";
-                      }
-                      return (
-                        <div key={`${rIdx}-${cIdx}`} onMouseDown={() => handleMouseDown(rIdx, cIdx)} onMouseEnter={() => handleMouseEnter(rIdx, cIdx)}
-                          className={`w-[14px] h-[14px] border-[0.1px] border-gray-50 ${bgColor} hover:bg-blue-50 transition-colors`} />
-                      );
-                    }))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* 2️⃣ AI 사진 3D 추출 탭 */}
-            {editorTab === 'photo' && (
-              <div className="h-full p-6 flex flex-col items-center overflow-y-auto relative"
-                onMouseMove={(e) => {
-                  if (!isDrawingBox || !imgRef.current) return;
-                  const rect = imgRef.current.getBoundingClientRect();
-                  const currentX = e.clientX - rect.left;
-                  const currentY = e.clientY - rect.top;
-                  setBox(prev => ({ ...prev, endX: currentX, endY: currentY }));
-                }}
-                onMouseUp={() => setIsDrawingBox(false)}
-                onMouseLeave={() => setIsDrawingBox(false)}
-              >
-                {!imageSrc ? (
-                  // [사진 업로드 전 화면]
-                  <div className="w-full max-w-2xl bg-white p-10 rounded-3xl shadow-lg border border-gray-200 flex flex-col items-center text-center mt-10">
-                    <div className="text-5xl mb-6">📸</div>
-                    <h2 className="text-2xl font-black text-gray-900 mb-2">건물/객체 사진 업로드</h2>
-                    <p className="text-gray-500 mb-8 font-medium">사진을 올리고 원하는 건물을 박스로 치면, AI가 1만 개 이하의 3D 엑셀 블록으로 추출합니다.</p>
-
-                    <label className="cursor-pointer w-full flex flex-col items-center justify-center h-48 border-2 border-dashed border-blue-300 rounded-2xl bg-blue-50 hover:bg-blue-100 transition-colors">
-                      <span className="text-blue-600 font-bold mb-2">클릭하여 이미지 파일 선택</span>
-                      <span className="text-xs text-blue-400">지원 형식: JPG, PNG</span>
-                      <input type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
-                    </label>
-
-                    <div className="w-full flex items-center my-6">
-                      <div className="flex-1 h-px bg-gray-200" /><span className="px-3 text-xs text-gray-400">또는</span><div className="flex-1 h-px bg-gray-200" />
-                    </div>
-
-                    {/* 🌟 기존에 추출해둔 CSV를 다시 불러와서 회전만 편집 */}
-                    <label className="cursor-pointer w-full flex flex-col items-center justify-center h-20 border-2 border-dashed border-gray-300 rounded-2xl bg-gray-50 hover:bg-gray-100 transition-colors">
-                      <span className="text-gray-600 font-bold text-sm">📂 이전에 추출한 CSV 불러와서 회전 편집</span>
-                      <input ref={csvUploadRef} type="file" accept=".csv" className="hidden" onChange={handleCsvReupload} />
-                    </label>
-                  </div>
-                ) : (
-                  // [사진 업로드 후 - 박스 그리기 화면]
-                  <div className="w-full flex flex-col items-center">
-                    <div className="w-full flex justify-between items-center mb-4 bg-white p-4 rounded-2xl shadow-sm border border-gray-200">
-                      <div>
-                        <h3 className="font-bold text-gray-800">🎯 추출할 건물을 마우스로 드래그하세요!</h3>
-                        <p className="text-xs text-gray-500">현재 스냅샷: {snapshots.length} / 3 MAX</p>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.1"
-                          placeholder="실제 높이(m)"
-                          value={realHeightMeters}
-                          onChange={e => setRealHeightMeters(e.target.value)}
-                          className="w-28 px-2 py-2 border border-gray-300 rounded-md text-sm"
-                        />
-                        <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); }}>취소</Button>
-                        <Button variant="primary" onClick={handleExtract3D} disabled={!box || isExtracting || !realHeightMeters}>
-                          {isExtracting ? 'AI 추출 중...⏳' : '⚡ 3D 추출 (원본 자동 다운로드)'}
-                        </Button>
-                      </div>
-                    </div>
-
-                    {/* 🌟 크롭(박스) 에디터 영역 */}
-                    <div className="relative inline-block border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl select-none">
-                      <img
-                        ref={imgRef}
-                        src={imageSrc}
-                        alt="upload"
-                        className="max-w-[700px] max-h-[600px] object-contain cursor-crosshair"
-                        draggable="false"
-                        onMouseDown={(e) => {
-                          const rect = imgRef.current.getBoundingClientRect();
-                          const startX = e.clientX - rect.left;
-                          const startY = e.clientY - rect.top;
-                          setIsDrawingBox(true);
-                          setBox({ startX, startY, endX: startX, endY: startY });
-                        }}
-                      />
-                      {box && (
-                        <div
-                          className="absolute border-2 border-blue-500 bg-blue-400/30 pointer-events-none"
-                          style={{
-                            left: Math.min(box.startX, box.endX),
-                            top: Math.min(box.startY, box.endY),
-                            width: Math.abs(box.endX - box.startX),
-                            height: Math.abs(box.endY - box.startY)
-                          }}
-                        />
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* 🌟 회전 편집 + 다운로드 패널 (추출/불러오기 결과가 있을 때만 표시) */}
-                {extracted3DData.length > 0 && (
-                  <div className="w-full max-w-2xl mt-6 bg-white p-5 rounded-2xl shadow-sm border border-gray-200">
-                    <h3 className="font-bold text-gray-800 mb-3">🔄 회전 편집</h3>
-                    <p className="text-xs text-gray-500 mb-3">버튼으로 90도씩 빠르게 돌리거나, 오른쪽 미리보기의 기즈모를 드래그해서 자유롭게 맞춰보세요. 이 화면이 곧 최종 모습은 아니고, <b>다운로드 시 여기서 오른쪽으로 225도가 추가로 더 돌아간 상태</b>로 엑셀이 만들어집니다 (Unity 좌표계 보정용). 90도로 안 맞는 애매한 각도는 기즈모로 맞춘 뒤 <b>"📍 이 각도를 0점으로 저장"</b>을 눌러두면 초기화/90도 버튼이 그 각도를 기준으로 움직여요.</p>
-
-                    <div className="flex flex-wrap items-center gap-2 mb-4">
-                      <Button variant="secondary" onClick={() => rotateBy90('x', 1)}>X축 +90°</Button>
-                      <Button variant="secondary" onClick={() => rotateBy90('x', -1)}>X축 -90°</Button>
-                      <Button variant="secondary" onClick={() => rotateBy90('y', 1)}>Y축 +90°</Button>
-                      <Button variant="secondary" onClick={() => rotateBy90('y', -1)}>Y축 -90°</Button>
-                      <Button variant="secondary" onClick={() => setRotationQuat(baseRotationQuat)}>↺ 초기화 (저장된 0점으로)</Button>
-                    </div>
-
-                    <div className="flex items-center gap-2 mb-4">
-                      <Button variant="dark" onClick={handleSetZeroPoint}>📍 이 각도를 0점으로 저장</Button>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <Button variant="secondary" onClick={handleDownloadOriginal}>📥 원본 다운로드</Button>
-                      <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(화면+225°) 다운로드</Button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-          </div>
-        </div>
-
-        {/* ⭐ [오른쪽 영역] : 3D 라이브 데모 (공통) */}
-        <div className="w-[450px] bg-white shadow-2xl flex flex-col z-20 shrink-0">
-          <div className="p-4 bg-gray-900 text-white font-bold flex justify-between items-center text-sm">
-            <span>🏗️ 실시간 3D 시공 미리보기</span>
-            <span className="text-xs text-green-400 font-black animate-pulse">● Live</span>
-          </div>
-          <div className="flex-1 relative">
-            <LiveDemoViewer
-              grid={editorTab === 'grid' ? grid : null}
-              data={editorTab === 'photo' ? extracted3DData : null}
-              mode="realtime"
-              maxBlocks={10000}
-              rotationQuat={rotationQuat}
-              enableGizmo={editorTab === 'photo' && extracted3DData.length > 0}
-              onRotationChange={(q) => setRotationQuat(q)}
-            />
-          </div>
-        </div>
-
-      </div>
-    </div>
+      {view === 'detail' && selectedBp && (
+        <DetailView
+          selectedBp={selectedBp}
+          setView={setView}
+          comments={commentsData[selectedBp.id] || []}
+          commentInput={commentInput}
+          setCommentInput={setCommentInput}
+          likeCount={(likesData[selectedBp.id] || []).length}
+          hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
+          onLikeToggle={() => handleLikeToggle(selectedBp.id)}
+          onAddComment={() => handleAddComment(selectedBp.id)}
+          onEditBlueprint={() => {
+            setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
+            setHistory([]);
+            setView('editor');
+          }}
+        />
+      )}
+    </>
   );
 }
 ```
 
-// FILE PATH: src/components/LiveDemoViewer.jsx
-// MODIFIED: 26-07-01 20:37 | LINES: 251
-```jsx
-import React, { useMemo, useRef, useEffect, useState } from 'react';
-import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Stage, PivotControls } from '@react-three/drei';
-import * as THREE from 'three';
-import { FLOOR_COLORS } from '../utils/cadUtils';
+// FILE PATH: src/utils/cadUtils.js
+// MODIFIED: 26-07-25 19:17 | LINES: 248
+```js
+import CryptoJS from 'crypto-js';
 
-const MATERIAL_COLORS = {
-  Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50',
-  Glass: '#3498db', Default: '#bdc3c7'
+// 비밀번호 암호화 로직
+export const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
+
+// ===================== 층별 벽 색상 매핑 =====================
+// grid 값 체계: 0=빈칸, 1~5=벽(1~5층), 9=바닥
+export const FLOOR_COLORS = {
+  1: { hex: '#9CA3AF', tw: 'bg-gray-400', label: '1층' },   // 회색
+  2: { hex: '#EF4444', tw: 'bg-red-500',  label: '2층' },   // 빨강
+  3: { hex: '#F97316', tw: 'bg-orange-500', label: '3층' }, // 주황
+  4: { hex: '#EAB308', tw: 'bg-yellow-500', label: '4층' }, // 노랑
+  5: { hex: '#000000', tw: 'bg-black',    label: '5층' },   // 검정
+};
+export const FLOOR_VALUE = 9; // 바닥 칸 값 (기존 2에서 변경 → 1~5 벽 값과 충돌 방지)
+
+// 셀 값을 기준으로 표시 색상(hex)을 반환
+export const getCellColorHex = (cell) => {
+  if (cell === FLOOR_VALUE) return '#D2D2D2';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].hex;
+  return '#FFFFFF';
 };
 
-function VoxelBlocks({ blocks }) {
-  return (
-    <group>
-      {blocks.map((block, index) => {
-        const isGlass = block.mat === 'Glass';
-        return (
-          <mesh key={index} position={[block.x, block.y, block.z]}>
-            <boxGeometry args={[3, 3, 3]} />
-            <meshStandardMaterial
-              color={block.color || MATERIAL_COLORS[block.mat] || MATERIAL_COLORS.Default}
-              transparent={isGlass}
-              opacity={isGlass ? 0.6 : 1}
-              roughness={isGlass ? 0.1 : 0.8}
-            />
-          </mesh>
-        );
-      })}
-    </group>
-  );
-}
+// 셀 값을 기준으로 표시 색상(tailwind 클래스)을 반환
+export const getCellColorClass = (cell) => {
+  if (cell === FLOOR_VALUE) return 'bg-gray-300';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].tw;
+  return 'bg-white';
+};
 
-// 🌟 블록들의 바운딩박스 중심을 계산 (회전 피벗을 여기로 잡아야 "제자리에서" 돈다)
-function getBlocksCenter(blocks) {
-  if (!blocks || blocks.length === 0) return [0, 0, 0];
-  let minX = Infinity, maxX = -Infinity;
-  let minY = Infinity, maxY = -Infinity;
-  let minZ = Infinity, maxZ = -Infinity;
-  blocks.forEach(b => {
-    if (b.x < minX) minX = b.x; if (b.x > maxX) maxX = b.x;
-    if (b.y < minY) minY = b.y; if (b.y > maxY) maxY = b.y;
-    if (b.z < minZ) minZ = b.z; if (b.z > maxZ) maxZ = b.z;
+// Flood Fill 알고리즘
+export const floodFill = (grid, r, c, replacementVal) => {
+  const targetVal = grid[r][c];
+  if (targetVal === replacementVal) return grid;
+  const newGrid = JSON.parse(JSON.stringify(grid));
+  const stack = [[r, c]];
+  while (stack.length > 0) {
+    const [currR, currC] = stack.pop();
+    if (currR >= 0 && currR < 50 && currC >= 0 && currC < 50 && newGrid[currR][currC] === targetVal) {
+      newGrid[currR][currC] = replacementVal;
+      stack.push([currR + 1, currC], [currR - 1, currC], [currR, currC + 1], [currR, currC - 1]);
+    }
+  }
+  return newGrid;
+};
+
+// 블록 ID 포맷 생성기
+export const formatID = (val) => {
+  const absVal = Math.round(Math.abs(val));
+  const sign = val < 0 ? "-" : "0";
+  return sign + absVal.toString().padStart(3, '0');
+};
+
+// 사각형 테두리(두께 2칸)만 칠하고 안쪽은 비우는 벽 그리기 로직
+// startR/endR/startC/endC: 드래그 영역의 행/열 범위 (min~max 정렬된 값)
+// thickness: 테두리 두께 (기본 2칸)
+export const applyWallBorder = (gridRef, startR, endR, startC, endC, floorValue, thickness = 2) => {
+  for (let r = startR; r <= endR; r++) {
+    for (let c = startC; c <= endC; c++) {
+      const distFromTop = r - startR;
+      const distFromBottom = endR - r;
+      const distFromLeft = c - startC;
+      const distFromRight = endC - c;
+      const minDist = Math.min(distFromTop, distFromBottom, distFromLeft, distFromRight);
+      // 테두리(바깥쪽 thickness칸)에 해당하면 칠하고, 안쪽이면 건드리지 않음
+      if (minDist < thickness) {
+        gridRef[r][c] = floorValue;
+      }
+    }
+  }
+  return gridRef;
+};
+
+// CSV 구조 데이터 파일 추출 (1~5층 벽 + 바닥)
+export const exportToCSV = (grid) => {
+  let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell === 0) return;
+      const xCoord = cIdx * 3 + 1.5;
+      const zCoord = rIdx * 3 + 1.5;
+      const idX = formatID(xCoord * 10);
+      const idZ = formatID(zCoord * 10);
+
+      if (cell >= 1 && cell <= 5) {
+        // cell 값 = 층 번호. 해당 층 높이에만 벽 블록 생성
+        const floorNum = cell;
+        const yCoord = floorNum * 3 - 1.5;
+        const idY = formatID(yCoord * 10);
+        csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Wall_F${floorNum}\n`;
+      } else if (cell === FLOOR_VALUE) {
+        csvContent += `${idX}_${idZ}_015,${xCoord.toFixed(2)},1.50,${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Floor\n`;
+      }
+    });
   });
-  return [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
-}
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `blueprint_final.csv`;
+  link.click();
+};
 
-// 🌟 본체 그룹: 바운딩박스 중심을 피벗으로 잡아서 회전 (블록 자체는 -center 만큼 안쪽 그룹에서 당겨놓고,
-//    바깥 그룹을 center 위치로 옮긴 뒤 그 바깥 그룹에 회전을 적용 → 결과적으로 "제자리 회전"이 됨)
-function RotatableGroup({ blocks, rotationQuat, onRotationChange, center }) {
-  const groupRef = useRef();
+// ===================== 무한 누적(페이지 스택) 시스템 =====================
+// 페이지(한 장) 안에서는 셀 값(1~5)이 "그 페이지 안에서의 상대 높이(색)"를 의미.
+// 페이지를 기입(commit)할 때, 그 페이지에서 실제 쓰인 최고 색번호(maxColorUsed)를
+// 이전 페이지의 (pageBase + maxColorUsed) + 1 에 이어붙여서 다음 페이지의 시작 높이를 정한다.
+// → 종이(페이지)를 한 장씩 쌓아 올리되, 페이지마다 두께(1~5칸)가 달라도 절대 안 겹침.
 
-  useEffect(() => {
-    if (groupRef.current && rotationQuat) {
-      groupRef.current.quaternion.set(...rotationQuat);
-    }
-  }, [rotationQuat]);
+// 현재 grid에서 실제 쓰인 색(1~5) 중 최댓값을 찾는다 (안 쓰였으면 1)
+export const getMaxColorUsed = (grid) => {
+  let maxColorUsed = 0;
+  grid.forEach(row => row.forEach(cell => {
+    if (cell >= 1 && cell <= 5 && cell > maxColorUsed) maxColorUsed = cell;
+  }));
+  return maxColorUsed || 1;
+};
 
-  // 🌟 본체 쪽에서는 더 이상 PivotControls를 직접 띄우지 않음 (우측 상단 미니 기즈모가 대신함)
-  //    하지만 외부에서 onRotationChange가 호출되도록 ref는 노출 안 해도 됨 — 회전은 미니 기즈모 쪽에서만 발생.
-  return (
-    <group position={center}>
-      <group ref={groupRef}>
-        <group position={[-center[0], -center[1], -center[2]]}>
-          <VoxelBlocks blocks={blocks} />
-        </group>
-      </group>
-    </group>
-  );
-}
+// 이전 스택 정보를 바탕으로 다음 페이지가 시작될 pageBase를 계산
+export const getNextPageBase = (stackedFloors) => {
+  if (stackedFloors.length === 0) return 0;
+  const prev = stackedFloors[stackedFloors.length - 1];
+  return prev.pageBase + prev.maxColorUsed;
+};
 
-// 🌟 화면 우측 상단에 고정되는 작은 회전 기즈모 (본체와 분리된 별도의 미니 Canvas)
-//    여기서 드래그하면 onRotationChange로 쿼터니언이 부모에게 전달되고, 본체 회전에도 그대로 반영됨.
-function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
-  const lastEmitted = useRef(rotationQuat); // 🌟 이 기즈모가 마지막으로 "스스로" 내보낸 값 (드래그 결과)
-  const [gizmoKey, setGizmoKey] = useState(0); // 🌟 값이 바뀔 때마다 올려서 PivotControls를 통째로 리마운트시키는 용도
-
-  useEffect(() => {
-    // 🌟 rotationQuat이 바뀌었는데, 그게 방금 이 기즈모 자신이 드래그해서 emit한 값이 아니라면
-    //    (= 버튼 클릭이나 "초기화" 같은 외부 변경) → PivotControls를 강제로 리마운트해서
-    //    내부에 남아있던 낡은 회전 상태를 완전히 씻어내고 새 rotationQuat으로 다시 시작하게 함.
-    const prev = lastEmitted.current;
-    const isSelfEmitted = prev && rotationQuat.every((v, i) => Math.abs(v - prev[i]) < 1e-6);
-    if (!isSelfEmitted) {
-      setGizmoKey(k => k + 1);
-    }
-  }, [rotationQuat]);
-
-  // 🌟 진짜 원인: PivotControls는 우리가 잡은 자식 <group>의 matrix를 절대 건드리지 않는다.
-  //    회전은 PivotControls 내부에 감춰진 wrapper 오브젝트에 적용되기 때문에,
-  //    innerRef.current.matrix를 읽으면 항상 identity(회전 없음)만 나온다.
-  //    → 대신 PivotControls가 드래그하는 동안 실시간으로 넘겨주는 실제 로컬 변환행렬(l)을 그대로 써야 한다.
-  const handleDrag = (l) => {
-    if (!onRotationChange) return;
-    const q = new THREE.Quaternion();
-    const pos = new THREE.Vector3();
-    const scl = new THREE.Vector3();
-    l.decompose(pos, q, scl);
-    const next = [q.x, q.y, q.z, q.w];
-    lastEmitted.current = next; // 🌟 내가 emit한 값이라고 표시 → 위 useEffect에서 리마운트 안 되게
-    onRotationChange(next);
-  };
-
-  return (
-    <div
-      style={{
-        position: 'absolute',
-        top: 12,
-        right: 12,
-        width: 110,
-        height: 110,
-        zIndex: 20,
-        background: 'rgba(0,0,0,0.45)',
-        borderRadius: 12,
-        backdropFilter: 'blur(4px)',
-        pointerEvents: 'auto',
-      }}
-    >
-      <Canvas
-        orthographic
-        camera={{ position: [4, 4, 4], zoom: 30, near: 0.1, far: 100 }}
-        // 🌟 미니 캔버스는 항상 원점(0,0,0)을 중심으로 보여줘서 절대 안 흔들림 (중심 고정)
-      >
-        <ambientLight intensity={0.9} />
-        <directionalLight position={[3, 5, 3]} intensity={1.2} />
-        <PivotControls
-          key={gizmoKey}
-          disableTranslation
-          disableScaling
-          anchor={[0, 0, 0]}
-          depthTest={false}
-          scale={45}
-          fixed
-          onDrag={handleDrag}
-        >
-          <group
-            ref={(el) => {
-              // 🌟 리마운트된 직후(또는 최초 마운트) 바로 현재 rotationQuat 값으로 세팅
-              //    (이후 드래그 중 실제 회전은 handleDrag가 받는 l 행렬로만 처리하므로
-              //     이 그룹의 matrix/quaternion을 직접 읽을 필요가 없다)
-              if (el) el.quaternion.set(...rotationQuat);
-            }}
-          >
-            {/* 회전 방향을 눈으로 알 수 있게 작은 박스 + 화살표 모양 참조 오브젝트 */}
-            <mesh>
-              <boxGeometry args={[0.9, 0.9, 0.9]} />
-              <meshStandardMaterial color="#3b82f6" />
-            </mesh>
-            <mesh position={[0, 0.75, 0]}>
-              <coneGeometry args={[0.25, 0.5, 8]} />
-              <meshStandardMaterial color="#ef4444" />
-            </mesh>
-          </group>
-        </PivotControls>
-      </Canvas>
-      <div style={{
-        position: 'absolute', bottom: 2, left: 0, right: 0,
-        textAlign: 'center', color: '#cbd5e1', fontSize: 10, fontWeight: 700,
-        pointerEvents: 'none',
-      }}>
-        드래그: 회전
-      </div>
-    </div>
-  );
-}
-
-export default function LiveDemoViewer({
-  grid = null, data = null, mode = 'static', maxBlocks = 10000,
-  rotationQuat = [0, 0, 0, 1], onRotationChange = null, enableGizmo = false
-}) {
-
-  const displayData = useMemo(() => {
-    let blocks = [];
-
-    if (grid) {
-      grid.forEach((row, rIdx) => {
-        row.forEach((cell, cIdx) => {
-          if (cell) {
-            const totalFloors = (cell >= 1 && cell <= 5) ? cell : 1;
-
-            let hexColor = '#bdc3c7';
-            if (cell >= 1 && cell <= 5) hexColor = FLOOR_COLORS[cell].hex;
-            else if (cell === 9) hexColor = '#D2D2D2';
-
-            for (let h = 1; h <= totalFloors; h++) {
-              blocks.push({
-                x: cIdx * 3.0,
-                y: h * 3.0 - 1.5,
-                z: rIdx * 3.0,
-                color: hexColor,
-                mat: 'Concrete'
-              });
-            }
-          }
-        });
+// 누적된 모든 페이지를 하나의 CSV로 합쳐서 내보내기
+// 🌟 셀 값(cell, 1~5)은 "그 칸에 쌓을 블록 개수(반복 층수)"를 의미한다.
+//    예: 색=2(빨강)면 pageBase+1층, pageBase+2층 이렇게 2칸을 그 자리에 쌓아 올린다.
+export const exportStackedFloorsToCSV = (stackedFloors) => {
+  let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
+  stackedFloors.forEach(({ pageBase, grid }) => {
+    grid.forEach((row, rIdx) => {
+      row.forEach((cell, cIdx) => {
+        if (cell < 1 || cell > 5) return; // 0(빈칸)은 무시.
+        const xCoord = cIdx * 3 + 1.5;
+        const zCoord = rIdx * 3 + 1.5;
+        const idX = formatID(xCoord * 10);
+        const idZ = formatID(zCoord * 10);
+        for (let layer = 1; layer <= cell; layer++) {
+          const n = pageBase + layer; // 절대 누적 높이 인덱스
+          const yCoord = 1.5 + 3 * n;
+          const idY = formatID(yCoord * 10);
+          csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Block_N${n}\n`;
+        }
       });
-    } else if (data) {
-      // 🌟 백엔드(main.py의 mesh_to_blocks)에서 이미 앞뒤 방향을 보정해서 내려주므로
-      //    여기서 화면용으로 다시 뒤집지 않음 — 미리보기와 실제 CSV가 항상 일치하게 함.
-      blocks = data;
+    });
+  });
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `blueprint_stacked.csv`;
+  link.click();
+};
+
+// PNG 캔버스 이미지 저장 (mbs_ 접두사 자동 부여)
+export const exportToPNG = (grid, fileName) => {
+  const cellSize = 10;
+  const canvas = document.createElement('canvas');
+  canvas.width = 50 * cellSize; canvas.height = 50 * cellSize;
+  const ctx = canvas.getContext('2d');
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      ctx.fillStyle = getCellColorHex(cell);
+      ctx.fillRect(cIdx * cellSize, rIdx * cellSize, cellSize, cellSize);
+    });
+  });
+
+  // 유니티 스캐너 인식용 mbs_ 접두사 강제 부여
+  let baseName = (fileName && fileName.trim()) ? fileName.trim() : 'blueprint_draw';
+  baseName = baseName.replace(/\.png$/i, ''); // 혹시 사용자가 .png까지 입력해도 중복 방지
+  baseName = baseName.replace(/^mbs_/i, '');   // 이미 mbs_가 붙어있으면 중복 방지
+  const finalName = `mbs_${baseName}.png`;
+
+  const link = document.createElement('a');
+  link.download = finalName;
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+};
+
+// 이미지 파일에서 격자판 역추적 로드 (층별 색상 인식)
+export const importPNGToGrid = (file, callback) => {
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 50; canvas.height = 50;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, 50, 50);
+    const imageData = ctx.getImageData(0, 0, 50, 50).data;
+    const newGrid = Array(50).fill(null).map(() => Array(50).fill(0));
+
+    // 색상 → grid 값 역매핑 테이블 준비 (RGB 거리 기준 최근접 매칭)
+    const colorTable = [
+      { val: FLOOR_VALUE, rgb: [210, 210, 210] }, // 바닥
+      ...Object.entries(FLOOR_COLORS).map(([val, info]) => {
+        const hex = info.hex.replace('#', '');
+        const rgb = [
+          parseInt(hex.substring(0, 2), 16),
+          parseInt(hex.substring(2, 4), 16),
+          parseInt(hex.substring(4, 6), 16),
+        ];
+        return { val: Number(val), rgb };
+      }),
+    ];
+
+    for (let r = 0; r < 50; r++) {
+      for (let c = 0; c < 50; c++) {
+        const idx = (r * 50 + c) * 4;
+        const px = [imageData[idx], imageData[idx + 1], imageData[idx + 2]];
+        // 흰색(빈칸)에 가까우면 0으로 처리
+        if (px[0] > 245 && px[1] > 245 && px[2] > 245) {
+          newGrid[r][c] = 0;
+          continue;
+        }
+        // 가장 가까운 색을 찾아 매핑
+        let bestVal = 0;
+        let bestDist = Infinity;
+        for (const entry of colorTable) {
+          const d = Math.pow(px[0] - entry.rgb[0], 2) + Math.pow(px[1] - entry.rgb[1], 2) + Math.pow(px[2] - entry.rgb[2], 2);
+          if (d < bestDist) { bestDist = d; bestVal = entry.val; }
+        }
+        newGrid[r][c] = bestVal;
+      }
     }
-
-    if (blocks.length > maxBlocks) {
-      return blocks.slice(0, maxBlocks);
-    }
-    return blocks;
-  }, [grid, data, maxBlocks]);
-
-  // 🌟 블록 묶음의 실제 중심 (회전 피벗으로 사용)
-  const center = useMemo(() => getBlocksCenter(displayData), [displayData]);
-
-  return (
-    <div className="w-full h-full min-h-[400px] bg-gray-900 rounded-2xl overflow-hidden relative shadow-inner">
-      <div className="absolute top-4 left-4 z-10 bg-black/60 backdrop-blur-sm text-white px-4 py-2 rounded-xl text-sm font-bold flex flex-col gap-1">
-        <span className="text-blue-400">
-          {mode === 'realtime' ? '🟢 실시간 에디터 모드' : '🌐 갤러리 감상 모드'}
-        </span>
-        <span>
-          블록 렌더링: <span className={displayData.length >= maxBlocks ? "text-red-400" : "text-green-400"}>
-            {displayData.length.toLocaleString()}
-          </span> / {maxBlocks.toLocaleString()} MAX
-        </span>
-      </div>
-
-      <div className="absolute bottom-4 right-4 z-10 bg-black/60 backdrop-blur-sm text-gray-300 px-3 py-1 rounded-lg text-xs">
-        {enableGizmo
-          ? '우측 상단 미니 기즈모 드래그: 회전 | 좌클릭(빈공간): 시점회전 | 휠: 확대/축소'
-          : '좌클릭: 회전 | 우클릭: 이동 | 휠: 확대/축소'}
-      </div>
-
-      {/* 🌟 화면에 고정된 우측 상단 회전 기즈모 — 본체와 별도 캔버스라 카메라를 돌려도 절대 안 움직임 */}
-      {enableGizmo && (
-        <FixedCornerGizmo rotationQuat={rotationQuat} onRotationChange={onRotationChange} />
-      )}
-
-      <Canvas camera={{ position: [50, 50, 50], fov: 45 }}>
-        <color attach="background" args={['#0f172a']} />
-        <ambientLight intensity={0.6} />
-        <directionalLight position={[20, 40, 20]} intensity={1.5} castShadow />
-        <Stage environment="city" intensity={0.5} adjustCamera={true}>
-          <RotatableGroup
-            blocks={displayData}
-            rotationQuat={rotationQuat}
-            onRotationChange={onRotationChange}
-            center={center}
-          />
-        </Stage>
-        <OrbitControls makeDefault enableDamping={false} autoRotate={mode === 'static'} autoRotateSpeed={1.5} />
-      </Canvas>
-    </div>
-  );
-}
+    URL.revokeObjectURL(url);
+    callback(newGrid);
+  };
+  img.src = url;
+};
+// 2D 격자 데이터를 3D 뷰어용 배열(x, y, z, mat)로 변환해주는 함수
+export const convertGridTo3DData = (grid) => {
+  if (!grid) return [];
+  const blocks = [];
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell) {
+        // 셀 값이 숫자면 해당 층수, 아니면 기본 1층으로 계산
+        const floorHeight = typeof cell === 'number' ? cell : 1; 
+        blocks.push({
+          x: cIdx * 3.0, 
+          y: floorHeight * 3.0 - 1.5, 
+          z: rIdx * 3.0, 
+          mat: 'Concrete' // 기본 뷰는 콘크리트 재질로 통일
+        });
+      }
+    });
+  });
+  return blocks;
+};
 ```
 

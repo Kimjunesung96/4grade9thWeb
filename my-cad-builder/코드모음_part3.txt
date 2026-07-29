@@ -1,3 +1,693 @@
+// FILE PATH: src/components/LiveDemoViewer.jsx
+// MODIFIED: 26-07-02 16:55 | LINES: 253
+```jsx
+import React, { useMemo, useRef, useEffect, useState } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls, Stage, PivotControls } from '@react-three/drei';
+import * as THREE from 'three';
+import { FLOOR_COLORS } from '../utils/cadUtils';
+
+const MATERIAL_COLORS = {
+  Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50',
+  Glass: '#3498db', Default: '#bdc3c7'
+};
+
+function VoxelBlocks({ blocks }) {
+  return (
+    <group>
+      {blocks.map((block, index) => {
+        const isGlass = block.mat === 'Glass';
+        return (
+          <mesh key={index} position={[block.x, block.y, block.z]}>
+            <boxGeometry args={[3, 3, 3]} />
+            <meshStandardMaterial
+              color={block.color || MATERIAL_COLORS[block.mat] || MATERIAL_COLORS.Default}
+              transparent={isGlass}
+              opacity={isGlass ? 0.6 : 1}
+              roughness={isGlass ? 0.1 : 0.8}
+            />
+          </mesh>
+        );
+      })}
+    </group>
+  );
+}
+
+// 🌟 블록들의 바운딩박스 중심을 계산 (회전 피벗을 여기로 잡아야 "제자리에서" 돈다)
+function getBlocksCenter(blocks) {
+  if (!blocks || blocks.length === 0) return [0, 0, 0];
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  let minZ = Infinity, maxZ = -Infinity;
+  blocks.forEach(b => {
+    if (b.x < minX) minX = b.x; if (b.x > maxX) maxX = b.x;
+    if (b.y < minY) minY = b.y; if (b.y > maxY) maxY = b.y;
+    if (b.z < minZ) minZ = b.z; if (b.z > maxZ) maxZ = b.z;
+  });
+  return [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+}
+
+// 🌟 본체 그룹: 바운딩박스 중심을 피벗으로 잡아서 회전 (블록 자체는 -center 만큼 안쪽 그룹에서 당겨놓고,
+//    바깥 그룹을 center 위치로 옮긴 뒤 그 바깥 그룹에 회전을 적용 → 결과적으로 "제자리 회전"이 됨)
+function RotatableGroup({ blocks, rotationQuat, onRotationChange, center }) {
+  const groupRef = useRef();
+
+  useEffect(() => {
+    if (groupRef.current && rotationQuat) {
+      groupRef.current.quaternion.set(...rotationQuat);
+    }
+  }, [rotationQuat]);
+
+  // 🌟 본체 쪽에서는 더 이상 PivotControls를 직접 띄우지 않음 (우측 상단 미니 기즈모가 대신함)
+  //    하지만 외부에서 onRotationChange가 호출되도록 ref는 노출 안 해도 됨 — 회전은 미니 기즈모 쪽에서만 발생.
+  return (
+    <group position={center}>
+      <group ref={groupRef}>
+        <group position={[-center[0], -center[1], -center[2]]}>
+          <VoxelBlocks blocks={blocks} />
+        </group>
+      </group>
+    </group>
+  );
+}
+
+// 🌟 화면 우측 상단에 고정되는 작은 회전 기즈모 (본체와 분리된 별도의 미니 Canvas)
+//    여기서 드래그하면 onRotationChange로 쿼터니언이 부모에게 전달되고, 본체 회전에도 그대로 반영됨.
+// LINE 141 ~ 144: 버튼 클릭 등으로 외부에서 rotationQuat이 바뀔 때 기즈모 컴포넌트가 이를 완벽히 반영하도록 수정합니다.
+function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
+  const lastEmitted = useRef(rotationQuat);
+  const [gizmoKey, setGizmoKey] = useState(0);
+
+  useEffect(() => {
+    const prev = lastEmitted.current;
+    const isSelfEmitted = prev && rotationQuat.every((v, i) => Math.abs(v - prev[i]) < 1e-6);
+    
+    // 자기 자신이 드래그한 게 아니라 버튼 클릭 등으로 값이 외부에서 바뀐 경우라면 
+    // 기즈모의 내부 matrix 청소를 위해 리마운트를 트리거하고 동기화합니다.
+    if (!isSelfEmitted) {
+      lastEmitted.current = rotationQuat;
+      setGizmoKey(k => k + 1);
+    }
+  }, [rotationQuat]);
+
+  // 🌟 진짜 원인: PivotControls는 우리가 잡은 자식 <group>의 matrix를 절대 건드리지 않는다.
+  //    회전은 PivotControls 내부에 감춰진 wrapper 오브젝트에 적용되기 때문에,
+  //    innerRef.current.matrix를 읽으면 항상 identity(회전 없음)만 나온다.
+  //    → 대신 PivotControls가 드래그하는 동안 실시간으로 넘겨주는 실제 로컬 변환행렬(l)을 그대로 써야 한다.
+  const handleDrag = (l) => {
+    if (!onRotationChange) return;
+    const q = new THREE.Quaternion();
+    const pos = new THREE.Vector3();
+    const scl = new THREE.Vector3();
+    l.decompose(pos, q, scl);
+    const next = [q.x, q.y, q.z, q.w];
+    lastEmitted.current = next; // 🌟 내가 emit한 값이라고 표시 → 위 useEffect에서 리마운트 안 되게
+    onRotationChange(next);
+  };
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 12,
+        right: 12,
+        width: 110,
+        height: 110,
+        zIndex: 20,
+        background: 'rgba(0,0,0,0.45)',
+        borderRadius: 12,
+        backdropFilter: 'blur(4px)',
+        pointerEvents: 'auto',
+      }}
+    >
+      <Canvas
+        orthographic
+        camera={{ position: [4, 4, 4], zoom: 30, near: 0.1, far: 100 }}
+        // 🌟 미니 캔버스는 항상 원점(0,0,0)을 중심으로 보여줘서 절대 안 흔들림 (중심 고정)
+      >
+        <ambientLight intensity={0.9} />
+        <directionalLight position={[3, 5, 3]} intensity={1.2} />
+        <PivotControls
+          key={gizmoKey}
+          disableTranslation
+          disableScaling
+          anchor={[0, 0, 0]}
+          depthTest={false}
+          scale={45}
+          fixed
+          onDrag={handleDrag}
+        >
+          <group
+            ref={(el) => {
+              // 🌟 리마운트된 직후(또는 최초 마운트) 바로 현재 rotationQuat 값으로 세팅
+              //    (이후 드래그 중 실제 회전은 handleDrag가 받는 l 행렬로만 처리하므로
+              //     이 그룹의 matrix/quaternion을 직접 읽을 필요가 없다)
+              if (el) el.quaternion.set(...rotationQuat);
+            }}
+          >
+            {/* 회전 방향을 눈으로 알 수 있게 작은 박스 + 화살표 모양 참조 오브젝트 */}
+            <mesh>
+              <boxGeometry args={[0.9, 0.9, 0.9]} />
+              <meshStandardMaterial color="#3b82f6" />
+            </mesh>
+            <mesh position={[0, 0.75, 0]}>
+              <coneGeometry args={[0.25, 0.5, 8]} />
+              <meshStandardMaterial color="#ef4444" />
+            </mesh>
+          </group>
+        </PivotControls>
+      </Canvas>
+      <div style={{
+        position: 'absolute', bottom: 2, left: 0, right: 0,
+        textAlign: 'center', color: '#cbd5e1', fontSize: 10, fontWeight: 700,
+        pointerEvents: 'none',
+      }}>
+        드래그: 회전
+      </div>
+    </div>
+  );
+}
+
+export default function LiveDemoViewer({
+  grid = null, data = null, mode = 'static', maxBlocks = 10000,
+  rotationQuat = [0, 0, 0, 1], onRotationChange = null, enableGizmo = false
+}) {
+
+  const displayData = useMemo(() => {
+    let blocks = [];
+
+    if (grid) {
+      grid.forEach((row, rIdx) => {
+        row.forEach((cell, cIdx) => {
+          if (cell) {
+            const totalFloors = (cell >= 1 && cell <= 5) ? cell : 1;
+
+            let hexColor = '#bdc3c7';
+            if (cell >= 1 && cell <= 5) hexColor = FLOOR_COLORS[cell].hex;
+            else if (cell === 9) hexColor = '#D2D2D2';
+
+            for (let h = 1; h <= totalFloors; h++) {
+              blocks.push({
+                x: cIdx * 3.0,
+                y: h * 3.0 - 1.5,
+                z: rIdx * 3.0,
+                color: hexColor,
+                mat: 'Concrete'
+              });
+            }
+          }
+        });
+      });
+    } else if (data) {
+      // 🌟 백엔드(main.py의 mesh_to_blocks)에서 이미 앞뒤 방향을 보정해서 내려주므로
+      //    여기서 화면용으로 다시 뒤집지 않음 — 미리보기와 실제 CSV가 항상 일치하게 함.
+      blocks = data;
+    }
+
+    if (blocks.length > maxBlocks) {
+      return blocks.slice(0, maxBlocks);
+    }
+    return blocks;
+  }, [grid, data, maxBlocks]);
+
+  // 🌟 블록 묶음의 실제 중심 (회전 피벗으로 사용)
+  const center = useMemo(() => getBlocksCenter(displayData), [displayData]);
+
+  return (
+    <div className="w-full h-full min-h-[400px] bg-gray-900 rounded-2xl overflow-hidden relative shadow-inner">
+      <div className="absolute top-4 left-4 z-10 bg-black/60 backdrop-blur-sm text-white px-4 py-2 rounded-xl text-sm font-bold flex flex-col gap-1">
+        <span className="text-blue-400">
+          {mode === 'realtime' ? '🟢 실시간 에디터 모드' : '🌐 갤러리 감상 모드'}
+        </span>
+        <span>
+          블록 렌더링: <span className={displayData.length >= maxBlocks ? "text-red-400" : "text-green-400"}>
+            {displayData.length.toLocaleString()}
+          </span> / {maxBlocks.toLocaleString()} MAX
+        </span>
+      </div>
+
+      <div className="absolute bottom-4 right-4 z-10 bg-black/60 backdrop-blur-sm text-gray-300 px-3 py-1 rounded-lg text-xs">
+        {enableGizmo
+          ? '우측 상단 미니 기즈모 드래그: 회전 | 좌클릭(빈공간): 시점회전 | 휠: 확대/축소'
+          : '좌클릭: 회전 | 우클릭: 이동 | 휠: 확대/축소'}
+      </div>
+
+      {/* 🌟 화면에 고정된 우측 상단 회전 기즈모 — 본체와 별도 캔버스라 카메라를 돌려도 절대 안 움직임 */}
+      {enableGizmo && (
+        <FixedCornerGizmo rotationQuat={rotationQuat} onRotationChange={onRotationChange} />
+      )}
+
+      <Canvas camera={{ position: [50, 50, 50], fov: 45 }} gl={{ preserveDrawingBuffer: true }}>
+        <color attach="background" args={['#0f172a']} />
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[20, 40, 20]} intensity={1.5} castShadow />
+        <Stage environment="city" intensity={0.5} adjustCamera={true}>
+          <RotatableGroup
+            blocks={displayData}
+            rotationQuat={rotationQuat}
+            onRotationChange={onRotationChange}
+            center={center}
+          />
+        </Stage>
+        <OrbitControls makeDefault enableDamping={false} autoRotate={mode === 'static'} autoRotateSpeed={1.5} />
+      </Canvas>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/backend/main.py
+// MODIFIED: 26-07-01 18:06 | LINES: 221
+```py
+import io
+import pillow_avif  # noqa: F401  (AVIF 포맷 지원 — PIL 기본 탑재 아님, import만 해도 등록됨)
+import requests
+import trimesh
+import numpy as np
+import uvicorn
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from PIL import Image
+
+app = FastAPI()
+
+# 리액트(Vite) 프론트엔드에서 API를 호출할 수 있도록 CORS 허용 세팅
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 실제 배포 시에는 "http://localhost:5173" 등으로 제한
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ====================================================================
+# 🌟 콜랍에서 띄운 ngrok 주소. 콜랍 노트북을 다시 켤 때마다 바뀌니
+#    매번 여기를 갱신해줘야 합니다!
+# ====================================================================
+COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
+
+MAX_BLOCKS = 10000          # 유니티 렌더링 한도 (블록 렌더링 X / 10,000 MAX)
+GRID_PITCH = 3.0            # 기존 스케일 약속: 3유닛 = 15cm
+UNITS_PER_METER = 20.0      # 1m = 20유닛 (3유닛=15cm 이므로 1m = 6.667*3유닛 -> 20유닛)
+
+
+def format_id(val):
+    """
+    JS의 formatID 완벽 재현!
+    소수점을 10배수로 날리고 015, -105 형태로 포맷팅합니다.
+    """
+    abs_val = round(abs(val))
+    sign = "-" if val < 0 else "0"
+    return f"{sign}{str(abs_val).zfill(3)}"
+
+
+def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
+    """
+    콜랍에 올려둔 TripoSR API에 사진을 보내고, 생성된 3D 메시(.glb)를 받아옵니다.
+    (정면 사진 한 장 → AI가 뒷면/옆면까지 추론해서 만든 입체 메시)
+    """
+    resp = requests.post(
+        COLAB_API_URL,
+        files={"image": ("input.png", img_bytes, "image/png")},
+        timeout=180,
+    )
+    resp.raise_for_status()
+
+    mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
+    # GLB는 여러 메시가 묶인 Scene으로 로드될 수 있어서 하나로 합쳐줍니다
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(mesh.dump())
+    return mesh
+
+
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
+    """
+    🌟 건프라 축소 비율 방식: 건물 표면적에 맞춰 블록 크기(pitch)를 역산해서,
+    랜덤 솎아내기 없이 max_blocks 예산 안에서 표면 전체를 빈틈없이 덮습니다.
+    """
+    # 0. 🌟 축 보정: range가 제일 큰 축 = 실제 "높이"라고 보고, 그 축을 Y로 맞춤
+    #    (고정 90도 보정 대신, TripoSR 결과물 방향이 들쭉날쭉해도 항상 맞도록 자동 판별)
+    extents = mesh.bounds[1] - mesh.bounds[0]  # [x_range, y_range, z_range]
+    tallest_axis = int(np.argmax(extents))
+
+    if tallest_axis == 2:  # 높이가 Z축 -> X축 기준 -90도 회전해서 Y로
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    elif tallest_axis == 0:  # 높이가 X축 -> Z축 기준 90도 회전해서 Y로
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    # tallest_axis == 1이면 이미 Y축이 높이니까 회전 안 함
+
+    # 🌟 앞뒤(Z축) 반전 보정: TripoSR/GLB 결과물이 항상 앞뒤가 뒤집혀서 나오므로
+    #    여기서 실제 메시 좌표 자체를 거울처럼 뒤집어서 CSV/미리보기가 처음부터 올바르게 나오게 함.
+    #    (프론트엔드에서 화면용으로 임시로 뒤집던 방식은 제거했음 — 이제 데이터 자체가 정답)
+    mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
+    mesh.apply_transform(mirror)
+    mesh.invert()  # 미러링하면 face winding이 뒤집혀서 법선이 반대로 계산됨 → 다시 뒤집어서 복구
+
+    print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
+
+    # 1. AI가 만든 메시는 임의 크기라, 사용자가 입력한 실제 건물 높이에 맞춰 스케일 보정
+    mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
+    if mesh_height_raw <= 0:
+        raise ValueError("메시 높이를 계산할 수 없습니다 (생성된 메시가 비정상일 수 있음)")
+
+    target_height_units = real_height_m * UNITS_PER_METER
+    mesh.apply_scale(target_height_units / mesh_height_raw)
+    mesh.apply_translation([0, -mesh.bounds[0][1], 0])  # 바닥을 Y=0(유니티 그라운드)에 맞춤
+
+    surface_area = mesh.area
+    pitch = max(GRID_PITCH, round(((surface_area / max_blocks) ** 0.5) / GRID_PITCH) * GRID_PITCH)
+
+
+    # 2. 안전장치: 예산을 넘기면 랜덤 제거 대신 pitch를 키워 재시도 (균일 압축 유지, 구멍 방지)
+    raw_blocks = []
+    for attempt in range(5):
+        estimated_cells = surface_area / (pitch ** 2)
+        sample_count = max(int(estimated_cells * 6), 5000)
+        points, face_indices = trimesh.sample.sample_surface(mesh, count=sample_count)
+        normals = mesh.face_normals[face_indices]
+
+        raw_blocks = []
+        seen_ids = set()
+        for (x, y, z), normal in zip(points, normals):
+            grid_x = round((x - 1.5) / pitch)
+            grid_y = round((y - 1.5) / pitch)
+            grid_z = round((z - 1.5) / pitch)
+
+            # 🌟 칸 번호(grid_x/y/z)는 그대로 유지, 저장 좌표는 항상 GRID_PITCH(3)로 압축
+            #    → 점 개수/모양은 안 바뀌고, 점들 사이 실제 거리만 좁아짐 (유니티 코드 안 건드려도 됨)
+            pos_x = grid_x * GRID_PITCH + 1.5
+            pos_y = grid_y * GRID_PITCH + 1.5
+            pos_z = grid_z * GRID_PITCH + 1.5
+
+            id_x = format_id(pos_x * 10)
+            id_z = format_id(pos_z * 10)
+            id_y = format_id(pos_y * 10)
+            block_id = f"{id_x}_{id_z}_{id_y}"
+            if block_id in seen_ids:
+                continue
+            seen_ids.add(block_id)
+
+            # 표면 법선의 Y성분으로 바닥/지붕(Floor) vs 벽(Wall) 자동 판정
+            block_type = "Floor" if abs(normal[1]) > 0.7 else "Wall"
+
+            raw_blocks.append({
+                "BlockID": block_id,
+                "PosX": round(pos_x, 2),
+                "PosY": round(pos_y, 2),
+                "PosZ": round(pos_z, 2),
+                "Stress": 0.00,
+                "RiskLevel": "Safe",
+                "Prescription": "N",
+                "Material": "Default",
+                "Tensile": 400.0,
+                "Compressive": 400.0,
+                "Tool": "Existing",
+                "Type": block_type,
+            })
+
+        print(f"📐 시도 {attempt + 1}: pitch={pitch} → {len(raw_blocks)}개 블록")
+        if len(raw_blocks) <= max_blocks:
+            break
+        pitch += GRID_PITCH  # 넘쳤으면 한 칸 더 키워서 재시도
+
+    return raw_blocks
+
+
+@app.post("/api/extract-3d-csv")
+async def extract_3d_csv(
+    file: UploadFile = File(...),
+    startX: float = Form(...),
+    startY: float = Form(...),
+    endX: float = Form(...),
+    endY: float = Form(...),
+    realHeightMeters: float = Form(...),
+):
+    print(f"📥 사진 데이터 및 박스 좌표 수신: ({startX}, {startY}) ~ ({endX}, {endY}) | 실제 높이: {realHeightMeters}m")
+
+    # 1. 이미지 로드 (박스 영역만 잘라서 콜랍으로 보내면 결과가 더 정확함)
+    img_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이미지를 읽을 수 없습니다 (지원하지 않는 포맷일 수 있음): {e}",
+        )
+
+    sx, sy = max(0, int(startX)), max(0, int(startY))
+    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
+    cropped = image.crop((sx, sy, ex, ey))
+
+    crop_bytes_io = io.BytesIO()
+    cropped.save(crop_bytes_io, format="PNG")
+    crop_bytes = crop_bytes_io.getvalue()
+
+    # 2. 콜랍 TripoSR 모델로 단일 사진 → 3D 메시 생성 (뒷면/옆면까지 AI가 추론)
+    print("🤖 콜랍 AI 모델에 메시 생성 요청 중...")
+    mesh = get_mesh_from_colab(crop_bytes)
+    print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
+
+    # 3. 메시를 실제 크기로 스케일 보정 후, 표면(겉면)만 빈틈없이 블록화
+    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
+
+    # 4. Pandas 데이터프레임화
+    df = pd.DataFrame(raw_blocks)
+    df = df.drop_duplicates(subset=["BlockID"])
+    df = df.sort_values(by=["PosZ", "PosX", "PosY"])
+
+    print(f"✅ 총 {len(df)}개의 3D 빌딩 블록 엑셀 변환 완료! (속은 비어있는 표면 전용 구조)")
+
+    # 5. CSV 스트리밍 반환
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    output.seek(0)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ai_extracted_3d.csv"},
+    )
+
+
+if __name__ == "__main__":
+    print("🚀 CAD AI 백엔드 서버를 시작합니다. (포트 8000)")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+// FILE PATH: 요약2.py
+// MODIFIED: 26-06-29 00:49 | LINES: 83
+```py
+import os
+import datetime
+
+def gather_files():
+    # 🔍 수집할 핵심 파일 확장자 (.js, .css 등 추가 가능)
+    target_extensions = ('.py', '.jsx', '.html', '.bat', '.js')
+    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+    
+    # 💡 1000줄 넘으면 다음 part로 분할
+    MAX_LINES_PER_FILE = 1000 
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_data = []
+    
+    print("📦 파일 스캔 및 내용 수집 중...")
+    
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_folders]
+        
+        for file in files:
+            if file.endswith(target_extensions):
+                # 💡 만들어진 결과물이 다시 스캔되는 것을 방지
+                if file.startswith("코드모음_"):
+                    continue
+                    
+                filepath = os.path.join(root, file)
+                # AI가 파일 구조를 이해하기 쉽도록 절대경로 대신 상대경로 추출
+                rel_path = os.path.relpath(filepath, base_dir) 
+                
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
+                    
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                        content = "".join(lines)
+                        line_count = len(lines)
+                        
+                    files_data.append({
+                        'path': rel_path.replace("\\", "/"), # 윈도우 경로(\)를 표준(/)으로 변경
+                        'time': dt,
+                        'line_count': line_count,
+                        'content': content,
+                        'extension': file.split('.')[-1]
+                    })
+                except Exception as e:
+                    print(f"⚠️ {file} 읽기 실패: {e}")
+                    
+    files_data.sort(key=lambda x: x['time'], reverse=True)
+    
+    if not files_data:
+        print("❌ 수집할 파일이 없습니다.")
+        return
+
+    current_part = 1
+    current_lines = 0
+    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+    
+    for f_data in files_data:
+        # 💡 AI가 완벽하게 파싱할 수 있는 파일 헤더와 마크다운 코드 블록 양식
+        header = f"// FILE PATH: {f_data['path']}\n"
+        header += f"// MODIFIED: {f_data['time']} | LINES: {f_data['line_count']}\n"
+        code_block_start = f"```{f_data['extension']}\n"
+        code_block_end = "\n```\n\n"
+        
+        formatted_content = header + code_block_start + f_data['content'] + code_block_end
+        
+        added_lines = f_data['line_count'] + 6 
+        
+        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
+            out_f.close()
+            current_part += 1
+            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+            current_lines = 0
+            
+        out_f.write(formatted_content)
+        current_lines += added_lines
+        
+    out_f.close()
+    print(f"✅ 총 {current_part}개의 파트로 AI 최적화 코드 모음이 생성되었습니다.")
+
+if __name__ == "__main__":
+    gather_files()
+```
+
+// FILE PATH: src/components/BlueprintDetailModal.jsx
+// MODIFIED: 26-06-26 16:55 | LINES: 113
+```jsx
+import React from 'react';
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+
+export default function BlueprintDetailModal({
+  selectedBp,
+  onClose,
+  comments,
+  commentInput,
+  setCommentInput,
+  likeCount,
+  hasLiked,
+  onLikeToggle,
+  onAddComment
+}) {
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col md:flex-row overflow-hidden">
+        
+        {/* 왼쪽: 미니 그리드뷰 및 다운로드 */}
+        <div className="w-full md:w-1/2 bg-gray-100 p-6 flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-gray-200">
+          <div className="text-sm font-bold text-gray-500 mb-3 uppercase tracking-wider">구조물 설계도 평면도</div>
+          <div className="bg-white p-2 rounded-xl shadow-md overflow-auto max-w-full max-h-[350px]">
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 6px)', width: '300px' }}>
+              {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
+                <div
+                  key={`modal-cell-${rIdx}-${cIdx}`}
+                  className={`w-[6px] h-[6px] border-[0.05px] border-gray-100 ${getCellColorClass(cell)}`}
+                />
+              )))}
+            </div>
+          </div>
+          
+          <div className="w-full grid grid-cols-2 gap-3 mt-6">
+            <button onClick={handlePngDownload} className="p-3 bg-gray-880 text-white rounded-xl text-xs font-bold hover:bg-black transition-all">
+              📸 PNG 이미지 다운 (mbs_)
+            </button>
+            <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all">
+              📊 CSV 데이터 내보내기
+            </button>
+          </div>
+        </div>
+
+        {/* 오른쪽: 소셜 및 정보 영역 */}
+        <div className="w-full md:w-1/2 p-6 flex flex-col h-full overflow-hidden justify-between">
+          <div>
+            <div className="flex justify-between items-start mb-2">
+              <h3 className="text-2xl font-black text-gray-900">{selectedBp.name}</h3>
+              <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl font-bold p-1">✕</button>
+            </div>
+            <div className="text-sm text-gray-500 font-medium mb-4">
+              설계자: <span className="text-blue-600 font-bold">{selectedBp.author}</span>
+            </div>
+
+            {/* 좋아요 버튼 */}
+            <div className="mb-6">
+              <button 
+                onClick={onLikeToggle} 
+                className={`flex items-center space-x-2 px-4 py-2 rounded-full border text-sm font-bold transition-all ${
+                  hasLiked ? 'bg-red-50 border-red-200 text-red-500' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <span>{hasLiked ? '❤️' : '🤍'}</span>
+                <span>좋아요 {likeCount}개</span>
+              </button>
+            </div>
+
+            {/* 댓글 목록 */}
+            <div className="border-t border-gray-100 pt-4">
+              <h4 className="text-sm font-bold text-gray-700 mb-2">댓글 ({comments.length})</h4>
+              <div className="space-y-3 max-h-[220px] overflow-y-auto pr-1">
+                {comments.length === 0 ? (
+                  <p className="text-xs text-gray-400 py-4 text-center">첫 댓글을 남겨 자라나는 구조물을 칭찬해 보세요!</p>
+                ) : (
+                  comments.map(comment => (
+                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs">
+                      <div className="flex justify-between font-bold text-gray-700 mb-1">
+                        <span>{comment.username || '익명'}</span>
+                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
+                      </div>
+                      <p className="text-gray-600 font-medium break-all">{comment.content}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* 댓글 입력 바 */}
+          <div className="border-t border-gray-100 pt-4 mt-4 flex gap-2">
+            <input 
+              type="text" 
+              value={commentInput}
+              onChange={e => setCommentInput(e.target.value)}
+              placeholder="멋진 구조물이네요! 댓글을 남겨보세요..."
+              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 transition-all"
+              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
+            />
+            <button onClick={onAddComment} className="px-4 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition-all">
+              등록
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
 // FILE PATH: trace_deps.py
 // MODIFIED: 26-06-14 19:17 | LINES: 90
 ```py
@@ -247,278 +937,5 @@ export default defineConfig({
   plugins: [react()],
 })
 
-```
-
-// FILE PATH: 요약.py
-// MODIFIED: 26-06-03 17:04 | LINES: 90
-```py
-import os
-import datetime
-
-def gather_files():
-    # 🔍 수집할 핵심 파일 확장자
-    target_extensions = ('.py', '.jsx', '.html', '.bat')
-    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
-    
-    # 💡 한 텍스트 파일당 최대 몇 줄까지 담을지 설정 (원하시면 숫자를 수정하세요!)
-    MAX_LINES_PER_FILE = 1000 
-    
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    files_data = []
-    
-    print("📦 파일 스캔 및 내용 수집 중...")
-    
-    for root, dirs, files in os.walk(base_dir):
-        dirs[:] = [d for d in dirs if d not in ignore_folders]
-        
-        for file in files:
-            if file.endswith(target_extensions):
-                # 💡 만들어진 결과물(코드모음_*.txt)이 다시 스캔되는 것을 방지
-                if file.startswith("코드모음_"):
-                    continue
-                    
-                filepath = os.path.join(root, file)
-                
-                try:
-                    mtime = os.path.getmtime(filepath)
-                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
-                    
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        lines = f.readlines()
-                        content = "".join(lines)
-                        line_count = len(lines) # 글자 수가 아닌 '줄 수' 계산!
-                    
-                    files_data.append({
-                        'path': os.path.relpath(filepath, base_dir),
-                        'time': dt,
-                        'line_count': line_count,
-                        'mtime': mtime,
-                        'content': content
-                    })
-                    
-                except Exception as e:
-                    pass 
-
-    # 최근 수정된 순서대로 정렬
-    files_data.sort(key=lambda x: x['mtime'], reverse=True)
-    
-    if not files_data:
-        print("❌ 수집할 파일이 없습니다.")
-        return
-
-    # ---------------------------------------------------------
-    # 💡 수집된 내용들을 여러 개의 텍스트 파일로 쪼개서 저장하기
-    # ---------------------------------------------------------
-    current_part = 1
-    current_lines = 0
-    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
-    
-    for f_data in files_data:
-        # 파일별 제목 헤더 (예: [26-05-12 16:44] main.py (50줄))
-        header = f"\n\n{'='*60}\n[{f_data['time']}] {f_data['path']} ({f_data['line_count']}줄)\n{'='*60}\n\n"
-        
-        # 파일 하나를 추가할 때 예상되는 줄 수
-        added_lines = f_data['line_count'] + 6 
-        
-        # 만약 이 파일을 넣었을 때 제한(MAX_LINES_PER_FILE)을 넘는다면 새 파일 만들기
-        # 단, current_lines가 0일 때는 파일 하나가 1000줄이 넘더라도 일단 무조건 넣습니다.
-        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
-            out_f.close()
-            current_part += 1
-            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
-            current_lines = 0
-            
-        out_f.write(header)
-        out_f.write(f_data['content'])
-        current_lines += added_lines
-
-    out_f.close()
-    
-    print("=" * 60)
-    print(f"✅ 총 {len(files_data)}개의 파일 코드를 성공적으로 수집했습니다!")
-    print(f"📁 '코드모음_part1.txt' ~ '코드모음_part{current_part}.txt' 에 나뉘어 저장되었습니다.")
-    print("=" * 60)
-
-if __name__ == "__main__":
-    gather_files()
-    input("\n엔터를 누르면 종료됩니다...")
-```
-
-// FILE PATH: src/main.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 10
-```jsx
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
-import App from './App.jsx'
-
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-
-```
-
-// FILE PATH: src/supabaseClient.js
-// MODIFIED: 26-06-03 17:04 | LINES: 7
-```js
-import { createClient } from '@supabase/supabase-js'
-
-// 금고(.env)에서 자재 꺼내오기
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
-```
-
-// FILE PATH: src/components/BlueprintCard.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 19
-```jsx
-import React from 'react';
-
-export default function BlueprintCard({ bp, onClick }) {
-  return (
-    <div 
-      onClick={onClick} 
-      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98"
-    >
-      <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">🏗️</div>
-      <div className="p-5">
-        <div className="font-bold text-lg text-gray-900">{bp.name}</div>
-        <div className="flex justify-between items-center mt-2">
-          <span className="text-sm text-blue-600 font-bold">{bp.author}</span>
-          <span className="text-xs text-gray-400">{new Date(bp.created_at).toLocaleDateString()}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/components/ui/Button.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 13
-```jsx
-import React from 'react';
-
-export default function Button({ children, variant = 'primary', className = '', ...props }) {
-  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
-  const styles = {
-    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
-    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
-    dark: "bg-gray-800 text-white hover:bg-black",
-    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
-    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
-  };
-  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
-}
-```
-
-// FILE PATH: src/components/ui/Input.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 10
-```jsx
-import React from 'react';
-
-export default function Input({ label, className = '', ...props }) {
-  return (
-    <div className="space-y-1 w-full">
-      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
-      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/AuthView.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 29
-```jsx
-import React from 'react';
-import Input from '../components/ui/Input';
-import Button from '../components/ui/Button';
-
-export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
-  return (
-    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
-      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
-        <div className="text-blue-600 text-center mb-8">
-          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
-          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
-        </div>
-        <div className="space-y-4">
-          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
-          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
-          {authMode === 'signup' && (
-            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
-          )}
-          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
-            {authMode === 'login' ? '로그인' : '회원가입 하기'}
-          </Button>
-          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
-            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/DashboardView.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 54
-```jsx
-import React from 'react';
-import BlueprintCard from '../components/BlueprintCard';
-import Button from '../components/ui/Button';
-
-export default function DashboardView({ user, blueprints, setView, setUser, onSelectBlueprint }) {
-  return (
-    <div className="flex h-screen bg-gray-50 text-gray-800 font-sans">
-      <aside className="w-64 bg-white border-r border-gray-200 p-6 flex flex-col">
-        <div className="text-2xl font-black text-blue-600 mb-10">DESIGN CENTER</div>
-        <div className="bg-blue-50 p-4 rounded-xl mb-10">
-          <div className="text-xs font-bold text-blue-400 uppercase mb-1">Signed in as</div>
-          <div className="font-bold text-blue-700">{user?.username}</div>
-        </div>
-    
-        <nav className="flex-1 space-y-2">
-          <button className="w-full text-left p-3 bg-blue-600 text-white rounded-lg font-bold shadow-md">🏠 대시보드</button>
-          <button onClick={() => setView('editor')} className="w-full text-left p-3 hover:bg-gray-100 rounded-lg text-gray-600 font-medium transition-colors">📐 새 도면 그리기</button>
-        </nav>
-        <button onClick={() => { setUser(null); setView('auth'); }} className="p-3 text-gray-400 font-bold hover:text-red-500 transition-colors">로그아웃</button>
-      </aside>
-
-      <main className="flex-1 p-10 overflow-y-auto">
-        <header className="flex justify-between items-center mb-6">
-          <h2 className="text-3xl font-black text-gray-900">내 구조물</h2>
-          <Button variant="primary" onClick={() => setView('editor')} className="px-6 py-3 rounded-full">새 프로젝트 시작</Button>
-        </header>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
-          {blueprints.mine.length === 0 ? (
-            <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">아직 저장된 도면이 없습니다</div>
-          ) : (
-            blueprints.mine.map(bp => (
-              <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-            ))
-          )}
-        </div>
-
-        <div className="border-t border-gray-200 pt-10">
-          <h2 className="text-2xl font-black text-gray-900 mb-6">🌐 전체 전시관</h2>
-  
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {blueprints.others.length === 0 ? (
-              <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">다른 사용자의 도면이 없습니다</div>
-            ) : (
-              blueprints.others.map(bp => (
-                <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-              ))
-            )}
-          </div>
-        </div>
-      </main>
-    </div>
-  );
-}
 ```
 

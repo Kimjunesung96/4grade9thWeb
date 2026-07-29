@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
-import { hashPw, applyWallBorder, floodFill, FLOOR_VALUE } from './utils/cadUtils';
+import { hashPw, applyWallBorder, floodFill, getMaxColorUsed, getNextPageBase, exportStackedFloorsToCSV } from './utils/cadUtils';
 import AuthView from './views/AuthView';
 import DashboardView from './views/DashboardView';
 import EditorView from './views/EditorView';
@@ -13,7 +13,8 @@ export default function App() {
   const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
   const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
   const [mode, setMode] = useState('wall_rect');
-  const [activeFloor, setActiveFloor] = useState(1); // 현재 선택된 층 (1~5)
+  const [paintColor, setPaintColor] = useState(1); // 지금 그리는 페이지 안에서 쓸 색(1~5, = 상대 높이)
+  const [stackedFloors, setStackedFloors] = useState([]); // 기입 완료된 페이지들: [{ pageBase, maxColorUsed, grid }]
   const [isDrawing, setIsDrawing] = useState(false);
   const [history, setHistory] = useState([]);
   const [startPos, setStartPos] = useState(null);
@@ -75,7 +76,7 @@ export default function App() {
     // 바닥 채우기(클릭) 모드는 드래그 개념이 없으므로 즉시 flood fill 실행
     if (mode === 'floor_fill') {
       saveHistory();
-      setGrid(prevGrid => floodFill(prevGrid, r, c, FLOOR_VALUE));
+      setGrid(prevGrid => floodFill(prevGrid, r, c, paintColor));
       return;
     }
     saveHistory();
@@ -94,12 +95,12 @@ export default function App() {
       const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
 
       if (mode === 'wall_rect') {
-        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 층 값으로)
-        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, activeFloor, 2);
+        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 색 값으로)
+        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, paintColor, 2);
       } else if (mode === 'floor_rect') {
-        // 바닥(드래그): 영역 전체를 채움
+        // 바닥(드래그): 영역 전체를 채움 (선택된 색 값으로)
         for (let r = startR; r <= endR; r++) {
-          for (let c = startC; c <= endC; c++) { newGrid[r][c] = FLOOR_VALUE; }
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = paintColor; }
         }
       } else if (mode === 'rect_eraser') {
         // 지우개: 영역 전체를 비움
@@ -110,6 +111,32 @@ export default function App() {
       setGrid(newGrid);
     }
     setIsDrawing(false); setStartPos(null); setCurrentPos(null);
+  };
+
+  // 현재 페이지(grid)를 "기입"해서 stackedFloors에 누적하고, 다음 페이지를 위해 캔버스 초기화
+  const commitCurrentFloor = () => {
+    const maxColorUsed = getMaxColorUsed(grid);
+    const pageBase = getNextPageBase(stackedFloors);
+    setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
+  };
+
+  // 마지막으로 기입한 페이지를 되돌려서 다시 편집 가능하게
+  const goBackToPreviousFloor = () => {
+    if (stackedFloors.length === 0) return;
+    const last = stackedFloors[stackedFloors.length - 1];
+    setGrid(last.grid); // 마지막 페이지 grid를 다시 캔버스로 복원
+    setStackedFloors(prev => prev.slice(0, -1)); // 스택에서 제거
+    setHistory([]);
+  };
+
+  // 전체 페이지 + 현재 캔버스 다 날리고 처음 상태로
+  const resetAllFloors = () => {
+    if (!window.confirm("전체 페이지를 초기화하시겠습니까? 되돌릴 수 없습니다.")) return;
+    setStackedFloors([]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
   };
 
   const isInsidePreview = (r, c) => {
@@ -165,8 +192,12 @@ export default function App() {
           setGrid={setGrid}
           mode={mode}
           setMode={setMode}
-          activeFloor={activeFloor}
-          setActiveFloor={setActiveFloor}
+          paintColor={paintColor}
+          setPaintColor={setPaintColor}
+          stackedFloors={stackedFloors}
+          commitCurrentFloor={commitCurrentFloor}
+          goBackToPreviousFloor={goBackToPreviousFloor}
+          resetAllFloors={resetAllFloors}
           setView={setView}
           undo={undo}
           saveHistory={saveHistory}

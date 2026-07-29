@@ -1,8 +1,34 @@
 import React, { useState, useRef, useMemo } from 'react';
 import * as THREE from 'three';
 import Button from '../components/ui/Button';
-import { exportToPNG, exportToCSV, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID } from '../utils/cadUtils';
+import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
+
+// 🌟 기입 완료된 모든 페이지(stackedFloors) + 현재 그리는 중인 페이지(grid)를 합쳐서
+//    LiveDemoViewer가 그릴 수 있는 블록 배열({x,y,z,color,mat})로 변환
+function buildAllBlocks(stackedFloors, currentGrid, currentPageBase) {
+  const blocks = [];
+  const pushPage = (pageBase, pageGrid) => {
+    pageGrid.forEach((row, rIdx) => {
+      row.forEach((cell, cIdx) => {
+        if (cell < 1 || cell > 5) return;
+        for (let layer = 1; layer <= cell; layer++) {
+          const n = pageBase + layer;
+          blocks.push({
+            x: cIdx * 3.0,
+            y: 1.5 + 3 * n,
+            z: rIdx * 3.0,
+            color: FLOOR_COLORS[cell].hex,
+            mat: 'Concrete',
+          });
+        }
+      });
+    });
+  };
+  stackedFloors.forEach(({ pageBase, grid }) => pushPage(pageBase, grid));
+  pushPage(currentPageBase, currentGrid); // 아직 기입 안 한 현재 페이지도 미리보기에 포함
+  return blocks;
+}
 
 // 🌟 백엔드 CSV 행({PosX,PosY,PosZ,Material,...}) → LiveDemoViewer가 기대하는 블록 형태({x,y,z,mat,color})로 변환
 //    + 원본 컬럼 전체(raw)도 같이 보관해둬서, 나중에 회전 적용 후 CSV를 다시 만들 때 그대로 재사용
@@ -123,13 +149,20 @@ const EXPORT_EXTRA_RIGHT_225_QUAT = (() => {
 })();
 
 export default function EditorView({
-  grid, setGrid, mode, setMode, activeFloor, setActiveFloor, setView,
+  grid, setGrid, mode, setMode, paintColor, setPaintColor, stackedFloors, commitCurrentFloor, setView,
   undo, saveHistory, uploadToShowcase, isInsidePreview,
-  handleMouseDown, handleMouseEnter, handleMouseUp
+  handleMouseDown, handleMouseEnter, handleMouseUp,
+  goBackToPreviousFloor, resetAllFloors
 }) {
 
   // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
   const [editorTab, setEditorTab] = useState('grid');
+
+  // 🌟 기입 완료된 페이지 전부 + 지금 그리는 중인 페이지까지 합친 3D 미리보기용 블록
+  const allStackedBlocks = useMemo(
+    () => buildAllBlocks(stackedFloors, grid, getNextPageBase(stackedFloors)),
+    [stackedFloors, grid]
+  );
 
   // AI 사진 추출 결과 → 3D 뷰어에 띄울 데이터 (원본, 회전 미적용)
   const [extracted3DData, setExtracted3DData] = useState([]);
@@ -329,7 +362,7 @@ export default function EditorView({
         <div className="flex space-x-2">
           <Button variant="primary" onClick={handleCloudSave}>🌐 클라우드 저장</Button>
           <Button variant="dark" onClick={handlePngSave}>PNG 저장 (mbs_)</Button>
-          <Button variant="secondary" onClick={() => exportToCSV(grid)}>CSV 내보내기</Button>
+          <Button variant="secondary" onClick={() => exportStackedFloorsToCSV(stackedFloors)}>📦 전체 CSV 내보내기 ({stackedFloors.length}장)</Button>
         </div>
       </header>
 
@@ -367,23 +400,26 @@ export default function EditorView({
                     <Button variant={mode === 'floor_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_rect')}>🏁 바닥 드래그</Button>
                     <Button variant={mode === 'rect_eraser' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('rect_eraser')} className={mode === 'rect_eraser' ? '!text-red-500' : ''}>🧼 지우개</Button>
                   </div>
-                  {mode === 'wall_rect' && (
+                  {mode !== 'rect_eraser' && (
                     <div className="flex items-center bg-gray-100 p-1 rounded-lg space-x-1">
-                      {[1, 2, 3, 4, 5].map(floorNum => (
+                      {[1, 2, 3, 4, 5].map(colorNum => (
                         <button
-                          key={floorNum}
-                          onClick={() => setActiveFloor(floorNum)}
+                          key={colorNum}
+                          onClick={() => setPaintColor(colorNum)}
                           className={`w-7 h-7 rounded-md border-2 flex items-center justify-center text-[10px] font-bold transition-all ${
-                            activeFloor === floorNum ? 'border-blue-500 scale-110' : 'border-transparent opacity-70 hover:opacity-100'
+                            paintColor === colorNum ? 'border-blue-500 scale-110' : 'border-transparent opacity-70 hover:opacity-100'
                           }`}
-                          style={{ backgroundColor: FLOOR_COLORS[floorNum].hex, color: floorNum === 1 ? '#111' : '#fff' }}
+                          style={{ backgroundColor: FLOOR_COLORS[colorNum].hex, color: colorNum === 1 ? '#111' : '#fff' }}
                         >
-                          {floorNum}
+                          {colorNum}
                         </button>
                       ))}
                     </div>
                   )}
                   <Button variant="secondary" onClick={undo}>↩ 되돌리기</Button>
+                  <Button variant="secondary" onClick={goBackToPreviousFloor} disabled={stackedFloors.length === 0}>⏮ 이전 페이지로</Button>
+                  <Button variant="primary" onClick={commitCurrentFloor}>✅ 이 페이지 기입하고 다음 장으로</Button>
+                  <Button variant="dark" onClick={resetAllFloors} className="!bg-red-600 hover:!bg-red-700">🗑 전체 초기화</Button>
                   <label className="cursor-pointer px-3 py-2 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
                     📂 PNG 불러오기
                     <input type="file" accept="image/*" className="hidden" onChange={e => {
@@ -393,15 +429,41 @@ export default function EditorView({
                   </label>
                 </div>
 
+                {/* 현재 페이지 상태 표시 */}
+                <div className="flex justify-center items-center py-2 bg-white border-b border-gray-100 text-xs font-bold text-gray-500">
+                  🏗 {stackedFloors.length + 1}번째 장 그리는 중 · 기입 완료: {stackedFloors.length}장
+                  {stackedFloors.length > 0 && (
+                    <span className="ml-2 text-gray-400">
+                      (이전 장 시작 높이: {stackedFloors[stackedFloors.length - 1].pageBase}, 이번 장 시작 높이: {stackedFloors[stackedFloors.length - 1].pageBase + stackedFloors[stackedFloors.length - 1].maxColorUsed})
+                    </span>
+                  )}
+                </div>
+
                 {/* 50x50 캔버스 영역 */}
                 <div className="flex-1 p-10 flex justify-center items-start" onMouseUp={handleMouseUp}>
                   <div className="bg-white shadow-2xl border border-gray-200 relative" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
+
+                    {/* 이전 장 실루엣 레이어 (참고용, 클릭 통과) */}
+                    {stackedFloors.length > 0 && (
+                      <div className="absolute inset-0 pointer-events-none" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)' }}>
+                        {stackedFloors[stackedFloors.length - 1].grid.map((row, rIdx) =>
+                          row.map((cell, cIdx) => (
+                            <div key={`ghost-${rIdx}-${cIdx}`} className="w-[14px] h-[14px]"
+                              style={{
+                                backgroundColor: (cell >= 1 && cell <= 5) ? FLOOR_COLORS[cell].hex : 'transparent',
+                                opacity: (cell >= 1 && cell <= 5) ? 0.25 : 0,
+                              }} />
+                          ))
+                        )}
+                      </div>
+                    )}
+
+                    {/* 현재 페이지 그리기 레이어 */}
                     {grid.map((row, rIdx) => row.map((cell, cIdx) => {
                       const inPreview = isInsidePreview(rIdx, cIdx);
                       let bgColor = getCellColorClass(cell);
                       if (inPreview) {
-                        if (mode === 'wall_rect') bgColor = FLOOR_COLORS[activeFloor].tw + '/60';
-                        else if (mode === 'floor_rect') bgColor = "bg-blue-300/40";
+                        if (mode === 'wall_rect' || mode === 'floor_rect') bgColor = FLOOR_COLORS[paintColor].tw + '/60';
                         else bgColor = "bg-red-200";
                       }
                       return (
@@ -544,8 +606,8 @@ export default function EditorView({
           </div>
           <div className="flex-1 relative">
             <LiveDemoViewer
-              grid={editorTab === 'grid' ? grid : null}
-              data={editorTab === 'photo' ? extracted3DData : null}
+              grid={null}
+              data={editorTab === 'grid' ? allStackedBlocks : (editorTab === 'photo' ? extracted3DData : null)}
               mode="realtime"
               maxBlocks={10000}
               rotationQuat={rotationQuat}

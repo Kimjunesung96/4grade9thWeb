@@ -1,0 +1,190 @@
+// FILE PATH: 요약.py
+// MODIFIED: 26-06-03 17:04 | LINES: 90
+```py
+import os
+import datetime
+
+def gather_files():
+    # 🔍 수집할 핵심 파일 확장자
+    target_extensions = ('.py', '.jsx', '.html', '.bat')
+    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+    
+    # 💡 한 텍스트 파일당 최대 몇 줄까지 담을지 설정 (원하시면 숫자를 수정하세요!)
+    MAX_LINES_PER_FILE = 1000 
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_data = []
+    
+    print("📦 파일 스캔 및 내용 수집 중...")
+    
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_folders]
+        
+        for file in files:
+            if file.endswith(target_extensions):
+                # 💡 만들어진 결과물(코드모음_*.txt)이 다시 스캔되는 것을 방지
+                if file.startswith("코드모음_"):
+                    continue
+                    
+                filepath = os.path.join(root, file)
+                
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
+                    
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                        content = "".join(lines)
+                        line_count = len(lines) # 글자 수가 아닌 '줄 수' 계산!
+                    
+                    files_data.append({
+                        'path': os.path.relpath(filepath, base_dir),
+                        'time': dt,
+                        'line_count': line_count,
+                        'mtime': mtime,
+                        'content': content
+                    })
+                    
+                except Exception as e:
+                    pass 
+
+    # 최근 수정된 순서대로 정렬
+    files_data.sort(key=lambda x: x['mtime'], reverse=True)
+    
+    if not files_data:
+        print("❌ 수집할 파일이 없습니다.")
+        return
+
+    # ---------------------------------------------------------
+    # 💡 수집된 내용들을 여러 개의 텍스트 파일로 쪼개서 저장하기
+    # ---------------------------------------------------------
+    current_part = 1
+    current_lines = 0
+    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+    
+    for f_data in files_data:
+        # 파일별 제목 헤더 (예: [26-05-12 16:44] main.py (50줄))
+        header = f"\n\n{'='*60}\n[{f_data['time']}] {f_data['path']} ({f_data['line_count']}줄)\n{'='*60}\n\n"
+        
+        # 파일 하나를 추가할 때 예상되는 줄 수
+        added_lines = f_data['line_count'] + 6 
+        
+        # 만약 이 파일을 넣었을 때 제한(MAX_LINES_PER_FILE)을 넘는다면 새 파일 만들기
+        # 단, current_lines가 0일 때는 파일 하나가 1000줄이 넘더라도 일단 무조건 넣습니다.
+        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
+            out_f.close()
+            current_part += 1
+            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+            current_lines = 0
+            
+        out_f.write(header)
+        out_f.write(f_data['content'])
+        current_lines += added_lines
+
+    out_f.close()
+    
+    print("=" * 60)
+    print(f"✅ 총 {len(files_data)}개의 파일 코드를 성공적으로 수집했습니다!")
+    print(f"📁 '코드모음_part1.txt' ~ '코드모음_part{current_part}.txt' 에 나뉘어 저장되었습니다.")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    gather_files()
+    input("\n엔터를 누르면 종료됩니다...")
+```
+
+// FILE PATH: src/main.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+```
+
+// FILE PATH: src/supabaseClient.js
+// MODIFIED: 26-06-03 17:04 | LINES: 7
+```js
+import { createClient } from '@supabase/supabase-js'
+
+// 금고(.env)에서 자재 꺼내오기
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+```
+
+// FILE PATH: src/components/ui/Button.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 13
+```jsx
+import React from 'react';
+
+export default function Button({ children, variant = 'primary', className = '', ...props }) {
+  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
+  const styles = {
+    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
+    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
+    dark: "bg-gray-800 text-white hover:bg-black",
+    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
+    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
+  };
+  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
+}
+```
+
+// FILE PATH: src/components/ui/Input.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import React from 'react';
+
+export default function Input({ label, className = '', ...props }) {
+  return (
+    <div className="space-y-1 w-full">
+      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
+      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/views/AuthView.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 29
+```jsx
+import React from 'react';
+import Input from '../components/ui/Input';
+import Button from '../components/ui/Button';
+
+export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
+  return (
+    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
+      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
+        <div className="text-blue-600 text-center mb-8">
+          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
+          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
+        </div>
+        <div className="space-y-4">
+          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
+          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
+          {authMode === 'signup' && (
+            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
+          )}
+          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
+            {authMode === 'login' ? '로그인' : '회원가입 하기'}
+          </Button>
+          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
+            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
