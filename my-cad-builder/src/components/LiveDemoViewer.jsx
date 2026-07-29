@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useEffect, useState } from 'react';
+import React, { useMemo, useRef, useEffect, useLayoutEffect, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Stage, PivotControls } from '@react-three/drei';
 import * as THREE from 'three';
@@ -9,23 +9,59 @@ const MATERIAL_COLORS = {
   Glass: '#3498db', Default: '#bdc3c7'
 };
 
+// ⭐ [성능 개선] 블록 하나당 <mesh> 하나씩(수천 개) 만드는 대신,
+//    THREE.InstancedMesh 하나로 전부 한 번에 그림 (드로우콜 1회).
+//    유리(Glass)만 투명이라 재질 옵션이 달라서 일반/유리 두 그룹으로 나눠 처리.
 function VoxelBlocks({ blocks }) {
+  const solidRef = useRef();
+  const glassRef = useRef();
+
+  const { solidBlocks, glassBlocks } = useMemo(() => {
+    const solid = [];
+    const glass = [];
+    blocks.forEach(b => (b.mat === 'Glass' ? glass : solid).push(b));
+    return { solidBlocks: solid, glassBlocks: glass };
+  }, [blocks]);
+
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+  const colorObj = useMemo(() => new THREE.Color(), []);
+
+  useLayoutEffect(() => {
+    if (solidRef.current) {
+      solidBlocks.forEach((block, i) => {
+        dummy.position.set(block.x, block.y, block.z);
+        dummy.updateMatrix();
+        solidRef.current.setMatrixAt(i, dummy.matrix);
+        colorObj.set(block.color || MATERIAL_COLORS[block.mat] || MATERIAL_COLORS.Default);
+        solidRef.current.setColorAt(i, colorObj);
+      });
+      solidRef.current.instanceMatrix.needsUpdate = true;
+      if (solidRef.current.instanceColor) solidRef.current.instanceColor.needsUpdate = true;
+    }
+    if (glassRef.current) {
+      glassBlocks.forEach((block, i) => {
+        dummy.position.set(block.x, block.y, block.z);
+        dummy.updateMatrix();
+        glassRef.current.setMatrixAt(i, dummy.matrix);
+      });
+      glassRef.current.instanceMatrix.needsUpdate = true;
+    }
+  }, [solidBlocks, glassBlocks, dummy, colorObj]);
+
   return (
     <group>
-      {blocks.map((block, index) => {
-        const isGlass = block.mat === 'Glass';
-        return (
-          <mesh key={index} position={[block.x, block.y, block.z]}>
-            <boxGeometry args={[3, 3, 3]} />
-            <meshStandardMaterial
-              color={block.color || MATERIAL_COLORS[block.mat] || MATERIAL_COLORS.Default}
-              transparent={isGlass}
-              opacity={isGlass ? 0.6 : 1}
-              roughness={isGlass ? 0.1 : 0.8}
-            />
-          </mesh>
-        );
-      })}
+      {solidBlocks.length > 0 && (
+        <instancedMesh ref={solidRef} args={[null, null, solidBlocks.length]} key={`solid-${solidBlocks.length}`}>
+          <boxGeometry args={[3, 3, 3]} />
+          <meshStandardMaterial roughness={0.8} />
+        </instancedMesh>
+      )}
+      {glassBlocks.length > 0 && (
+        <instancedMesh ref={glassRef} args={[null, null, glassBlocks.length]} key={`glass-${glassBlocks.length}`}>
+          <boxGeometry args={[3, 3, 3]} />
+          <meshStandardMaterial color={MATERIAL_COLORS.Glass} transparent opacity={0.6} roughness={0.1} />
+        </instancedMesh>
+      )}
     </group>
   );
 }
@@ -70,7 +106,6 @@ function RotatableGroup({ blocks, rotationQuat, onRotationChange, center }) {
 
 // 🌟 화면 우측 상단에 고정되는 작은 회전 기즈모 (본체와 분리된 별도의 미니 Canvas)
 //    여기서 드래그하면 onRotationChange로 쿼터니언이 부모에게 전달되고, 본체 회전에도 그대로 반영됨.
-// LINE 141 ~ 144: 버튼 클릭 등으로 외부에서 rotationQuat이 바뀔 때 기즈모 컴포넌트가 이를 완벽히 반영하도록 수정합니다.
 function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
   const lastEmitted = useRef(rotationQuat);
   const [gizmoKey, setGizmoKey] = useState(0);
@@ -78,19 +113,13 @@ function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
   useEffect(() => {
     const prev = lastEmitted.current;
     const isSelfEmitted = prev && rotationQuat.every((v, i) => Math.abs(v - prev[i]) < 1e-6);
-    
-    // 자기 자신이 드래그한 게 아니라 버튼 클릭 등으로 값이 외부에서 바뀐 경우라면 
-    // 기즈모의 내부 matrix 청소를 위해 리마운트를 트리거하고 동기화합니다.
+
     if (!isSelfEmitted) {
       lastEmitted.current = rotationQuat;
       setGizmoKey(k => k + 1);
     }
   }, [rotationQuat]);
 
-  // 🌟 진짜 원인: PivotControls는 우리가 잡은 자식 <group>의 matrix를 절대 건드리지 않는다.
-  //    회전은 PivotControls 내부에 감춰진 wrapper 오브젝트에 적용되기 때문에,
-  //    innerRef.current.matrix를 읽으면 항상 identity(회전 없음)만 나온다.
-  //    → 대신 PivotControls가 드래그하는 동안 실시간으로 넘겨주는 실제 로컬 변환행렬(l)을 그대로 써야 한다.
   const handleDrag = (l) => {
     if (!onRotationChange) return;
     const q = new THREE.Quaternion();
@@ -98,7 +127,7 @@ function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
     const scl = new THREE.Vector3();
     l.decompose(pos, q, scl);
     const next = [q.x, q.y, q.z, q.w];
-    lastEmitted.current = next; // 🌟 내가 emit한 값이라고 표시 → 위 useEffect에서 리마운트 안 되게
+    lastEmitted.current = next;
     onRotationChange(next);
   };
 
@@ -120,7 +149,6 @@ function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
       <Canvas
         orthographic
         camera={{ position: [4, 4, 4], zoom: 30, near: 0.1, far: 100 }}
-        // 🌟 미니 캔버스는 항상 원점(0,0,0)을 중심으로 보여줘서 절대 안 흔들림 (중심 고정)
       >
         <ambientLight intensity={0.9} />
         <directionalLight position={[3, 5, 3]} intensity={1.2} />
@@ -136,13 +164,9 @@ function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
         >
           <group
             ref={(el) => {
-              // 🌟 리마운트된 직후(또는 최초 마운트) 바로 현재 rotationQuat 값으로 세팅
-              //    (이후 드래그 중 실제 회전은 handleDrag가 받는 l 행렬로만 처리하므로
-              //     이 그룹의 matrix/quaternion을 직접 읽을 필요가 없다)
               if (el) el.quaternion.set(...rotationQuat);
             }}
           >
-            {/* 회전 방향을 눈으로 알 수 있게 작은 박스 + 화살표 모양 참조 오브젝트 */}
             <mesh>
               <boxGeometry args={[0.9, 0.9, 0.9]} />
               <meshStandardMaterial color="#3b82f6" />
@@ -196,8 +220,6 @@ export default function LiveDemoViewer({
         });
       });
     } else if (data) {
-      // 🌟 백엔드(main.py의 mesh_to_blocks)에서 이미 앞뒤 방향을 보정해서 내려주므로
-      //    여기서 화면용으로 다시 뒤집지 않음 — 미리보기와 실제 CSV가 항상 일치하게 함.
       blocks = data;
     }
 
@@ -207,7 +229,6 @@ export default function LiveDemoViewer({
     return blocks;
   }, [grid, data, maxBlocks]);
 
-  // 🌟 블록 묶음의 실제 중심 (회전 피벗으로 사용)
   const center = useMemo(() => getBlocksCenter(displayData), [displayData]);
 
   return (
@@ -229,7 +250,6 @@ export default function LiveDemoViewer({
           : '좌클릭: 회전 | 우클릭: 이동 | 휠: 확대/축소'}
       </div>
 
-      {/* 🌟 화면에 고정된 우측 상단 회전 기즈모 — 본체와 별도 캔버스라 카메라를 돌려도 절대 안 움직임 */}
       {enableGizmo && (
         <FixedCornerGizmo rotationQuat={rotationQuat} onRotationChange={onRotationChange} />
       )}
