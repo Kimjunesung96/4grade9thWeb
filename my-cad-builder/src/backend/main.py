@@ -43,19 +43,15 @@ def format_id(val):
 
 
 def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
-    """
-    콜랍에 올려둔 TripoSR API에 사진을 보내고, 생성된 3D 메시(.glb)를 받아옵니다.
-    (정면 사진 한 장 → AI가 뒷면/옆면까지 추론해서 만든 입체 메시)
-    """
     resp = requests.post(
         COLAB_API_URL,
         files={"image": ("input.png", img_bytes, "image/png")},
+        params={"flatten_roof": "false", "snap_grid": "false"},
         timeout=180,
     )
     resp.raise_for_status()
 
     mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
-    # GLB는 여러 메시가 묶인 Scene으로 로드될 수 있어서 하나로 합쳐줍니다
     if isinstance(mesh, trimesh.Scene):
         mesh = trimesh.util.concatenate(mesh.dump())
     return mesh

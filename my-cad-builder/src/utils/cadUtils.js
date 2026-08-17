@@ -1,4 +1,5 @@
 import CryptoJS from 'crypto-js';
+import JSZip from 'jszip';
 
 // 비밀번호 암호화 로직
 export const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
@@ -125,6 +126,23 @@ export const getNextPageBase = (stackedFloors) => {
 // 누적된 모든 페이지를 하나의 CSV로 합쳐서 내보내기
 // 🌟 셀 값(cell, 1~5)은 "그 칸에 쌓을 블록 개수(반복 층수)"를 의미한다.
 //    예: 색=2(빨강)면 pageBase+1층, pageBase+2층 이렇게 2칸을 그 자리에 쌓아 올린다.
+// 🌟 CSV로 불러온 페이지(csvPages)와 수동으로 이어그린 페이지(stackedFloors)를
+//    "지금 실제로 존재하는 건물 전체"로 합쳐서 하나의 stackedFloors 형식 배열로 반환.
+//    - csvPages가 있는 상태(= 아직 "이 페이지 기입하고 다음 장으로"를 눌러 흡수되기 전)라면
+//      CSV 페이지들을 pageBase = pageIndex*5 에 깔아준다. 지금 편집 중인 페이지(csvPageIndex)는
+//      csvPages 스냅샷이 아니라 화면에 있는 최신 grid를 써서, 커밋 전 수정사항도 내보내기/미리보기에 반영되게 한다.
+//    - csvPages가 비어있다면(=CSV 미로드거나 이미 흡수됨) 기존 stackedFloors를 그대로 사용.
+//    ⚠️ 두 시스템은 항상 배타적으로 취급한다: commitCurrentFloor에서 csvPages를 stackedFloors로
+//       흡수시킨 뒤 비우기 때문에, 흡수 이후에는 stackedFloors 쪽 로직만 타면 된다.
+export const getCombinedFloors = (stackedFloors, csvPages, csvPageIndex, currentGrid) => {
+  if (!csvPages || csvPages.length === 0) return stackedFloors;
+  return csvPages.map((pageGrid, i) => ({
+    pageBase: i * 5,
+    maxColorUsed: 5,
+    grid: i === csvPageIndex ? currentGrid : pageGrid,
+  }));
+};
+
 export const exportStackedFloorsToCSV = (stackedFloors) => {
   let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
   stackedFloors.forEach(({ pageBase, grid }) => {
@@ -174,6 +192,55 @@ export const exportToPNG = (grid, fileName) => {
   link.download = finalName;
   link.href = canvas.toDataURL('image/png');
   link.click();
+};
+
+// 🌟 grid 하나를 PNG Blob으로 변환 (다운로드 없이 메모리에서만, zip에 넣기 위함)
+const gridToPngBlob = (grid) => {
+  const cellSize = 10;
+  const canvas = document.createElement('canvas');
+  canvas.width = 50 * cellSize; canvas.height = 50 * cellSize;
+  const ctx = canvas.getContext('2d');
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      ctx.fillStyle = getCellColorHex(cell);
+      ctx.fillRect(cIdx * cellSize, rIdx * cellSize, cellSize, cellSize);
+    });
+  });
+  return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+};
+
+// 🌟 여러 장의 grid를 PNG로 각각 변환한 뒤 zip 파일 하나로 묶어서 한 번에 다운로드
+// pages: [grid1, grid2, ...], labels: 각 grid에 대응하는 파일명(확장자 제외, mbs_ 접두사는 자동 부여)
+export const downloadGridPagesAsZip = async (pages, labels, zipName = 'floor_pages') => {
+  if (!pages || pages.length === 0) return;
+  const zip = new JSZip();
+  for (let i = 0; i < pages.length; i++) {
+    const blob = await gridToPngBlob(pages[i]);
+    const label = (labels && labels[i]) ? labels[i] : `page_${i + 1}`;
+    zip.file(`mbs_${label}.png`, blob);
+  }
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(zipBlob);
+  link.download = `${zipName}.zip`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+};
+
+// 🌟 페이지 수에 따라 자동으로 방식을 결정: 6장 미만이면 개별 PNG 다운로드, 6장 이상이면 zip 하나로 묶어서 다운로드
+// (브라우저 팝업 차단 및 다운로드 폴더 지저분해지는 문제를 방지하기 위한 기준값)
+const ZIP_THRESHOLD = 6;
+export const downloadPagesAsPngOrZip = async (pages, labels, zipName = 'floor_pages') => {
+  if (!pages || pages.length === 0) return;
+  if (pages.length >= ZIP_THRESHOLD) {
+    await downloadGridPagesAsZip(pages, labels, zipName);
+  } else {
+    for (let i = 0; i < pages.length; i++) {
+      const label = (labels && labels[i]) ? labels[i] : `page_${i + 1}`;
+      exportToPNG(pages[i], label);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
 };
 
 // 이미지 파일에서 격자판 역추적 로드 (층별 색상 인식)
@@ -245,4 +312,96 @@ export const convertGridTo3DData = (grid) => {
     });
   });
   return blocks;
+};
+
+// ===================== 3D CSV → 층별 PNG 분할 =====================
+// 🌟 Unity에서 넘어온 3D CSV(20층 등 여러 층)를 웹의 2D grid 색상 체계(1~5층)에
+//    맞게 5층씩 잘라서 grid 배열 여러 개로 변환. (각 grid는 exportToPNG 그대로 사용 가능)
+export const csvDataToFloorPages = (csvText, floorsPerPage = 5, gridSize = 50) => {
+  if (!csvText) return [];
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const idx = {
+    x: headers.indexOf('PosX'),
+    y: headers.indexOf('PosY'),
+    z: headers.indexOf('PosZ'),
+  };
+  if (idx.x === -1 || idx.y === -1 || idx.z === -1) return [];
+
+  const points = [];
+  let minX = Infinity, minZ = Infinity;
+  const ySet = new Set();
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const cols = lines[i].split(',');
+    const x = parseFloat(cols[idx.x]);
+    const y = parseFloat(cols[idx.y]);
+    const z = parseFloat(cols[idx.z]);
+    if ([x, y, z].some(Number.isNaN)) continue;
+    points.push({ x, y, z });
+    if (x < minX) minX = x;
+    if (z < minZ) minZ = z;
+    ySet.add(Math.round(y));
+  }
+  if (points.length === 0) return [];
+
+  // 실제 존재하는 층 높이들을 오름차순 정렬 → "몇 번째 층"인지 인덱스 매기기
+  const sortedYs = Array.from(ySet).sort((a, b) => a - b);
+  const floorIndexOf = (y) => sortedYs.indexOf(Math.round(y));
+
+  const totalFloors = sortedYs.length;
+  const pageCount = Math.ceil(totalFloors / floorsPerPage);
+  const pages = Array.from({ length: pageCount }, () =>
+    Array(gridSize).fill().map(() => Array(gridSize).fill(0))
+  );
+
+  points.forEach(p => {
+    const col = Math.round((p.x - minX) / 3.0);
+    const row = Math.round((p.z - minZ) / 3.0);
+    if (col < 0 || col >= gridSize || row < 0 || row >= gridSize) return;
+
+    const floorIdx = floorIndexOf(p.y); // 0 ~ totalFloors-1
+    const pageNum = Math.floor(floorIdx / floorsPerPage);
+    const colorInPage = (floorIdx % floorsPerPage) + 1; // 1~5
+
+    // 이미 더 높은 색(층)이 칠해져 있으면 덮어쓰지 않고 최대값 유지
+    pages[pageNum][row][col] = Math.max(pages[pageNum][row][col], colorInPage);
+  });
+
+  return pages; // [grid1, grid2, grid3, ...] 각 grid는 exportToPNG(grid, name) 그대로 사용 가능
+};
+
+// 🌟 쪼갠 grid들을 기존 exportToPNG로 순차 다운로드 (파일이 개별로 여러 장 떨어짐 — 구버전, 호환용으로 유지)
+//    (브라우저가 연속 다운로드를 팝업처럼 막는 경우가 있어 약간의 딜레이를 둠)
+export const downloadFloorPagesAsPngs = async (csvText, baseName = 'structure', floorsPerPage = 5) => {
+  const pages = csvDataToFloorPages(csvText, floorsPerPage);
+  if (pages.length === 0) {
+    alert('CSV에서 유효한 좌표(PosX/PosY/PosZ)를 찾지 못했습니다.');
+    return;
+  }
+  for (let i = 0; i < pages.length; i++) {
+    const startFloor = i * floorsPerPage + 1;
+    const endFloor = Math.min((i + 1) * floorsPerPage, pages.length * floorsPerPage);
+    const label = `${baseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
+    exportToPNG(pages[i], label);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+};
+
+// 🌟 쪼갠 grid들을 PNG로 변환해서 다운로드 (6장 미만은 개별, 6장 이상은 zip 하나로 자동 전환)
+export const downloadFloorPagesAsZip = async (csvText, baseName = 'structure', floorsPerPage = 5) => {
+  const pages = csvDataToFloorPages(csvText, floorsPerPage);
+  if (pages.length === 0) {
+    alert('CSV에서 유효한 좌표(PosX/PosY/PosZ)를 찾지 못했습니다.');
+    return;
+  }
+  const labels = pages.map((_, i) => {
+    const startFloor = i * floorsPerPage + 1;
+    const endFloor = Math.min((i + 1) * floorsPerPage, pages.length * floorsPerPage);
+    return `${baseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
+  });
+  await downloadPagesAsPngOrZip(pages, labels, `${baseName}_floors`);
 };

@@ -1,15 +1,846 @@
-// FILE PATH: 요약.py
-// MODIFIED: 26-06-03 17:04 | LINES: 90
+// FILE PATH: src/components/LiveDemoViewer.jsx
+// MODIFIED: 26-07-29 18:53 | LINES: 273
+```jsx
+import React, { useMemo, useRef, useEffect, useLayoutEffect, useState } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls, Stage, PivotControls } from '@react-three/drei';
+import * as THREE from 'three';
+import { FLOOR_COLORS } from '../utils/cadUtils';
+
+const MATERIAL_COLORS = {
+  Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50',
+  Glass: '#3498db', Default: '#bdc3c7'
+};
+
+// ⭐ [성능 개선] 블록 하나당 <mesh> 하나씩(수천 개) 만드는 대신,
+//    THREE.InstancedMesh 하나로 전부 한 번에 그림 (드로우콜 1회).
+//    유리(Glass)만 투명이라 재질 옵션이 달라서 일반/유리 두 그룹으로 나눠 처리.
+function VoxelBlocks({ blocks }) {
+  const solidRef = useRef();
+  const glassRef = useRef();
+
+  const { solidBlocks, glassBlocks } = useMemo(() => {
+    const solid = [];
+    const glass = [];
+    blocks.forEach(b => (b.mat === 'Glass' ? glass : solid).push(b));
+    return { solidBlocks: solid, glassBlocks: glass };
+  }, [blocks]);
+
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+  const colorObj = useMemo(() => new THREE.Color(), []);
+
+  useLayoutEffect(() => {
+    if (solidRef.current) {
+      solidBlocks.forEach((block, i) => {
+        dummy.position.set(block.x, block.y, block.z);
+        dummy.updateMatrix();
+        solidRef.current.setMatrixAt(i, dummy.matrix);
+        colorObj.set(block.color || MATERIAL_COLORS[block.mat] || MATERIAL_COLORS.Default);
+        solidRef.current.setColorAt(i, colorObj);
+      });
+      solidRef.current.instanceMatrix.needsUpdate = true;
+      if (solidRef.current.instanceColor) solidRef.current.instanceColor.needsUpdate = true;
+    }
+    if (glassRef.current) {
+      glassBlocks.forEach((block, i) => {
+        dummy.position.set(block.x, block.y, block.z);
+        dummy.updateMatrix();
+        glassRef.current.setMatrixAt(i, dummy.matrix);
+      });
+      glassRef.current.instanceMatrix.needsUpdate = true;
+    }
+  }, [solidBlocks, glassBlocks, dummy, colorObj]);
+
+  return (
+    <group>
+      {solidBlocks.length > 0 && (
+        <instancedMesh ref={solidRef} args={[null, null, solidBlocks.length]} key={`solid-${solidBlocks.length}`}>
+          <boxGeometry args={[3, 3, 3]} />
+          <meshStandardMaterial roughness={0.8} />
+        </instancedMesh>
+      )}
+      {glassBlocks.length > 0 && (
+        <instancedMesh ref={glassRef} args={[null, null, glassBlocks.length]} key={`glass-${glassBlocks.length}`}>
+          <boxGeometry args={[3, 3, 3]} />
+          <meshStandardMaterial color={MATERIAL_COLORS.Glass} transparent opacity={0.6} roughness={0.1} />
+        </instancedMesh>
+      )}
+    </group>
+  );
+}
+
+// 🌟 블록들의 바운딩박스 중심을 계산 (회전 피벗을 여기로 잡아야 "제자리에서" 돈다)
+function getBlocksCenter(blocks) {
+  if (!blocks || blocks.length === 0) return [0, 0, 0];
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  let minZ = Infinity, maxZ = -Infinity;
+  blocks.forEach(b => {
+    if (b.x < minX) minX = b.x; if (b.x > maxX) maxX = b.x;
+    if (b.y < minY) minY = b.y; if (b.y > maxY) maxY = b.y;
+    if (b.z < minZ) minZ = b.z; if (b.z > maxZ) maxZ = b.z;
+  });
+  return [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+}
+
+// 🌟 본체 그룹: 바운딩박스 중심을 피벗으로 잡아서 회전 (블록 자체는 -center 만큼 안쪽 그룹에서 당겨놓고,
+//    바깥 그룹을 center 위치로 옮긴 뒤 그 바깥 그룹에 회전을 적용 → 결과적으로 "제자리 회전"이 됨)
+function RotatableGroup({ blocks, rotationQuat, onRotationChange, center }) {
+  const groupRef = useRef();
+
+  useEffect(() => {
+    if (groupRef.current && rotationQuat) {
+      groupRef.current.quaternion.set(...rotationQuat);
+    }
+  }, [rotationQuat]);
+
+  // 🌟 본체 쪽에서는 더 이상 PivotControls를 직접 띄우지 않음 (우측 상단 미니 기즈모가 대신함)
+  //    하지만 외부에서 onRotationChange가 호출되도록 ref는 노출 안 해도 됨 — 회전은 미니 기즈모 쪽에서만 발생.
+  return (
+    <group position={center}>
+      <group ref={groupRef}>
+        <group position={[-center[0], -center[1], -center[2]]}>
+          <VoxelBlocks blocks={blocks} />
+        </group>
+      </group>
+    </group>
+  );
+}
+
+// 🌟 화면 우측 상단에 고정되는 작은 회전 기즈모 (본체와 분리된 별도의 미니 Canvas)
+//    여기서 드래그하면 onRotationChange로 쿼터니언이 부모에게 전달되고, 본체 회전에도 그대로 반영됨.
+function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
+  const lastEmitted = useRef(rotationQuat);
+  const [gizmoKey, setGizmoKey] = useState(0);
+
+  useEffect(() => {
+    const prev = lastEmitted.current;
+    const isSelfEmitted = prev && rotationQuat.every((v, i) => Math.abs(v - prev[i]) < 1e-6);
+
+    if (!isSelfEmitted) {
+      lastEmitted.current = rotationQuat;
+      setGizmoKey(k => k + 1);
+    }
+  }, [rotationQuat]);
+
+  const handleDrag = (l) => {
+    if (!onRotationChange) return;
+    const q = new THREE.Quaternion();
+    const pos = new THREE.Vector3();
+    const scl = new THREE.Vector3();
+    l.decompose(pos, q, scl);
+    const next = [q.x, q.y, q.z, q.w];
+    lastEmitted.current = next;
+    onRotationChange(next);
+  };
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 12,
+        right: 12,
+        width: 110,
+        height: 110,
+        zIndex: 20,
+        background: 'rgba(0,0,0,0.45)',
+        borderRadius: 12,
+        backdropFilter: 'blur(4px)',
+        pointerEvents: 'auto',
+      }}
+    >
+      <Canvas
+        orthographic
+        camera={{ position: [4, 4, 4], zoom: 30, near: 0.1, far: 100 }}
+      >
+        <ambientLight intensity={0.9} />
+        <directionalLight position={[3, 5, 3]} intensity={1.2} />
+        <PivotControls
+          key={gizmoKey}
+          disableTranslation
+          disableScaling
+          anchor={[0, 0, 0]}
+          depthTest={false}
+          scale={45}
+          fixed
+          onDrag={handleDrag}
+        >
+          <group
+            ref={(el) => {
+              if (el) el.quaternion.set(...rotationQuat);
+            }}
+          >
+            <mesh>
+              <boxGeometry args={[0.9, 0.9, 0.9]} />
+              <meshStandardMaterial color="#3b82f6" />
+            </mesh>
+            <mesh position={[0, 0.75, 0]}>
+              <coneGeometry args={[0.25, 0.5, 8]} />
+              <meshStandardMaterial color="#ef4444" />
+            </mesh>
+          </group>
+        </PivotControls>
+      </Canvas>
+      <div style={{
+        position: 'absolute', bottom: 2, left: 0, right: 0,
+        textAlign: 'center', color: '#cbd5e1', fontSize: 10, fontWeight: 700,
+        pointerEvents: 'none',
+      }}>
+        드래그: 회전
+      </div>
+    </div>
+  );
+}
+
+export default function LiveDemoViewer({
+  grid = null, data = null, mode = 'static', maxBlocks = 10000,
+  rotationQuat = [0, 0, 0, 1], onRotationChange = null, enableGizmo = false
+}) {
+
+  const displayData = useMemo(() => {
+    let blocks = [];
+
+    if (grid) {
+      grid.forEach((row, rIdx) => {
+        row.forEach((cell, cIdx) => {
+          if (cell) {
+            const totalFloors = (cell >= 1 && cell <= 5) ? cell : 1;
+
+            let hexColor = '#bdc3c7';
+            if (cell >= 1 && cell <= 5) hexColor = FLOOR_COLORS[cell].hex;
+            else if (cell === 9) hexColor = '#D2D2D2';
+
+            for (let h = 1; h <= totalFloors; h++) {
+              blocks.push({
+                x: cIdx * 3.0,
+                y: h * 3.0 - 1.5,
+                z: rIdx * 3.0,
+                color: hexColor,
+                mat: 'Concrete'
+              });
+            }
+          }
+        });
+      });
+    } else if (data) {
+      blocks = data;
+    }
+
+    if (blocks.length > maxBlocks) {
+      return blocks.slice(0, maxBlocks);
+    }
+    return blocks;
+  }, [grid, data, maxBlocks]);
+
+  const center = useMemo(() => getBlocksCenter(displayData), [displayData]);
+
+  return (
+    <div className="w-full h-full min-h-[400px] bg-gray-900 rounded-2xl overflow-hidden relative shadow-inner">
+      <div className="absolute top-4 left-4 z-10 bg-black/60 backdrop-blur-sm text-white px-4 py-2 rounded-xl text-sm font-bold flex flex-col gap-1">
+        <span className="text-blue-400">
+          {mode === 'realtime' ? '🟢 실시간 에디터 모드' : '🌐 갤러리 감상 모드'}
+        </span>
+        <span>
+          블록 렌더링: <span className={displayData.length >= maxBlocks ? "text-red-400" : "text-green-400"}>
+            {displayData.length.toLocaleString()}
+          </span> / {maxBlocks.toLocaleString()} MAX
+        </span>
+      </div>
+
+      <div className="absolute bottom-4 right-4 z-10 bg-black/60 backdrop-blur-sm text-gray-300 px-3 py-1 rounded-lg text-xs">
+        {enableGizmo
+          ? '우측 상단 미니 기즈모 드래그: 회전 | 좌클릭(빈공간): 시점회전 | 휠: 확대/축소'
+          : '좌클릭: 회전 | 우클릭: 이동 | 휠: 확대/축소'}
+      </div>
+
+      {enableGizmo && (
+        <FixedCornerGizmo rotationQuat={rotationQuat} onRotationChange={onRotationChange} />
+      )}
+
+      <Canvas camera={{ position: [50, 50, 50], fov: 45 }} gl={{ preserveDrawingBuffer: true }}>
+        <color attach="background" args={['#0f172a']} />
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[20, 40, 20]} intensity={1.5} castShadow />
+        <Stage environment="city" intensity={0.5} adjustCamera={true}>
+          <RotatableGroup
+            blocks={displayData}
+            rotationQuat={rotationQuat}
+            onRotationChange={onRotationChange}
+            center={center}
+          />
+        </Stage>
+        <OrbitControls makeDefault enableDamping={false} autoRotate={mode === 'static'} autoRotateSpeed={1.5} />
+      </Canvas>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/App.jsx
+// MODIFIED: 26-07-25 19:17 | LINES: 232
+```jsx
+import React, { useState, useEffect } from 'react';
+import { supabase } from './supabaseClient';
+import { hashPw, applyWallBorder, floodFill, getMaxColorUsed, getNextPageBase, exportStackedFloorsToCSV } from './utils/cadUtils';
+import AuthView from './views/AuthView';
+import DashboardView from './views/DashboardView';
+import EditorView from './views/EditorView';
+import DetailView from './views/DetailView';
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('auth');
+  const [authMode, setAuthMode] = useState('login');
+  const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
+  const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
+  const [mode, setMode] = useState('wall_rect');
+  const [paintColor, setPaintColor] = useState(1); // 지금 그리는 페이지 안에서 쓸 색(1~5, = 상대 높이)
+  const [stackedFloors, setStackedFloors] = useState([]); // 기입 완료된 페이지들: [{ pageBase, maxColorUsed, grid }]
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [startPos, setStartPos] = useState(null);
+  const [currentPos, setCurrentPos] = useState(null);
+  const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
+
+  // 소셜 상태 데이터 전역 상태 관리 저장소
+  const [selectedBp, setSelectedBp] = useState(null);
+  const [commentInput, setCommentInput] = useState('');
+  const [likesData, setLikesData] = useState({}); // { 도면ID: [유저ID리스트] }
+  const [commentsData, setCommentsData] = useState({}); // { 도면ID: [댓글배열] }
+
+  const handleSignUp = async () => {
+    const { error } = await supabase.from('users').insert([{ username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email }]);
+    if (error) alert("이미 존재하는 ID입니다.");
+    else { alert("계정이 생성되었습니다! 로그인해주세요."); setAuthMode('login'); }
+  };
+
+  const handleLogin = async () => {
+    const { data } = await supabase.from('users').select('*').eq('username', authForm.id).eq('password_hash', hashPw(authForm.pw)).single();
+    if (data) { setUser(data); setView('dashboard'); }
+    else alert("아이디 혹은 비밀번호가 틀립니다.");
+  };
+
+  const fetchBlueprints = async () => {
+    const { data: allData } = await supabase.from('blueprints').select('*').order('created_at', { ascending: false });
+    const all = allData || [];
+    setBlueprints({ mine: all.filter(bp => bp.user_id === user?.id), others: all.filter(bp => bp.user_id !== user?.id) });
+  };
+
+  useEffect(() => { if (view === 'dashboard' && user) fetchBlueprints(); }, [view, user]);
+
+  // 매개변수 payload를 받아서 유연하게 DB에 넣도록 수정
+  const uploadToShowcase = async (payload) => {
+    if (!user) return;
+    const title = prompt("작품 이름을 지어주세요!", "새 프로젝트");
+    if (!title) return;
+
+    const { error } = await supabase.from('blueprints').insert([{ 
+      name: title, 
+      user_id: user.id, 
+      author: user.username,
+      ...payload // grid_data, csv_data, thumbnail_url 등이 알아서 들어감
+    }]);
+
+    if (!error) { 
+      alert("업로드 완료!"); 
+      setView('dashboard'); 
+    } else {
+      alert("에러: " + error.message);
+    }
+  };
+
+  const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
+  const undo = () => { if (history.length === 0) return;
+  setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
+
+  const handleMouseDown = (r, c) => {
+    // 바닥 채우기(클릭) 모드는 드래그 개념이 없으므로 즉시 flood fill 실행
+    if (mode === 'floor_fill') {
+      saveHistory();
+      setGrid(prevGrid => floodFill(prevGrid, r, c, paintColor));
+      return;
+    }
+    saveHistory();
+    setIsDrawing(true);
+    setStartPos({ r, c });
+    setCurrentPos({ r, c });
+  };
+
+  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c });
+  };
+
+  const handleMouseUp = () => {
+    if (isDrawing && mode.includes('rect') && startPos && currentPos) {
+      let newGrid = grid.map(row => [...row]);
+      const startR = Math.min(startPos.r, currentPos.r), endR = Math.max(startPos.r, currentPos.r);
+      const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
+
+      if (mode === 'wall_rect') {
+        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 색 값으로)
+        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, paintColor, 2);
+      } else if (mode === 'floor_rect') {
+        // 바닥(드래그): 영역 전체를 채움 (선택된 색 값으로)
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = paintColor; }
+        }
+      } else if (mode === 'rect_eraser') {
+        // 지우개: 영역 전체를 비움
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = 0; }
+        }
+      }
+      setGrid(newGrid);
+    }
+    setIsDrawing(false); setStartPos(null); setCurrentPos(null);
+  };
+
+  // 현재 페이지(grid)를 "기입"해서 stackedFloors에 누적하고, 다음 페이지를 위해 캔버스 초기화
+  const commitCurrentFloor = () => {
+    const maxColorUsed = getMaxColorUsed(grid);
+    const pageBase = getNextPageBase(stackedFloors);
+    setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
+  };
+
+  // 마지막으로 기입한 페이지를 되돌려서 다시 편집 가능하게
+  const goBackToPreviousFloor = () => {
+    if (stackedFloors.length === 0) return;
+    const last = stackedFloors[stackedFloors.length - 1];
+    setGrid(last.grid); // 마지막 페이지 grid를 다시 캔버스로 복원
+    setStackedFloors(prev => prev.slice(0, -1)); // 스택에서 제거
+    setHistory([]);
+  };
+
+  // 전체 페이지 + 현재 캔버스 다 날리고 처음 상태로
+  const resetAllFloors = () => {
+    if (!window.confirm("전체 페이지를 초기화하시겠습니까? 되돌릴 수 없습니다.")) return;
+    setStackedFloors([]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
+  };
+
+  const isInsidePreview = (r, c) => {
+    if (!isDrawing || !startPos || !currentPos || !mode.includes('rect')) return false;
+    return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
+  };
+
+  // 1인 1회 토글형 좋아요 알고리즘 구현
+  const handleLikeToggle = (bpId) => {
+    if (!user) return;
+    const currentLikedUsers = likesData[bpId] || [];
+    if (currentLikedUsers.includes(user.id)) {
+      setLikesData({ ...likesData, [bpId]: currentLikedUsers.filter(uid => uid !== user.id) });
+    } else {
+      setLikesData({ ...likesData, [bpId]: [...currentLikedUsers, user.id] });
+    }
+  };
+
+  // 고유 도면 아이디 기반 독립형 댓글 작성 처리
+  const handleAddComment = (bpId) => {
+    if (!commentInput.trim() || !user) return;
+    const newComment = {
+      id: Date.now(),
+      username: user.username,
+      content: commentInput,
+      created_at: new Date().toISOString()
+    };
+    const currentComments = commentsData[bpId] || [];
+    setCommentsData({ ...commentsData, [bpId]: [...currentComments, newComment] });
+    setCommentInput('');
+  };
+
+  return (
+    <>
+      {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
+      
+      {view === 'dashboard' && (
+        <DashboardView 
+          user={user} 
+          blueprints={blueprints} 
+          setView={setView} 
+          setUser={setUser} 
+          onSelectBlueprint={(bp) => {
+            setSelectedBp(bp);
+            setView('detail'); // 💡 팝업 모달 대신 상세페이지('detail') 뷰로 화면 라우팅 전환
+          }} 
+        />
+      )}
+      
+      {view === 'editor' && (
+        <EditorView
+          grid={grid}
+          setGrid={setGrid}
+          mode={mode}
+          setMode={setMode}
+          paintColor={paintColor}
+          setPaintColor={setPaintColor}
+          stackedFloors={stackedFloors}
+          commitCurrentFloor={commitCurrentFloor}
+          goBackToPreviousFloor={goBackToPreviousFloor}
+          resetAllFloors={resetAllFloors}
+          setView={setView}
+          undo={undo}
+          saveHistory={saveHistory}
+          uploadToShowcase={uploadToShowcase}
+          isInsidePreview={isInsidePreview}
+          handleMouseDown={handleMouseDown}
+          handleMouseEnter={handleMouseEnter}
+          handleMouseUp={handleMouseUp}
+        />
+      )}
+
+      {view === 'detail' && selectedBp && (
+        <DetailView
+          selectedBp={selectedBp}
+          setView={setView}
+          comments={commentsData[selectedBp.id] || []}
+          commentInput={commentInput}
+          setCommentInput={setCommentInput}
+          likeCount={(likesData[selectedBp.id] || []).length}
+          hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
+          onLikeToggle={() => handleLikeToggle(selectedBp.id)}
+          onAddComment={() => handleAddComment(selectedBp.id)}
+          onEditBlueprint={() => {
+            setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
+            setHistory([]);
+            setView('editor');
+          }}
+        />
+      )}
+    </>
+  );
+}
+```
+
+// FILE PATH: src/views/DashboardView.jsx
+// MODIFIED: 26-07-25 18:47 | LINES: 54
+```jsx
+import React from 'react';
+import BlueprintCard from '../components/BlueprintCard';
+import Button from '../components/ui/Button';
+
+export default function DashboardView({ user, blueprints, setView, setUser, onSelectBlueprint }) {
+  return (
+    <div className="flex h-screen bg-gray-50 text-gray-800 font-sans">
+      <aside className="w-64 bg-white border-r border-gray-200 p-6 flex flex-col">
+        <div className="text-2xl font-black text-blue-600 mb-10">DESIGN CENTER</div>
+        <div className="bg-blue-50 p-4 rounded-xl mb-10">
+          <div className="text-xs font-bold text-blue-400 uppercase mb-1">Signed in as</div>
+          <div className="font-bold text-blue-700">{user?.username}</div>
+        </div>
+    
+        <nav className="flex-1 space-y-2">
+          <button className="w-full text-left p-3 bg-blue-600 text-white rounded-lg font-bold shadow-md">🏠 대시보드</button>
+          <button onClick={() => setView('editor')} className="w-full text-left p-3 hover:bg-gray-100 rounded-lg text-gray-600 font-medium transition-colors">📐 새 도면 그리기</button>
+        </nav>
+        <button onClick={() => { setUser(null); setView('auth'); }} className="p-3 text-gray-400 font-bold hover:text-red-500 transition-colors">로그아웃</button>
+      </aside>
+
+      <main className="flex-1 p-10 overflow-y-auto">
+        <header className="flex justify-between items-center mb-6">
+          <h2 className="text-3xl font-black text-gray-900">내 구조물</h2>
+          <Button variant="primary" onClick={() => setView('editor')} className="px-6 py-3 rounded-full">새 프로젝트 시작</Button>
+        </header>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
+          {blueprints.mine.length === 0 ? (
+            <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">아직 저장된 도면이 없습니다</div>
+          ) : (
+            blueprints.mine.map(bp => (
+              <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
+            ))
+          )}
+        </div>
+
+        <div className="border-t border-gray-200 pt-10">
+          <h2 className="text-2xl font-black text-gray-900 mb-6">🌐 전체 전시관</h2>
+  
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {blueprints.others.length === 0 ? (
+              <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">다른 사용자의 도면이 없습니다</div>
+            ) : (
+              blueprints.others.map(bp => (
+                <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
+              ))
+            )}
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/views/DetailView.jsx
+// MODIFIED: 26-07-02 17:45 | LINES: 204
+```jsx
+// LINE 1 ~ 7: 에디터에 있던 CSV 문자열 파싱 알고리즘을 가져오고, 파일 용량 계산 함수가 3D text 용량도 지원하도록 수정합니다.
+import React, { useMemo } from 'react';
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+import LiveDemoViewer from '../components/LiveDemoViewer';
+
+// 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
+function parseCsvToBlocks(csvText) {
+  if (!csvText) return [];
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const idx = {
+    x: headers.indexOf('PosX'),
+    y: headers.indexOf('PosY'),
+    z: headers.indexOf('PosZ'),
+    mat: headers.indexOf('Material'),
+  };
+
+  const MATERIAL_HEX = { Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50', Glass: '#3498db', Default: '#bdc3c7' };
+  const blocks = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const cols = lines[i].split(',');
+    const matName = idx.mat !== -1 ? cols[idx.mat] : 'Default';
+    blocks.push({
+      x: parseFloat(cols[idx.x]),
+      y: parseFloat(cols[idx.y]),
+      z: parseFloat(cols[idx.z]),
+      mat: matName,
+      color: MATERIAL_HEX[matName] || MATERIAL_HEX.Default,
+    });
+  }
+  return blocks;
+}
+
+export default function DetailView({
+  selectedBp,
+  setView,
+  comments,
+  commentInput,
+  setCommentInput,
+  likeCount,
+  hasLiked,
+  onLikeToggle,
+  onAddComment,
+  onEditBlueprint
+}) {
+  // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
+// LINE 205 ~ 207: grid_data가 없으면 csv_data 문자열 길이로 파일 용량을 대신 계산하고, 3D 블록 데이터를 메모이제이션합니다.
+  // 🌟 2D/3D 유연하게 대응하는 용량 계산 함수
+  const calculateFileSize = () => {
+    const targetData = selectedBp?.grid_data || selectedBp?.csv_data;
+    if (!targetData) return "0.00 KB";
+    const strLen = typeof targetData === 'string' ? targetData.length : JSON.stringify(targetData).length;
+    return (strLen / 1024).toFixed(2) + " KB";
+  };
+
+  // 🌟 현재 도면이 3D AI 기반 프로젝트인지 판별하고 블록 파싱 수행
+  const is3D = !!selectedBp?.csv_data;
+  const parsed3DBlocks = useMemo(() => {
+    return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
+  }, [selectedBp?.csv_data, is3D]);
+
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
+  };
+
+
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
+      {/* 상단 네비게이션 헤더 */}
+      <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shadow-sm sticky top-0 z-10">
+        <div className="flex items-center space-x-4">
+          <button 
+            onClick={() => setView('dashboard')} 
+            className="p-2 hover:bg-gray-100 rounded-xl text-gray-600 font-bold transition-all flex items-center space-x-1 text-sm"
+          >
+            <span>◀</span> <span>대시보드로 가기</span>
+          </button>
+          <div className="h-6 w-[1px] bg-gray-200" />
+          <h2 className="text-xl font-black text-gray-900">{selectedBp.name}</h2>
+        </div>
+        <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
+          설계도 뷰어 모드
+        </div>
+      </header>
+
+      {/* 대화형 메인 그리드 및 소셜 시스템 (2분할 구성) */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 flex flex-col md:flex-row gap-8">
+        
+        {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
+        <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
+          // LINE 211 ~ 216: 프로젝트 유형(is3D)에 맞게 제목을 매칭하고, LiveDemoViewer에 알맞은 prop 분배 및 하단 2D 격자 패널 조건부 노출을 처리합니다.
+          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
+            {is3D ? "3D AI 건축물 입체 프리뷰" : "구조물 설계도 평면도 미리보기"}
+          </div>
+          
+          {/* 🌟 3D 모드라면 parsed3DBlocks 데이터를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
+          <div className="w-full h-[350px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+            <LiveDemoViewer 
+              grid={!is3D ? selectedBp?.grid_data : null} 
+              data={is3D ? parsed3DBlocks : null} 
+              mode="static" 
+              maxBlocks={10000} 
+            />
+          </div>
+
+          {/* 🌟 2D 설계도일 때만 하단의 미니 격자판(2D 레고 도면)을 렌더링하고, 3D 건축물일 때는 공간을 차지하지 않도록 숨깁니다. */}
+          {!is3D && selectedBp.grid_data && (
+            <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
+                {selectedBp.grid_data.map((row, rIdx) => row.map((cell, cIdx) => (
+                  <div
+                    key={`detail-cell-${rIdx}-${cIdx}`}
+                    className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
+                  />
+                )))}
+              </div>
+            </div>
+          )}
+          
+          <div className="w-full flex flex-col gap-3 mt-6">
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
+                📸 PNG 이미지 다운로드 (mbs_)
+              </button>
+              <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
+                📊 CSV 데이터 내보내기
+              </button>
+            </div>
+            <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
+              📐 이 도면 편집기로 열기 (CAD 작업실 이동)
+            </button>
+          </div>
+        </div>
+
+        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 (기존 코드 완벽 유지) */}
+        <div className="w-full md:w-[400px] bg-white border border-gray-200 rounded-2xl p-6 flex flex-col shadow-sm justify-between">
+          <div>
+            <h3 className="text-base font-black text-gray-900 mb-4 pb-2 border-b border-gray-100">📋 설계 도면 정보</h3>
+            
+            <div className="bg-gray-50 p-4 rounded-xl text-xs space-y-3 text-gray-600 font-medium mb-5 border border-gray-100">
+              <div className="flex justify-between"><span>👤 설계자</span> <span className="text-blue-600 font-bold">{selectedBp.author}</span></div>
+              <div className="flex justify-between"><span>📅 제작일자</span> <span className="text-gray-900 font-bold">{new Date(selectedBp.created_at).toLocaleString()}</span></div>
+              <div className="flex justify-between"><span>💾 파일 용량</span> <span className="text-green-600 font-bold">{calculateFileSize()}</span></div>
+            </div>
+
+            <div className="mb-6">
+              <button 
+                onClick={onLikeToggle} 
+                className={`flex items-center space-x-2 px-5 py-2.5 rounded-full border text-xs font-bold transition-all shadow-sm ${
+                  hasLiked ? 'bg-red-50 border-red-200 text-red-500 shadow-red-100/30' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <span>{hasLiked ? '❤️' : '🤍'}</span>
+                <span>좋아요 {likeCount}개</span>
+              </button>
+            </div>
+
+            <div className="border-t border-gray-100 pt-5">
+              <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">💬 피드백 및 댓글 ({comments.length})</h4>
+              <div className="space-y-3 max-h-[260px] overflow-y-auto pr-1">
+                {comments.length === 0 ? (
+                  <div className="text-center py-10 bg-gray-50 rounded-xl border border-dashed border-gray-200 text-xs text-gray-400 font-medium">
+                    등록된 피드백이 없습니다.<br/>첫 댓글을 달아 칭찬해보세요!
+                  </div>
+                ) : (
+                  comments.map(comment => (
+                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs border border-gray-100">
+                      <div className="flex justify-between font-bold text-gray-700 mb-1">
+                        <span>{comment.username || '익명'}</span>
+                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
+                      </div>
+                      <p className="text-gray-600 font-medium break-all whitespace-pre-wrap">{comment.content}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-100 pt-4 mt-6 flex gap-2">
+            <input 
+              type="text" 
+              value={commentInput}
+              onChange={e => setCommentInput(e.target.value)}
+              placeholder="댓글을 남겨보세요..."
+              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 focus:bg-white transition-all font-medium"
+              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
+            />
+            <button onClick={onAddComment} className="px-5 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 shadow-sm transition-all whitespace-nowrap">
+              등록
+            </button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/components/BlueprintCard.jsx
+// MODIFIED: 26-07-02 17:04 | LINES: 43
+```jsx
+import React from 'react';
+
+export default function BlueprintCard({ bp, onClick }) {
+  // 🌟 썸네일(사진) 존재 여부로 3D / 2D 프로젝트를 판별합니다.
+  const is3D = !!bp.thumbnail_url;
+
+  return (
+    <div 
+      onClick={onClick} 
+      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98 relative"
+    >
+      {/* 🌟 우측 상단 뱃지 추가 (3D vs 2D 직관적 구분) */}
+      <div className="absolute top-3 right-3 z-10 px-2 py-1 bg-white/90 backdrop-blur-sm rounded-lg shadow-sm text-[10px] font-black border border-gray-100 text-gray-700">
+        {is3D ? '🕋 3D AI 모델' : '📐 2D 정밀 도면'}
+      </div>
+
+      {/* 🌟 썸네일 영역 */}
+      {is3D ? (
+        // 3D 프로젝트: 찰칵 찍어둔 썸네일 이미지를 꽉 차게 보여줌
+        <div className="h-40 w-full bg-gray-900 overflow-hidden">
+          <img 
+            src={bp.thumbnail_url} 
+            alt={bp.name} 
+            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+          />
+        </div>
+      ) : (
+        // 2D 프로젝트: 기존처럼 아이콘 표시
+        <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">
+          🏗️
+        </div>
+      )}
+      
+      <div className="p-5">
+        <div className="font-bold text-lg text-gray-900">{bp.name}</div>
+        <div className="flex justify-between items-center mt-2">
+          <span className="text-sm text-blue-600 font-bold">{bp.author}</span>
+          <span className="text-xs text-gray-400">{new Date(bp.created_at).toLocaleDateString()}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+// FILE PATH: 요약2.py
+// MODIFIED: 26-06-29 00:49 | LINES: 83
 ```py
 import os
 import datetime
 
 def gather_files():
-    # 🔍 수집할 핵심 파일 확장자
-    target_extensions = ('.py', '.jsx', '.html', '.bat')
+    # 🔍 수집할 핵심 파일 확장자 (.js, .css 등 추가 가능)
+    target_extensions = ('.py', '.jsx', '.html', '.bat', '.js')
     ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
     
-    # 💡 한 텍스트 파일당 최대 몇 줄까지 담을지 설정 (원하시면 숫자를 수정하세요!)
+    # 💡 1000줄 넘으면 다음 part로 분할
     MAX_LINES_PER_FILE = 1000 
     
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,11 +853,13 @@ def gather_files():
         
         for file in files:
             if file.endswith(target_extensions):
-                # 💡 만들어진 결과물(코드모음_*.txt)이 다시 스캔되는 것을 방지
+                # 💡 만들어진 결과물이 다시 스캔되는 것을 방지
                 if file.startswith("코드모음_"):
                     continue
                     
                 filepath = os.path.join(root, file)
+                # AI가 파일 구조를 이해하기 쉽도록 절대경로 대신 상대경로 추출
+                rel_path = os.path.relpath(filepath, base_dir) 
                 
                 try:
                     mtime = os.path.getmtime(filepath)
@@ -35,156 +868,52 @@ def gather_files():
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                         lines = f.readlines()
                         content = "".join(lines)
-                        line_count = len(lines) # 글자 수가 아닌 '줄 수' 계산!
-                    
+                        line_count = len(lines)
+                        
                     files_data.append({
-                        'path': os.path.relpath(filepath, base_dir),
+                        'path': rel_path.replace("\\", "/"), # 윈도우 경로(\)를 표준(/)으로 변경
                         'time': dt,
                         'line_count': line_count,
-                        'mtime': mtime,
-                        'content': content
+                        'content': content,
+                        'extension': file.split('.')[-1]
                     })
-                    
                 except Exception as e:
-                    pass 
-
-    # 최근 수정된 순서대로 정렬
-    files_data.sort(key=lambda x: x['mtime'], reverse=True)
+                    print(f"⚠️ {file} 읽기 실패: {e}")
+                    
+    files_data.sort(key=lambda x: x['time'], reverse=True)
     
     if not files_data:
         print("❌ 수집할 파일이 없습니다.")
         return
 
-    # ---------------------------------------------------------
-    # 💡 수집된 내용들을 여러 개의 텍스트 파일로 쪼개서 저장하기
-    # ---------------------------------------------------------
     current_part = 1
     current_lines = 0
     out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
     
     for f_data in files_data:
-        # 파일별 제목 헤더 (예: [26-05-12 16:44] main.py (50줄))
-        header = f"\n\n{'='*60}\n[{f_data['time']}] {f_data['path']} ({f_data['line_count']}줄)\n{'='*60}\n\n"
+        # 💡 AI가 완벽하게 파싱할 수 있는 파일 헤더와 마크다운 코드 블록 양식
+        header = f"// FILE PATH: {f_data['path']}\n"
+        header += f"// MODIFIED: {f_data['time']} | LINES: {f_data['line_count']}\n"
+        code_block_start = f"```{f_data['extension']}\n"
+        code_block_end = "\n```\n\n"
         
-        # 파일 하나를 추가할 때 예상되는 줄 수
+        formatted_content = header + code_block_start + f_data['content'] + code_block_end
+        
         added_lines = f_data['line_count'] + 6 
         
-        # 만약 이 파일을 넣었을 때 제한(MAX_LINES_PER_FILE)을 넘는다면 새 파일 만들기
-        # 단, current_lines가 0일 때는 파일 하나가 1000줄이 넘더라도 일단 무조건 넣습니다.
         if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
             out_f.close()
             current_part += 1
             out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
             current_lines = 0
             
-        out_f.write(header)
-        out_f.write(f_data['content'])
+        out_f.write(formatted_content)
         current_lines += added_lines
-
+        
     out_f.close()
-    
-    print("=" * 60)
-    print(f"✅ 총 {len(files_data)}개의 파일 코드를 성공적으로 수집했습니다!")
-    print(f"📁 '코드모음_part1.txt' ~ '코드모음_part{current_part}.txt' 에 나뉘어 저장되었습니다.")
-    print("=" * 60)
+    print(f"✅ 총 {current_part}개의 파트로 AI 최적화 코드 모음이 생성되었습니다.")
 
 if __name__ == "__main__":
     gather_files()
-    input("\n엔터를 누르면 종료됩니다...")
-```
-
-// FILE PATH: src/main.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 10
-```jsx
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
-import App from './App.jsx'
-
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-
-```
-
-// FILE PATH: src/supabaseClient.js
-// MODIFIED: 26-06-03 17:04 | LINES: 7
-```js
-import { createClient } from '@supabase/supabase-js'
-
-// 금고(.env)에서 자재 꺼내오기
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
-```
-
-// FILE PATH: src/components/ui/Button.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 13
-```jsx
-import React from 'react';
-
-export default function Button({ children, variant = 'primary', className = '', ...props }) {
-  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
-  const styles = {
-    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
-    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
-    dark: "bg-gray-800 text-white hover:bg-black",
-    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
-    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
-  };
-  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
-}
-```
-
-// FILE PATH: src/components/ui/Input.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 10
-```jsx
-import React from 'react';
-
-export default function Input({ label, className = '', ...props }) {
-  return (
-    <div className="space-y-1 w-full">
-      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
-      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/AuthView.jsx
-// MODIFIED: 26-06-03 17:04 | LINES: 29
-```jsx
-import React from 'react';
-import Input from '../components/ui/Input';
-import Button from '../components/ui/Button';
-
-export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
-  return (
-    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
-      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
-        <div className="text-blue-600 text-center mb-8">
-          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
-          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
-        </div>
-        <div className="space-y-4">
-          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
-          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
-          {authMode === 'signup' && (
-            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
-          )}
-          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
-            {authMode === 'login' ? '로그인' : '회원가입 하기'}
-          </Button>
-          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
-            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
 ```
 

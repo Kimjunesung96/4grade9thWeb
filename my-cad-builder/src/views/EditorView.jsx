@@ -1,7 +1,7 @@
 import React, { useState, useRef, useMemo } from 'react';
 import * as THREE from 'three';
 import Button from '../components/ui/Button';
-import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID } from '../utils/cadUtils';
+import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, getCombinedFloors, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
 
 // 🌟 기입 완료된 모든 페이지(stackedFloors) + 현재 그리는 중인 페이지(grid)를 합쳐서
@@ -27,6 +27,37 @@ function buildAllBlocks(stackedFloors, currentGrid, currentPageBase) {
   };
   stackedFloors.forEach(({ pageBase, grid }) => pushPage(pageBase, grid));
   pushPage(currentPageBase, currentGrid); // 아직 기입 안 한 현재 페이지도 미리보기에 포함
+  return blocks;
+}
+
+// 🌟 CSV로 불러온 모든 페이지(csvPages)를 각자 올바른 절대 높이(pageIndex*5)에
+//    동시에 쌓아서 3D 미리보기용 블록 배열로 변환.
+//    현재 보고 있는/수정 중인 페이지(currentPageIndex)는 csvPages의 스냅샷이 아니라
+//    화면에 있는 최신 grid를 사용해서, 페이지를 넘기기 전에 수정한 내용도 바로 반영되게 한다.
+function buildCsvPagesAllBlocks(csvPages, currentGrid, currentPageIndex) {
+  const blocks = [];
+  const pushPage = (pageBase, pageGrid) => {
+    pageGrid.forEach((row, rIdx) => {
+      row.forEach((cell, cIdx) => {
+        if (cell < 1 || cell > 5) return;
+        for (let layer = 1; layer <= cell; layer++) {
+          const n = pageBase + layer;
+          blocks.push({
+            x: cIdx * 3.0,
+            y: 1.5 + 3 * n,
+            z: rIdx * 3.0,
+            color: FLOOR_COLORS[cell].hex,
+            mat: 'Concrete',
+          });
+        }
+      });
+    });
+  };
+  csvPages.forEach((pageGrid, i) => {
+    const pageBase = i * 5; // 페이지당 5층 고정폭이므로 pageIndex*5가 절대 시작 높이
+    const gridToUse = i === currentPageIndex ? currentGrid : pageGrid;
+    pushPage(pageBase, gridToUse);
+  });
   return blocks;
 }
 
@@ -158,11 +189,26 @@ export default function EditorView({
   // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
   const [editorTab, setEditorTab] = useState('grid');
 
+  // ===================== 🌟 CSV → 정밀 격자 불러오기 (신규) =====================
+  // 웹에서 받은 3D CSV(PosX/PosY/PosZ)를 5층 단위 페이지로 쪼개서
+  // 정밀 격자(grid)에 순차적으로 표시 → 필요하면 수정 → 페이지 전체 PNG로 내보내기
+  // 🌟 allStackedBlocks가 이 상태를 참조해야 해서 (기존엔 아래쪽에 선언되어 있었음) 위로 끌어올림
+  const [csvPages, setCsvPages] = useState([]); // [grid1, grid2, ...] 5층씩 쪼갠 페이지들
+  const [csvPageIndex, setCsvPageIndex] = useState(0);
+  const [csvBaseName, setCsvBaseName] = useState('structure');
+  const csvGridUploadRef = useRef(null);
+  // ===================== CSV → 정밀 격자 불러오기 상태 끝 =====================
+
   // 🌟 기입 완료된 페이지 전부 + 지금 그리는 중인 페이지까지 합친 3D 미리보기용 블록
-  const allStackedBlocks = useMemo(
-    () => buildAllBlocks(stackedFloors, grid, getNextPageBase(stackedFloors)),
-    [stackedFloors, grid]
-  );
+  //    CSV를 불러온 상태(csvPages 존재)라면 stackedFloors 대신 csvPages 전부를
+  //    각자 올바른 절대 높이(pageIndex*5)에 동시에 쌓아서 이어 보이게 한다.
+  //    (수동 그리기 모드일 땐 기존 stackedFloors 기반 로직 그대로 사용)
+  const allStackedBlocks = useMemo(() => {
+    if (csvPages.length > 0) {
+      return buildCsvPagesAllBlocks(csvPages, grid, csvPageIndex);
+    }
+    return buildAllBlocks(stackedFloors, grid, getNextPageBase(stackedFloors));
+  }, [stackedFloors, grid, csvPages, csvPageIndex]);
 
   // AI 사진 추출 결과 → 3D 뷰어에 띄울 데이터 (원본, 회전 미적용)
   const [extracted3DData, setExtracted3DData] = useState([]);
@@ -188,6 +234,61 @@ export default function EditorView({
   const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
   const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
   const csvUploadRef = useRef(null);
+
+  // (csvPages / csvPageIndex / csvBaseName / csvGridUploadRef 는 allStackedBlocks가
+  //  참조해야 해서 컴포넌트 상단으로 이동시켰음 — 여기서 중복 선언하지 않음)
+
+  const handleCsvGridUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const csvText = evt.target.result;
+      const pages = csvDataToFloorPages(csvText, 5, 50);
+      if (pages.length === 0) {
+        alert('CSV에서 유효한 좌표(PosX/PosY/PosZ)를 찾지 못했습니다.');
+        return;
+      }
+      setCsvPages(pages);
+      setCsvPageIndex(0);
+      setCsvBaseName(file.name.replace(/\.csv$/i, ''));
+      saveHistory();
+      setGrid(pages[0]);
+      alert(`✅ CSV에서 ${pages.length}장의 페이지(5층씩)를 불러왔습니다. ◀▶로 페이지를 넘겨보고 필요하면 수정하세요.`);
+    };
+    reader.readAsText(file);
+    e.target.value = ''; // 같은 파일 다시 선택해도 onChange 트리거되게
+  };
+
+  // 페이지 이동 시 현재 화면에서 수정한 내용을 csvPages에 반영한 뒤 이동
+  const goToCsvPage = (newIndex) => {
+    if (newIndex < 0 || newIndex >= csvPages.length) return;
+    setCsvPages(prev => {
+      const updated = [...prev];
+      updated[csvPageIndex] = grid;
+      return updated;
+    });
+    saveHistory();
+    setGrid(csvPages[newIndex]);
+    setCsvPageIndex(newIndex);
+  };
+
+  // CSV에서 불러온 모든 페이지를 PNG로 다운로드 (6장 미만은 개별, 6장 이상은 zip 하나로 자동 전환)
+  const handleDownloadAllCsvPagesPngs = async () => {
+    if (csvPages.length === 0) {
+      alert('먼저 CSV를 불러와주세요.');
+      return;
+    }
+    const finalPages = [...csvPages];
+    finalPages[csvPageIndex] = grid; // 현재 보고 있는 페이지의 수정사항 반영
+    const labels = finalPages.map((_, i) => {
+      const startFloor = i * 5 + 1;
+      const endFloor = (i + 1) * 5;
+      return `${csvBaseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
+    });
+    await downloadPagesAsPngOrZip(finalPages, labels, `${csvBaseName}_floors`);
+  };
+  // ===================== CSV → 정밀 격자 불러오기 끝 =====================
 
   // 🌟 현재 회전 상태가 적용된 블록 (미리보기 + "편집본 다운로드"에 사용)
   const rotatedBlocks = useMemo(() => {
@@ -349,6 +450,16 @@ export default function EditorView({
     downloadCsvText(rawCsvText, `ai_extracted_원본_${Date.now()}.csv`);
   };
 
+  // 🌟 화면에 보이는(회전 적용된) 3D 블록을 5층씩 잘라서 PNG 여러 장으로 순차 다운로드
+  const handleDownloadFloorPagesPngs = () => {
+    if (rotatedBlocks.length === 0) {
+      alert("추출된 3D 데이터가 없습니다.");
+      return;
+    }
+    const csvText = blocksToCsvText(rotatedBlocks, csvHeaders);
+    downloadFloorPagesAsZip(csvText, '건물', 5);
+  };
+
   return (
     <div className="h-screen w-screen bg-gray-50 flex flex-col overflow-hidden select-none">
 
@@ -362,7 +473,12 @@ export default function EditorView({
         <div className="flex space-x-2">
           <Button variant="primary" onClick={handleCloudSave}>🌐 클라우드 저장</Button>
           <Button variant="dark" onClick={handlePngSave}>PNG 저장 (mbs_)</Button>
-          <Button variant="secondary" onClick={() => exportStackedFloorsToCSV(stackedFloors)}>📦 전체 CSV 내보내기 ({stackedFloors.length}장)</Button>
+          {/* 🌟 CSV로 불러온 뒤 아직 "기입"을 안 누른 페이지(csvPages)가 있어도 내보내기에 포함되도록
+                 getCombinedFloors로 stackedFloors + csvPages(현재 편집 중인 페이지는 최신 grid)를 합쳐서 내보낸다.
+                 (기존엔 stackedFloors만 내보내서 CSV로 불러온 내용이 통째로 빠지는 버그가 있었음) */}
+          <Button variant="secondary" onClick={() => exportStackedFloorsToCSV(getCombinedFloors(stackedFloors, csvPages, csvPageIndex, grid))}>
+            📦 전체 CSV 내보내기 ({(csvPages.length > 0 ? csvPages.length : stackedFloors.length)}장)
+          </Button>
         </div>
       </header>
 
@@ -393,7 +509,7 @@ export default function EditorView({
             {editorTab === 'grid' && (
               <div className="flex flex-col h-full">
                 {/* 툴바 (벽 그리기, 바닥 채우기 등) */}
-                <div className="p-3 bg-white border-b border-gray-200 flex items-center space-x-2 shadow-sm justify-center">
+                <div className="p-3 bg-white border-b border-gray-200 flex items-center space-x-2 shadow-sm justify-center flex-wrap gap-y-2">
                   <div className="flex bg-gray-100 p-1 rounded-lg">
                     <Button variant={mode === 'wall_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('wall_rect')}>🧱 벽 그리기</Button>
                     <Button variant={mode === 'floor_fill' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_fill')}>🪣 바닥 채우기</Button>
@@ -418,7 +534,19 @@ export default function EditorView({
                   )}
                   <Button variant="secondary" onClick={undo}>↩ 되돌리기</Button>
                   <Button variant="secondary" onClick={goBackToPreviousFloor} disabled={stackedFloors.length === 0}>⏮ 이전 페이지로</Button>
-                  <Button variant="primary" onClick={commitCurrentFloor}>✅ 이 페이지 기입하고 다음 장으로</Button>
+                  {/* 🌟 CSV를 불러온 상태(csvPages 有)에서 누르면, App의 commitCurrentFloor가
+                         로드된 모든 CSV 페이지를 stackedFloors로 흡수하도록 pages/pageIndex를 같이 넘긴다.
+                         흡수가 끝나면 이 화면(csvPages)은 더 이상 필요 없으니 비워서 이후엔
+                         기존 stackedFloors 기반 페이지 넘기기로만 이어지게 한다. */}
+                  <Button variant="primary" onClick={() => {
+                    if (csvPages.length > 0) {
+                      commitCurrentFloor({ pages: csvPages, pageIndex: csvPageIndex });
+                      setCsvPages([]);
+                      setCsvPageIndex(0);
+                    } else {
+                      commitCurrentFloor();
+                    }
+                  }}>✅ 이 페이지 기입하고 다음 장으로</Button>
                   <Button variant="dark" onClick={resetAllFloors} className="!bg-red-600 hover:!bg-red-700">🗑 전체 초기화</Button>
                   <label className="cursor-pointer px-3 py-2 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
                     📂 PNG 불러오기
@@ -426,6 +554,10 @@ export default function EditorView({
                       const file = e.target.files[0];
                       if (file) importPNGToGrid(file, g => { saveHistory(); setGrid(g); });
                     }} />
+                  </label>
+                  <label className="cursor-pointer px-3 py-2 bg-white border border-green-200 text-green-600 rounded-md text-xs font-bold hover:bg-green-50">
+                    📄 CSV 불러오기
+                    <input ref={csvGridUploadRef} type="file" accept=".csv" className="hidden" onChange={handleCsvGridUpload} />
                   </label>
                 </div>
 
@@ -438,6 +570,17 @@ export default function EditorView({
                     </span>
                   )}
                 </div>
+
+                {/* 🌟 CSV로 불러온 페이지 넘기기 UI (CSV 불러온 상태에서만 표시) */}
+                {csvPages.length > 0 && (
+                  <div className="flex justify-center items-center gap-3 py-2 bg-green-50 border-b border-green-100 text-xs font-bold text-green-700">
+                    <span>📄 {csvBaseName}.csv</span>
+                    <Button variant="secondary" onClick={() => goToCsvPage(csvPageIndex - 1)} disabled={csvPageIndex === 0}>◀</Button>
+                    <span>CSV 페이지 {csvPageIndex + 1} / {csvPages.length} (층 {csvPageIndex * 5 + 1}~{(csvPageIndex + 1) * 5})</span>
+                    <Button variant="secondary" onClick={() => goToCsvPage(csvPageIndex + 1)} disabled={csvPageIndex === csvPages.length - 1}>▶</Button>
+                    <Button variant="dark" onClick={handleDownloadAllCsvPagesPngs}>🗂️ 전체 페이지 PNG 다운로드</Button>
+                  </div>
+                )}
 
                 {/* 50x50 캔버스 영역 */}
                 <div className="flex-1 p-10 flex justify-center items-start" onMouseUp={handleMouseUp}>
@@ -586,9 +729,10 @@ export default function EditorView({
                       <Button variant="dark" onClick={handleSetZeroPoint}>📍 이 각도를 0점으로 저장</Button>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <Button variant="secondary" onClick={handleDownloadOriginal}>📥 원본 다운로드</Button>
                       <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(화면+225°) 다운로드</Button>
+                      <Button variant="dark" onClick={handleDownloadFloorPagesPngs}>🗂️ 층별 PNG 분할 다운로드 (5층씩)</Button>
                     </div>
                   </div>
                 )}

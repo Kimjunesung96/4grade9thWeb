@@ -114,7 +114,27 @@ export default function App() {
   };
 
   // 현재 페이지(grid)를 "기입"해서 stackedFloors에 누적하고, 다음 페이지를 위해 캔버스 초기화
-  const commitCurrentFloor = () => {
+  //
+  // 🌟 csvAbsorb: CSV를 불러온 상태(csvPages)에서 이 버튼을 눌렀을 때 EditorView가 넘겨주는
+  //    { pages, pageIndex } 값. 기존엔 이 값이 없어서 CSV로 불러온 내용은 완전히 무시하고
+  //    stackedFloors가 빈 상태 기준(pageBase=0)으로 새로 그린 페이지만 쌓아버렸음 → 그 결과
+  //    "CSV 불러오기 → 이어서 그리기 → 내보내기"를 하면 CSV 부분이 통째로 사라지고 새로 그린
+  //    페이지만 남는 버그가 있었음.
+  //    이제 csvAbsorb가 있으면: 로드된 모든 CSV 페이지(현재 편집 중인 페이지는 화면의 최신 grid로
+  //    교체)를 먼저 stackedFloors 형식으로 "흡수"시켜서 올바른 높이(pageIndex*5)에 확정시키고,
+  //    그 위에 이어그릴 새 빈 캔버스를 연다. 이후부터는 기존 stackedFloors 로직이 정상 동작한다.
+  const commitCurrentFloor = (csvAbsorb) => {
+    if (csvAbsorb && csvAbsorb.pages && csvAbsorb.pages.length > 0) {
+      const absorbed = csvAbsorb.pages.map((pageGrid, i) => ({
+        pageBase: i * 5,
+        maxColorUsed: 5,
+        grid: i === csvAbsorb.pageIndex ? grid : pageGrid,
+      }));
+      setStackedFloors(prev => [...prev, ...absorbed]);
+      setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+      setHistory([]);
+      return;
+    }
     const maxColorUsed = getMaxColorUsed(grid);
     const pageBase = getNextPageBase(stackedFloors);
     setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);

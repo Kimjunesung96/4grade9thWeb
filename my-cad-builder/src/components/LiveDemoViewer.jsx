@@ -258,7 +258,8 @@ export default function LiveDemoViewer({
         <color attach="background" args={['#0f172a']} />
         <ambientLight intensity={0.6} />
         <directionalLight position={[20, 40, 20]} intensity={1.5} castShadow />
-        <Stage environment="city" intensity={0.5} adjustCamera={true}>
+        {/* 🌟 environment={null} 을 추가하여 깃허브에서 HDR 조명 파일을 다운로드하지 않도록 강제 차단 (429 에러 방지) */}
+        <Stage intensity={0.5} adjustCamera={true} environment={null}>
           <RotatableGroup
             blocks={displayData}
             rotationQuat={rotationQuat}

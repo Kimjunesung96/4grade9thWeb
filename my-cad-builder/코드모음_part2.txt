@@ -1,10 +1,10 @@
 // FILE PATH: src/views/EditorView.jsx
-// MODIFIED: 26-07-25 19:17 | LINES: 623
+// MODIFIED: 26-08-16 21:21 | LINES: 709
 ```jsx
 import React, { useState, useRef, useMemo } from 'react';
 import * as THREE from 'three';
 import Button from '../components/ui/Button';
-import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID } from '../utils/cadUtils';
+import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
 
 // 🌟 기입 완료된 모든 페이지(stackedFloors) + 현재 그리는 중인 페이지(grid)를 합쳐서
@@ -192,6 +192,66 @@ export default function EditorView({
   const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
   const csvUploadRef = useRef(null);
 
+  // ===================== 🌟 CSV → 정밀 격자 불러오기 (신규) =====================
+  // 웹에서 받은 3D CSV(PosX/PosY/PosZ)를 5층 단위 페이지로 쪼개서
+  // 정밀 격자(grid)에 순차적으로 표시 → 필요하면 수정 → 페이지 전체 PNG로 내보내기
+  const [csvPages, setCsvPages] = useState([]); // [grid1, grid2, ...] 5층씩 쪼갠 페이지들
+  const [csvPageIndex, setCsvPageIndex] = useState(0);
+  const [csvBaseName, setCsvBaseName] = useState('structure');
+  const csvGridUploadRef = useRef(null);
+
+  const handleCsvGridUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const csvText = evt.target.result;
+      const pages = csvDataToFloorPages(csvText, 5, 50);
+      if (pages.length === 0) {
+        alert('CSV에서 유효한 좌표(PosX/PosY/PosZ)를 찾지 못했습니다.');
+        return;
+      }
+      setCsvPages(pages);
+      setCsvPageIndex(0);
+      setCsvBaseName(file.name.replace(/\.csv$/i, ''));
+      saveHistory();
+      setGrid(pages[0]);
+      alert(`✅ CSV에서 ${pages.length}장의 페이지(5층씩)를 불러왔습니다. ◀▶로 페이지를 넘겨보고 필요하면 수정하세요.`);
+    };
+    reader.readAsText(file);
+    e.target.value = ''; // 같은 파일 다시 선택해도 onChange 트리거되게
+  };
+
+  // 페이지 이동 시 현재 화면에서 수정한 내용을 csvPages에 반영한 뒤 이동
+  const goToCsvPage = (newIndex) => {
+    if (newIndex < 0 || newIndex >= csvPages.length) return;
+    setCsvPages(prev => {
+      const updated = [...prev];
+      updated[csvPageIndex] = grid;
+      return updated;
+    });
+    saveHistory();
+    setGrid(csvPages[newIndex]);
+    setCsvPageIndex(newIndex);
+  };
+
+  // CSV에서 불러온 모든 페이지를 PNG로 다운로드 (6장 미만은 개별, 6장 이상은 zip 하나로 자동 전환)
+  const handleDownloadAllCsvPagesPngs = async () => {
+    if (csvPages.length === 0) {
+      alert('먼저 CSV를 불러와주세요.');
+      return;
+    }
+    const finalPages = [...csvPages];
+    finalPages[csvPageIndex] = grid; // 현재 보고 있는 페이지의 수정사항 반영
+    const labels = finalPages.map((_, i) => {
+      const startFloor = i * 5 + 1;
+      const endFloor = (i + 1) * 5;
+      return `${csvBaseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
+    });
+    await downloadPagesAsPngOrZip(finalPages, labels, `${csvBaseName}_floors`);
+  };
+  // ===================== CSV → 정밀 격자 불러오기 끝 =====================
+
   // 🌟 현재 회전 상태가 적용된 블록 (미리보기 + "편집본 다운로드"에 사용)
   const rotatedBlocks = useMemo(() => {
     if (extracted3DData.length === 0) return [];
@@ -352,6 +412,16 @@ export default function EditorView({
     downloadCsvText(rawCsvText, `ai_extracted_원본_${Date.now()}.csv`);
   };
 
+  // 🌟 화면에 보이는(회전 적용된) 3D 블록을 5층씩 잘라서 PNG 여러 장으로 순차 다운로드
+  const handleDownloadFloorPagesPngs = () => {
+    if (rotatedBlocks.length === 0) {
+      alert("추출된 3D 데이터가 없습니다.");
+      return;
+    }
+    const csvText = blocksToCsvText(rotatedBlocks, csvHeaders);
+    downloadFloorPagesAsZip(csvText, '건물', 5);
+  };
+
   return (
     <div className="h-screen w-screen bg-gray-50 flex flex-col overflow-hidden select-none">
 
@@ -396,7 +466,7 @@ export default function EditorView({
             {editorTab === 'grid' && (
               <div className="flex flex-col h-full">
                 {/* 툴바 (벽 그리기, 바닥 채우기 등) */}
-                <div className="p-3 bg-white border-b border-gray-200 flex items-center space-x-2 shadow-sm justify-center">
+                <div className="p-3 bg-white border-b border-gray-200 flex items-center space-x-2 shadow-sm justify-center flex-wrap gap-y-2">
                   <div className="flex bg-gray-100 p-1 rounded-lg">
                     <Button variant={mode === 'wall_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('wall_rect')}>🧱 벽 그리기</Button>
                     <Button variant={mode === 'floor_fill' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_fill')}>🪣 바닥 채우기</Button>
@@ -430,6 +500,10 @@ export default function EditorView({
                       if (file) importPNGToGrid(file, g => { saveHistory(); setGrid(g); });
                     }} />
                   </label>
+                  <label className="cursor-pointer px-3 py-2 bg-white border border-green-200 text-green-600 rounded-md text-xs font-bold hover:bg-green-50">
+                    📄 CSV 불러오기
+                    <input ref={csvGridUploadRef} type="file" accept=".csv" className="hidden" onChange={handleCsvGridUpload} />
+                  </label>
                 </div>
 
                 {/* 현재 페이지 상태 표시 */}
@@ -441,6 +515,17 @@ export default function EditorView({
                     </span>
                   )}
                 </div>
+
+                {/* 🌟 CSV로 불러온 페이지 넘기기 UI (CSV 불러온 상태에서만 표시) */}
+                {csvPages.length > 0 && (
+                  <div className="flex justify-center items-center gap-3 py-2 bg-green-50 border-b border-green-100 text-xs font-bold text-green-700">
+                    <span>📄 {csvBaseName}.csv</span>
+                    <Button variant="secondary" onClick={() => goToCsvPage(csvPageIndex - 1)} disabled={csvPageIndex === 0}>◀</Button>
+                    <span>CSV 페이지 {csvPageIndex + 1} / {csvPages.length} (층 {csvPageIndex * 5 + 1}~{(csvPageIndex + 1) * 5})</span>
+                    <Button variant="secondary" onClick={() => goToCsvPage(csvPageIndex + 1)} disabled={csvPageIndex === csvPages.length - 1}>▶</Button>
+                    <Button variant="dark" onClick={handleDownloadAllCsvPagesPngs}>🗂️ 전체 페이지 PNG 다운로드</Button>
+                  </div>
+                )}
 
                 {/* 50x50 캔버스 영역 */}
                 <div className="flex-1 p-10 flex justify-center items-start" onMouseUp={handleMouseUp}>
@@ -589,9 +674,10 @@ export default function EditorView({
                       <Button variant="dark" onClick={handleSetZeroPoint}>📍 이 각도를 0점으로 저장</Button>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <Button variant="secondary" onClick={handleDownloadOriginal}>📥 원본 다운로드</Button>
                       <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(화면+225°) 다운로드</Button>
+                      <Button variant="dark" onClick={handleDownloadFloorPagesPngs}>🗂️ 층별 PNG 분할 다운로드 (5층씩)</Button>
                     </div>
                   </div>
                 )}
@@ -620,322 +706,6 @@ export default function EditorView({
           </div>
         </div>
 
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/DashboardView.jsx
-// MODIFIED: 26-07-25 18:47 | LINES: 54
-```jsx
-import React from 'react';
-import BlueprintCard from '../components/BlueprintCard';
-import Button from '../components/ui/Button';
-
-export default function DashboardView({ user, blueprints, setView, setUser, onSelectBlueprint }) {
-  return (
-    <div className="flex h-screen bg-gray-50 text-gray-800 font-sans">
-      <aside className="w-64 bg-white border-r border-gray-200 p-6 flex flex-col">
-        <div className="text-2xl font-black text-blue-600 mb-10">DESIGN CENTER</div>
-        <div className="bg-blue-50 p-4 rounded-xl mb-10">
-          <div className="text-xs font-bold text-blue-400 uppercase mb-1">Signed in as</div>
-          <div className="font-bold text-blue-700">{user?.username}</div>
-        </div>
-    
-        <nav className="flex-1 space-y-2">
-          <button className="w-full text-left p-3 bg-blue-600 text-white rounded-lg font-bold shadow-md">🏠 대시보드</button>
-          <button onClick={() => setView('editor')} className="w-full text-left p-3 hover:bg-gray-100 rounded-lg text-gray-600 font-medium transition-colors">📐 새 도면 그리기</button>
-        </nav>
-        <button onClick={() => { setUser(null); setView('auth'); }} className="p-3 text-gray-400 font-bold hover:text-red-500 transition-colors">로그아웃</button>
-      </aside>
-
-      <main className="flex-1 p-10 overflow-y-auto">
-        <header className="flex justify-between items-center mb-6">
-          <h2 className="text-3xl font-black text-gray-900">내 구조물</h2>
-          <Button variant="primary" onClick={() => setView('editor')} className="px-6 py-3 rounded-full">새 프로젝트 시작</Button>
-        </header>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
-          {blueprints.mine.length === 0 ? (
-            <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">아직 저장된 도면이 없습니다</div>
-          ) : (
-            blueprints.mine.map(bp => (
-              <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-            ))
-          )}
-        </div>
-
-        <div className="border-t border-gray-200 pt-10">
-          <h2 className="text-2xl font-black text-gray-900 mb-6">🌐 전체 전시관</h2>
-  
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {blueprints.others.length === 0 ? (
-              <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">다른 사용자의 도면이 없습니다</div>
-            ) : (
-              blueprints.others.map(bp => (
-                <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-              ))
-            )}
-          </div>
-        </div>
-      </main>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/DetailView.jsx
-// MODIFIED: 26-07-02 17:45 | LINES: 204
-```jsx
-// LINE 1 ~ 7: 에디터에 있던 CSV 문자열 파싱 알고리즘을 가져오고, 파일 용량 계산 함수가 3D text 용량도 지원하도록 수정합니다.
-import React, { useMemo } from 'react';
-import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
-import LiveDemoViewer from '../components/LiveDemoViewer';
-
-// 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
-function parseCsvToBlocks(csvText) {
-  if (!csvText) return [];
-  const lines = csvText.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
-
-  const headers = lines[0].split(',').map(h => h.trim());
-  const idx = {
-    x: headers.indexOf('PosX'),
-    y: headers.indexOf('PosY'),
-    z: headers.indexOf('PosZ'),
-    mat: headers.indexOf('Material'),
-  };
-
-  const MATERIAL_HEX = { Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50', Glass: '#3498db', Default: '#bdc3c7' };
-  const blocks = [];
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i]) continue;
-    const cols = lines[i].split(',');
-    const matName = idx.mat !== -1 ? cols[idx.mat] : 'Default';
-    blocks.push({
-      x: parseFloat(cols[idx.x]),
-      y: parseFloat(cols[idx.y]),
-      z: parseFloat(cols[idx.z]),
-      mat: matName,
-      color: MATERIAL_HEX[matName] || MATERIAL_HEX.Default,
-    });
-  }
-  return blocks;
-}
-
-export default function DetailView({
-  selectedBp,
-  setView,
-  comments,
-  commentInput,
-  setCommentInput,
-  likeCount,
-  hasLiked,
-  onLikeToggle,
-  onAddComment,
-  onEditBlueprint
-}) {
-  // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
-// LINE 205 ~ 207: grid_data가 없으면 csv_data 문자열 길이로 파일 용량을 대신 계산하고, 3D 블록 데이터를 메모이제이션합니다.
-  // 🌟 2D/3D 유연하게 대응하는 용량 계산 함수
-  const calculateFileSize = () => {
-    const targetData = selectedBp?.grid_data || selectedBp?.csv_data;
-    if (!targetData) return "0.00 KB";
-    const strLen = typeof targetData === 'string' ? targetData.length : JSON.stringify(targetData).length;
-    return (strLen / 1024).toFixed(2) + " KB";
-  };
-
-  // 🌟 현재 도면이 3D AI 기반 프로젝트인지 판별하고 블록 파싱 수행
-  const is3D = !!selectedBp?.csv_data;
-  const parsed3DBlocks = useMemo(() => {
-    return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
-  }, [selectedBp?.csv_data, is3D]);
-
-  const handlePngDownload = () => {
-    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
-    if (name === null) return;
-    exportToPNG(selectedBp.grid_data, name);
-  };
-
-
-
-  return (
-    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
-      {/* 상단 네비게이션 헤더 */}
-      <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shadow-sm sticky top-0 z-10">
-        <div className="flex items-center space-x-4">
-          <button 
-            onClick={() => setView('dashboard')} 
-            className="p-2 hover:bg-gray-100 rounded-xl text-gray-600 font-bold transition-all flex items-center space-x-1 text-sm"
-          >
-            <span>◀</span> <span>대시보드로 가기</span>
-          </button>
-          <div className="h-6 w-[1px] bg-gray-200" />
-          <h2 className="text-xl font-black text-gray-900">{selectedBp.name}</h2>
-        </div>
-        <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
-          설계도 뷰어 모드
-        </div>
-      </header>
-
-      {/* 대화형 메인 그리드 및 소셜 시스템 (2분할 구성) */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 flex flex-col md:flex-row gap-8">
-        
-        {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
-        <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
-          // LINE 211 ~ 216: 프로젝트 유형(is3D)에 맞게 제목을 매칭하고, LiveDemoViewer에 알맞은 prop 분배 및 하단 2D 격자 패널 조건부 노출을 처리합니다.
-          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
-            {is3D ? "3D AI 건축물 입체 프리뷰" : "구조물 설계도 평면도 미리보기"}
-          </div>
-          
-          {/* 🌟 3D 모드라면 parsed3DBlocks 데이터를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
-          <div className="w-full h-[350px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
-            <LiveDemoViewer 
-              grid={!is3D ? selectedBp?.grid_data : null} 
-              data={is3D ? parsed3DBlocks : null} 
-              mode="static" 
-              maxBlocks={10000} 
-            />
-          </div>
-
-          {/* 🌟 2D 설계도일 때만 하단의 미니 격자판(2D 레고 도면)을 렌더링하고, 3D 건축물일 때는 공간을 차지하지 않도록 숨깁니다. */}
-          {!is3D && selectedBp.grid_data && (
-            <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
-                {selectedBp.grid_data.map((row, rIdx) => row.map((cell, cIdx) => (
-                  <div
-                    key={`detail-cell-${rIdx}-${cIdx}`}
-                    className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
-                  />
-                )))}
-              </div>
-            </div>
-          )}
-          
-          <div className="w-full flex flex-col gap-3 mt-6">
-            <div className="grid grid-cols-2 gap-3">
-              <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
-                📸 PNG 이미지 다운로드 (mbs_)
-              </button>
-              <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
-                📊 CSV 데이터 내보내기
-              </button>
-            </div>
-            <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
-              📐 이 도면 편집기로 열기 (CAD 작업실 이동)
-            </button>
-          </div>
-        </div>
-
-        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 (기존 코드 완벽 유지) */}
-        <div className="w-full md:w-[400px] bg-white border border-gray-200 rounded-2xl p-6 flex flex-col shadow-sm justify-between">
-          <div>
-            <h3 className="text-base font-black text-gray-900 mb-4 pb-2 border-b border-gray-100">📋 설계 도면 정보</h3>
-            
-            <div className="bg-gray-50 p-4 rounded-xl text-xs space-y-3 text-gray-600 font-medium mb-5 border border-gray-100">
-              <div className="flex justify-between"><span>👤 설계자</span> <span className="text-blue-600 font-bold">{selectedBp.author}</span></div>
-              <div className="flex justify-between"><span>📅 제작일자</span> <span className="text-gray-900 font-bold">{new Date(selectedBp.created_at).toLocaleString()}</span></div>
-              <div className="flex justify-between"><span>💾 파일 용량</span> <span className="text-green-600 font-bold">{calculateFileSize()}</span></div>
-            </div>
-
-            <div className="mb-6">
-              <button 
-                onClick={onLikeToggle} 
-                className={`flex items-center space-x-2 px-5 py-2.5 rounded-full border text-xs font-bold transition-all shadow-sm ${
-                  hasLiked ? 'bg-red-50 border-red-200 text-red-500 shadow-red-100/30' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                }`}
-              >
-                <span>{hasLiked ? '❤️' : '🤍'}</span>
-                <span>좋아요 {likeCount}개</span>
-              </button>
-            </div>
-
-            <div className="border-t border-gray-100 pt-5">
-              <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">💬 피드백 및 댓글 ({comments.length})</h4>
-              <div className="space-y-3 max-h-[260px] overflow-y-auto pr-1">
-                {comments.length === 0 ? (
-                  <div className="text-center py-10 bg-gray-50 rounded-xl border border-dashed border-gray-200 text-xs text-gray-400 font-medium">
-                    등록된 피드백이 없습니다.<br/>첫 댓글을 달아 칭찬해보세요!
-                  </div>
-                ) : (
-                  comments.map(comment => (
-                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs border border-gray-100">
-                      <div className="flex justify-between font-bold text-gray-700 mb-1">
-                        <span>{comment.username || '익명'}</span>
-                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
-                      </div>
-                      <p className="text-gray-600 font-medium break-all whitespace-pre-wrap">{comment.content}</p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-
-          <div className="border-t border-gray-100 pt-4 mt-6 flex gap-2">
-            <input 
-              type="text" 
-              value={commentInput}
-              onChange={e => setCommentInput(e.target.value)}
-              placeholder="댓글을 남겨보세요..."
-              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 focus:bg-white transition-all font-medium"
-              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
-            />
-            <button onClick={onAddComment} className="px-5 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 shadow-sm transition-all whitespace-nowrap">
-              등록
-            </button>
-          </div>
-        </div>
-
-      </main>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/components/BlueprintCard.jsx
-// MODIFIED: 26-07-02 17:04 | LINES: 43
-```jsx
-import React from 'react';
-
-export default function BlueprintCard({ bp, onClick }) {
-  // 🌟 썸네일(사진) 존재 여부로 3D / 2D 프로젝트를 판별합니다.
-  const is3D = !!bp.thumbnail_url;
-
-  return (
-    <div 
-      onClick={onClick} 
-      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98 relative"
-    >
-      {/* 🌟 우측 상단 뱃지 추가 (3D vs 2D 직관적 구분) */}
-      <div className="absolute top-3 right-3 z-10 px-2 py-1 bg-white/90 backdrop-blur-sm rounded-lg shadow-sm text-[10px] font-black border border-gray-100 text-gray-700">
-        {is3D ? '🕋 3D AI 모델' : '📐 2D 정밀 도면'}
-      </div>
-
-      {/* 🌟 썸네일 영역 */}
-      {is3D ? (
-        // 3D 프로젝트: 찰칵 찍어둔 썸네일 이미지를 꽉 차게 보여줌
-        <div className="h-40 w-full bg-gray-900 overflow-hidden">
-          <img 
-            src={bp.thumbnail_url} 
-            alt={bp.name} 
-            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-          />
-        </div>
-      ) : (
-        // 2D 프로젝트: 기존처럼 아이콘 표시
-        <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">
-          🏗️
-        </div>
-      )}
-      
-      <div className="p-5">
-        <div className="font-bold text-lg text-gray-900">{bp.name}</div>
-        <div className="flex justify-between items-center mt-2">
-          <span className="text-sm text-blue-600 font-bold">{bp.author}</span>
-          <span className="text-xs text-gray-400">{new Date(bp.created_at).toLocaleDateString()}</span>
-        </div>
       </div>
     </div>
   );
