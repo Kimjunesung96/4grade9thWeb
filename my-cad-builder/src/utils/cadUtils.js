@@ -136,11 +136,16 @@ export const getNextPageBase = (stackedFloors) => {
 //       흡수시킨 뒤 비우기 때문에, 흡수 이후에는 stackedFloors 쪽 로직만 타면 된다.
 export const getCombinedFloors = (stackedFloors, csvPages, csvPageIndex, currentGrid) => {
   if (!csvPages || csvPages.length === 0) return stackedFloors;
-  return csvPages.map((pageGrid, i) => ({
-    pageBase: i * 5,
-    maxColorUsed: 5,
-    grid: i === csvPageIndex ? currentGrid : pageGrid,
-  }));
+  
+  return csvPages.map((pageGrid, i) => {
+    const gridToUse = i === csvPageIndex ? currentGrid : pageGrid;
+    
+    return {
+      pageBase: i * 5,
+      maxColorUsed: getMaxColorUsed(gridToUse), // ✅ 실제 쓰인 최고 층수로 동적 계산
+      grid: gridToUse,
+    };
+  });
 };
 
 export const exportStackedFloorsToCSV = (stackedFloors) => {

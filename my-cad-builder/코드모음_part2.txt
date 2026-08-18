@@ -1,10 +1,10 @@
 // FILE PATH: src/views/EditorView.jsx
-// MODIFIED: 26-08-16 21:21 | LINES: 709
+// MODIFIED: 26-08-17 23:14 | LINES: 767
 ```jsx
 import React, { useState, useRef, useMemo } from 'react';
 import * as THREE from 'three';
 import Button from '../components/ui/Button';
-import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
+import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, getCombinedFloors, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
 
 // 🌟 기입 완료된 모든 페이지(stackedFloors) + 현재 그리는 중인 페이지(grid)를 합쳐서
@@ -30,6 +30,37 @@ function buildAllBlocks(stackedFloors, currentGrid, currentPageBase) {
   };
   stackedFloors.forEach(({ pageBase, grid }) => pushPage(pageBase, grid));
   pushPage(currentPageBase, currentGrid); // 아직 기입 안 한 현재 페이지도 미리보기에 포함
+  return blocks;
+}
+
+// 🌟 CSV로 불러온 모든 페이지(csvPages)를 각자 올바른 절대 높이(pageIndex*5)에
+//    동시에 쌓아서 3D 미리보기용 블록 배열로 변환.
+//    현재 보고 있는/수정 중인 페이지(currentPageIndex)는 csvPages의 스냅샷이 아니라
+//    화면에 있는 최신 grid를 사용해서, 페이지를 넘기기 전에 수정한 내용도 바로 반영되게 한다.
+function buildCsvPagesAllBlocks(csvPages, currentGrid, currentPageIndex) {
+  const blocks = [];
+  const pushPage = (pageBase, pageGrid) => {
+    pageGrid.forEach((row, rIdx) => {
+      row.forEach((cell, cIdx) => {
+        if (cell < 1 || cell > 5) return;
+        for (let layer = 1; layer <= cell; layer++) {
+          const n = pageBase + layer;
+          blocks.push({
+            x: cIdx * 3.0,
+            y: 1.5 + 3 * n,
+            z: rIdx * 3.0,
+            color: FLOOR_COLORS[cell].hex,
+            mat: 'Concrete',
+          });
+        }
+      });
+    });
+  };
+  csvPages.forEach((pageGrid, i) => {
+    const pageBase = i * 5; // 페이지당 5층 고정폭이므로 pageIndex*5가 절대 시작 높이
+    const gridToUse = i === currentPageIndex ? currentGrid : pageGrid;
+    pushPage(pageBase, gridToUse);
+  });
   return blocks;
 }
 
@@ -161,11 +192,26 @@ export default function EditorView({
   // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
   const [editorTab, setEditorTab] = useState('grid');
 
+  // ===================== 🌟 CSV → 정밀 격자 불러오기 (신규) =====================
+  // 웹에서 받은 3D CSV(PosX/PosY/PosZ)를 5층 단위 페이지로 쪼개서
+  // 정밀 격자(grid)에 순차적으로 표시 → 필요하면 수정 → 페이지 전체 PNG로 내보내기
+  // 🌟 allStackedBlocks가 이 상태를 참조해야 해서 (기존엔 아래쪽에 선언되어 있었음) 위로 끌어올림
+  const [csvPages, setCsvPages] = useState([]); // [grid1, grid2, ...] 5층씩 쪼갠 페이지들
+  const [csvPageIndex, setCsvPageIndex] = useState(0);
+  const [csvBaseName, setCsvBaseName] = useState('structure');
+  const csvGridUploadRef = useRef(null);
+  // ===================== CSV → 정밀 격자 불러오기 상태 끝 =====================
+
   // 🌟 기입 완료된 페이지 전부 + 지금 그리는 중인 페이지까지 합친 3D 미리보기용 블록
-  const allStackedBlocks = useMemo(
-    () => buildAllBlocks(stackedFloors, grid, getNextPageBase(stackedFloors)),
-    [stackedFloors, grid]
-  );
+  //    CSV를 불러온 상태(csvPages 존재)라면 stackedFloors 대신 csvPages 전부를
+  //    각자 올바른 절대 높이(pageIndex*5)에 동시에 쌓아서 이어 보이게 한다.
+  //    (수동 그리기 모드일 땐 기존 stackedFloors 기반 로직 그대로 사용)
+  const allStackedBlocks = useMemo(() => {
+    if (csvPages.length > 0) {
+      return buildCsvPagesAllBlocks(csvPages, grid, csvPageIndex);
+    }
+    return buildAllBlocks(stackedFloors, grid, getNextPageBase(stackedFloors));
+  }, [stackedFloors, grid, csvPages, csvPageIndex]);
 
   // AI 사진 추출 결과 → 3D 뷰어에 띄울 데이터 (원본, 회전 미적용)
   const [extracted3DData, setExtracted3DData] = useState([]);
@@ -192,13 +238,8 @@ export default function EditorView({
   const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
   const csvUploadRef = useRef(null);
 
-  // ===================== 🌟 CSV → 정밀 격자 불러오기 (신규) =====================
-  // 웹에서 받은 3D CSV(PosX/PosY/PosZ)를 5층 단위 페이지로 쪼개서
-  // 정밀 격자(grid)에 순차적으로 표시 → 필요하면 수정 → 페이지 전체 PNG로 내보내기
-  const [csvPages, setCsvPages] = useState([]); // [grid1, grid2, ...] 5층씩 쪼갠 페이지들
-  const [csvPageIndex, setCsvPageIndex] = useState(0);
-  const [csvBaseName, setCsvBaseName] = useState('structure');
-  const csvGridUploadRef = useRef(null);
+  // (csvPages / csvPageIndex / csvBaseName / csvGridUploadRef 는 allStackedBlocks가
+  //  참조해야 해서 컴포넌트 상단으로 이동시켰음 — 여기서 중복 선언하지 않음)
 
   const handleCsvGridUpload = (e) => {
     const file = e.target.files[0];
@@ -435,7 +476,12 @@ export default function EditorView({
         <div className="flex space-x-2">
           <Button variant="primary" onClick={handleCloudSave}>🌐 클라우드 저장</Button>
           <Button variant="dark" onClick={handlePngSave}>PNG 저장 (mbs_)</Button>
-          <Button variant="secondary" onClick={() => exportStackedFloorsToCSV(stackedFloors)}>📦 전체 CSV 내보내기 ({stackedFloors.length}장)</Button>
+          {/* 🌟 CSV로 불러온 뒤 아직 "기입"을 안 누른 페이지(csvPages)가 있어도 내보내기에 포함되도록
+                 getCombinedFloors로 stackedFloors + csvPages(현재 편집 중인 페이지는 최신 grid)를 합쳐서 내보낸다.
+                 (기존엔 stackedFloors만 내보내서 CSV로 불러온 내용이 통째로 빠지는 버그가 있었음) */}
+          <Button variant="secondary" onClick={() => exportStackedFloorsToCSV(getCombinedFloors(stackedFloors, csvPages, csvPageIndex, grid))}>
+            📦 전체 CSV 내보내기 ({(csvPages.length > 0 ? csvPages.length : stackedFloors.length)}장)
+          </Button>
         </div>
       </header>
 
@@ -491,7 +537,19 @@ export default function EditorView({
                   )}
                   <Button variant="secondary" onClick={undo}>↩ 되돌리기</Button>
                   <Button variant="secondary" onClick={goBackToPreviousFloor} disabled={stackedFloors.length === 0}>⏮ 이전 페이지로</Button>
-                  <Button variant="primary" onClick={commitCurrentFloor}>✅ 이 페이지 기입하고 다음 장으로</Button>
+                  {/* 🌟 CSV를 불러온 상태(csvPages 有)에서 누르면, App의 commitCurrentFloor가
+                         로드된 모든 CSV 페이지를 stackedFloors로 흡수하도록 pages/pageIndex를 같이 넘긴다.
+                         흡수가 끝나면 이 화면(csvPages)은 더 이상 필요 없으니 비워서 이후엔
+                         기존 stackedFloors 기반 페이지 넘기기로만 이어지게 한다. */}
+                  <Button variant="primary" onClick={() => {
+                    if (csvPages.length > 0) {
+                      commitCurrentFloor({ pages: csvPages, pageIndex: csvPageIndex });
+                      setCsvPages([]);
+                      setCsvPageIndex(0);
+                    } else {
+                      commitCurrentFloor();
+                    }
+                  }}>✅ 이 페이지 기입하고 다음 장으로</Button>
                   <Button variant="dark" onClick={resetAllFloors} className="!bg-red-600 hover:!bg-red-700">🗑 전체 초기화</Button>
                   <label className="cursor-pointer px-3 py-2 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
                     📂 PNG 불러오기

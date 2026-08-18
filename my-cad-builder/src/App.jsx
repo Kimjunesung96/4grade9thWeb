@@ -123,18 +123,24 @@ export default function App() {
   //    이제 csvAbsorb가 있으면: 로드된 모든 CSV 페이지(현재 편집 중인 페이지는 화면의 최신 grid로
   //    교체)를 먼저 stackedFloors 형식으로 "흡수"시켜서 올바른 높이(pageIndex*5)에 확정시키고,
   //    그 위에 이어그릴 새 빈 캔버스를 연다. 이후부터는 기존 stackedFloors 로직이 정상 동작한다.
-  const commitCurrentFloor = (csvAbsorb) => {
-    if (csvAbsorb && csvAbsorb.pages && csvAbsorb.pages.length > 0) {
-      const absorbed = csvAbsorb.pages.map((pageGrid, i) => ({
+const commitCurrentFloor = (csvAbsorb) => {
+  if (csvAbsorb && csvAbsorb.pages && csvAbsorb.pages.length > 0) {
+    const absorbed = csvAbsorb.pages.map((pageGrid, i) => {
+      // 현재 페이지가 편집 중인 페이지면 화면의 grid를, 아니면 기존 pageGrid를 사용
+      const gridToUse = i === csvAbsorb.pageIndex ? grid : pageGrid;
+      
+      return {
         pageBase: i * 5,
-        maxColorUsed: 5,
-        grid: i === csvAbsorb.pageIndex ? grid : pageGrid,
-      }));
-      setStackedFloors(prev => [...prev, ...absorbed]);
-      setGrid(Array(50).fill().map(() => Array(50).fill(0)));
-      setHistory([]);
-      return;
-    }
+        maxColorUsed: getMaxColorUsed(gridToUse), // ✅ 실제 쓰인 최고 층수로 동적 계산
+        grid: gridToUse,
+      };
+    });
+    setStackedFloors(prev => [...prev, ...absorbed]);
+    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+    setHistory([]);
+    return;
+  }
+  // ... 하위 코드 동일
     const maxColorUsed = getMaxColorUsed(grid);
     const pageBase = getNextPageBase(stackedFloors);
     setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);
