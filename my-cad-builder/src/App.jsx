@@ -1,10 +1,13 @@
+// FILE PATH: src/App.jsx
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
 import { hashPw, applyWallBorder, floodFill, getMaxColorUsed, getNextPageBase, exportStackedFloorsToCSV } from './utils/cadUtils';
+import Button from './components/ui/Button'; // 🌟 팝업용 버튼 추가
 import AuthView from './views/AuthView';
 import DashboardView from './views/DashboardView';
 import EditorView from './views/EditorView';
 import DetailView from './views/DetailView';
+import ExploreView from './views/ExploreView'; 
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -13,19 +16,38 @@ export default function App() {
   const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
   const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
   const [mode, setMode] = useState('wall_rect');
-  const [paintColor, setPaintColor] = useState(1); // 지금 그리는 페이지 안에서 쓸 색(1~5, = 상대 높이)
-  const [stackedFloors, setStackedFloors] = useState([]); // 기입 완료된 페이지들: [{ pageBase, maxColorUsed, grid }]
+  const [paintColor, setPaintColor] = useState(1); 
+  const [stackedFloors, setStackedFloors] = useState([]); 
   const [isDrawing, setIsDrawing] = useState(false);
   const [history, setHistory] = useState([]);
   const [startPos, setStartPos] = useState(null);
   const [currentPos, setCurrentPos] = useState(null);
   const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
 
-  // 소셜 상태 데이터 전역 상태 관리 저장소
   const [selectedBp, setSelectedBp] = useState(null);
   const [commentInput, setCommentInput] = useState('');
-  const [likesData, setLikesData] = useState({}); // { 도면ID: [유저ID리스트] }
-  const [commentsData, setCommentsData] = useState({}); // { 도면ID: [댓글배열] }
+  const [likesData, setLikesData] = useState({}); 
+  const [commentsData, setCommentsData] = useState({}); 
+
+  // 🌟 업로드 팝업 상태 관리
+  const [uploadModal, setUploadModal] = useState({ isOpen: false, payload: null, title: '새 프로젝트', type: 'blueprint' });
+
+  // 브라우저 뒤로가기(popstate) 감지 센서
+  useEffect(() => {
+    const handlePopState = (event) => {
+      if (event.state && event.state.view) {
+        setView(event.state.view);
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  // setView를 감싸서 가짜 URL 기록(history)을 남기는 전용 함수
+  const handleSetView = (newView) => {
+    window.history.pushState({ view: newView }, '', `?view=${newView}`);
+    setView(newView);
+  };
 
   const handleSignUp = async () => {
     const { error } = await supabase.from('users').insert([{ username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email }]);
@@ -35,8 +57,12 @@ export default function App() {
 
   const handleLogin = async () => {
     const { data } = await supabase.from('users').select('*').eq('username', authForm.id).eq('password_hash', hashPw(authForm.pw)).single();
-    if (data) { setUser(data); setView('dashboard'); }
-    else alert("아이디 혹은 비밀번호가 틀립니다.");
+    if (data) { 
+      setUser(data); 
+      handleSetView('dashboard'); 
+    } else {
+      alert("아이디 혹은 비밀번호가 틀립니다.");
+    }
   };
 
   const fetchBlueprints = async () => {
@@ -47,22 +73,38 @@ export default function App() {
 
   useEffect(() => { if (view === 'dashboard' && user) fetchBlueprints(); }, [view, user]);
 
-  // 매개변수 payload를 받아서 유연하게 DB에 넣도록 수정
-  const uploadToShowcase = async (payload) => {
+  // 🌟 에디터에서 저장 버튼 누를 때 팝업 띄우기
+  const triggerUpload = (payload) => {
     if (!user) return;
-    const title = prompt("작품 이름을 지어주세요!", "새 프로젝트");
-    if (!title) return;
+    
+    // 데이터 유무에 따라 기본 타입 스마트 추천
+    let defaultType = 'blueprint';
+    if (payload.thumbnail_url) defaultType = '3dmodel';
+    else if (payload.csv_data) defaultType = 'structure';
+
+    setUploadModal({ isOpen: true, payload, title: '', type: defaultType });
+  };
+
+  // 🌟 팝업에서 최종 '저장하기' 누를 때 DB 인서트
+  const executeUpload = async () => {
+    if (!uploadModal.title.trim()) {
+      alert("작품 이름을 입력해주세요!");
+      return;
+    }
 
     const { error } = await supabase.from('blueprints').insert([{ 
-      name: title, 
+      name: uploadModal.title, 
       user_id: user.id, 
       author: user.username,
-      ...payload // grid_data, csv_data, thumbnail_url 등이 알아서 들어감
+      project_type: uploadModal.type, // DB에 명시적 타입 저장!
+      ...uploadModal.payload 
     }]);
 
     if (!error) { 
       alert("업로드 완료!"); 
-      setView('dashboard'); 
+      setUploadModal({ isOpen: false, payload: null, title: '', type: 'blueprint' });
+      fetchBlueprints(); // 업로드 후 최신화
+      handleSetView('dashboard'); 
     } else {
       alert("에러: " + error.message);
     }
@@ -73,7 +115,6 @@ export default function App() {
   setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
 
   const handleMouseDown = (r, c) => {
-    // 바닥 채우기(클릭) 모드는 드래그 개념이 없으므로 즉시 flood fill 실행
     if (mode === 'floor_fill') {
       saveHistory();
       setGrid(prevGrid => floodFill(prevGrid, r, c, paintColor));
@@ -95,15 +136,12 @@ export default function App() {
       const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
 
       if (mode === 'wall_rect') {
-        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 색 값으로)
         newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, paintColor, 2);
       } else if (mode === 'floor_rect') {
-        // 바닥(드래그): 영역 전체를 채움 (선택된 색 값으로)
         for (let r = startR; r <= endR; r++) {
           for (let c = startC; c <= endC; c++) { newGrid[r][c] = paintColor; }
         }
       } else if (mode === 'rect_eraser') {
-        // 지우개: 영역 전체를 비움
         for (let r = startR; r <= endR; r++) {
           for (let c = startC; c <= endC; c++) { newGrid[r][c] = 0; }
         }
@@ -113,34 +151,18 @@ export default function App() {
     setIsDrawing(false); setStartPos(null); setCurrentPos(null);
   };
 
-  // 현재 페이지(grid)를 "기입"해서 stackedFloors에 누적하고, 다음 페이지를 위해 캔버스 초기화
-  //
-  // 🌟 csvAbsorb: CSV를 불러온 상태(csvPages)에서 이 버튼을 눌렀을 때 EditorView가 넘겨주는
-  //    { pages, pageIndex } 값. 기존엔 이 값이 없어서 CSV로 불러온 내용은 완전히 무시하고
-  //    stackedFloors가 빈 상태 기준(pageBase=0)으로 새로 그린 페이지만 쌓아버렸음 → 그 결과
-  //    "CSV 불러오기 → 이어서 그리기 → 내보내기"를 하면 CSV 부분이 통째로 사라지고 새로 그린
-  //    페이지만 남는 버그가 있었음.
-  //    이제 csvAbsorb가 있으면: 로드된 모든 CSV 페이지(현재 편집 중인 페이지는 화면의 최신 grid로
-  //    교체)를 먼저 stackedFloors 형식으로 "흡수"시켜서 올바른 높이(pageIndex*5)에 확정시키고,
-  //    그 위에 이어그릴 새 빈 캔버스를 연다. 이후부터는 기존 stackedFloors 로직이 정상 동작한다.
-const commitCurrentFloor = (csvAbsorb) => {
-  if (csvAbsorb && csvAbsorb.pages && csvAbsorb.pages.length > 0) {
-    const absorbed = csvAbsorb.pages.map((pageGrid, i) => {
-      // 현재 페이지가 편집 중인 페이지면 화면의 grid를, 아니면 기존 pageGrid를 사용
-      const gridToUse = i === csvAbsorb.pageIndex ? grid : pageGrid;
-      
-      return {
+  const commitCurrentFloor = (csvAbsorb) => {
+    if (csvAbsorb && csvAbsorb.pages && csvAbsorb.pages.length > 0) {
+      const absorbed = csvAbsorb.pages.map((pageGrid, i) => ({
         pageBase: i * 5,
-        maxColorUsed: getMaxColorUsed(gridToUse), // ✅ 실제 쓰인 최고 층수로 동적 계산
-        grid: gridToUse,
-      };
-    });
-    setStackedFloors(prev => [...prev, ...absorbed]);
-    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
-    setHistory([]);
-    return;
-  }
-  // ... 하위 코드 동일
+        maxColorUsed: 5,
+        grid: i === csvAbsorb.pageIndex ? grid : pageGrid,
+      }));
+      setStackedFloors(prev => [...prev, ...absorbed]);
+      setGrid(Array(50).fill().map(() => Array(50).fill(0)));
+      setHistory([]);
+      return;
+    }
     const maxColorUsed = getMaxColorUsed(grid);
     const pageBase = getNextPageBase(stackedFloors);
     setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);
@@ -148,16 +170,14 @@ const commitCurrentFloor = (csvAbsorb) => {
     setHistory([]);
   };
 
-  // 마지막으로 기입한 페이지를 되돌려서 다시 편집 가능하게
   const goBackToPreviousFloor = () => {
     if (stackedFloors.length === 0) return;
     const last = stackedFloors[stackedFloors.length - 1];
-    setGrid(last.grid); // 마지막 페이지 grid를 다시 캔버스로 복원
-    setStackedFloors(prev => prev.slice(0, -1)); // 스택에서 제거
+    setGrid(last.grid); 
+    setStackedFloors(prev => prev.slice(0, -1)); 
     setHistory([]);
   };
 
-  // 전체 페이지 + 현재 캔버스 다 날리고 처음 상태로
   const resetAllFloors = () => {
     if (!window.confirm("전체 페이지를 초기화하시겠습니까? 되돌릴 수 없습니다.")) return;
     setStackedFloors([]);
@@ -170,7 +190,6 @@ const commitCurrentFloor = (csvAbsorb) => {
     return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
   };
 
-  // 1인 1회 토글형 좋아요 알고리즘 구현
   const handleLikeToggle = (bpId) => {
     if (!user) return;
     const currentLikedUsers = likesData[bpId] || [];
@@ -181,7 +200,6 @@ const commitCurrentFloor = (csvAbsorb) => {
     }
   };
 
-  // 고유 도면 아이디 기반 독립형 댓글 작성 처리
   const handleAddComment = (bpId) => {
     if (!commentInput.trim() || !user) return;
     const newComment = {
@@ -197,18 +215,72 @@ const commitCurrentFloor = (csvAbsorb) => {
 
   return (
     <>
+      {/* 🌟 커스텀 업로드 모달 팝업 */}
+      {uploadModal.isOpen && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-6 rounded-2xl shadow-2xl w-full max-w-sm flex flex-col gap-5 border border-gray-100">
+            <h3 className="text-xl font-black text-gray-900 border-b pb-2">🌐 클라우드 업로드</h3>
+            
+            <div>
+              <label className="text-xs font-bold text-gray-500 mb-1.5 block">작품 제목을 입력하세요</label>
+              <input 
+                type="text" 
+                value={uploadModal.title}
+                onChange={e => setUploadModal({...uploadModal, title: e.target.value})}
+                placeholder="예: 내 첫 번째 대저택"
+                className="w-full bg-gray-50 border border-gray-200 p-3 rounded-xl text-sm outline-none focus:border-blue-500 transition-all font-medium"
+              />
+            </div>
+
+            <div>
+              <label className="text-xs font-bold text-gray-500 mb-2 block">작품 유형 (자동 분석됨)</label>
+              <div className="flex flex-col gap-2.5 bg-gray-50 p-3 rounded-xl border border-gray-100">
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700 cursor-pointer">
+                  <input type="radio" name="projectType" value="blueprint" checked={uploadModal.type === 'blueprint'} onChange={e => setUploadModal({...uploadModal, type: e.target.value})} className="w-4 h-4 accent-blue-600"/>
+                  📝 1층 설계도
+                </label>
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700 cursor-pointer">
+                  <input type="radio" name="projectType" value="structure" checked={uploadModal.type === 'structure'} onChange={e => setUploadModal({...uploadModal, type: e.target.value})} className="w-4 h-4 accent-blue-600"/>
+                  🏗️ 다층 구조물
+                </label>
+                <label className="flex items-center gap-2 text-sm font-bold text-gray-700 cursor-pointer">
+                  <input type="radio" name="projectType" value="3dmodel" checked={uploadModal.type === '3dmodel'} onChange={e => setUploadModal({...uploadModal, type: e.target.value})} className="w-4 h-4 accent-blue-600"/>
+                  🕋 AI 3D 모델
+                </label>
+              </div>
+            </div>
+
+            <div className="flex gap-3 mt-2">
+              <Button variant="secondary" className="flex-1 py-3" onClick={() => setUploadModal({ isOpen: false, payload: null, title: '', type: 'blueprint' })}>취소</Button>
+              <Button variant="primary" className="flex-1 py-3" onClick={executeUpload}>🚀 저장하기</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
       
       {view === 'dashboard' && (
         <DashboardView 
           user={user} 
           blueprints={blueprints} 
-          setView={setView} 
+          setView={handleSetView} 
           setUser={setUser} 
           onSelectBlueprint={(bp) => {
             setSelectedBp(bp);
-            setView('detail'); // 💡 팝업 모달 대신 상세페이지('detail') 뷰로 화면 라우팅 전환
+            handleSetView('detail'); 
           }} 
+        />
+      )}
+
+      {view === 'explore' && (
+        <ExploreView
+          blueprints={blueprints}
+          setView={handleSetView} 
+          onSelectBlueprint={(bp) => {
+            setSelectedBp(bp);
+            handleSetView('detail'); 
+          }}
         />
       )}
       
@@ -224,10 +296,10 @@ const commitCurrentFloor = (csvAbsorb) => {
           commitCurrentFloor={commitCurrentFloor}
           goBackToPreviousFloor={goBackToPreviousFloor}
           resetAllFloors={resetAllFloors}
-          setView={setView}
+          setView={handleSetView} 
           undo={undo}
           saveHistory={saveHistory}
-          uploadToShowcase={uploadToShowcase}
+          uploadToShowcase={triggerUpload} // 🌟 기존 함수 대신 팝업 트리거 함수 연결
           isInsidePreview={isInsidePreview}
           handleMouseDown={handleMouseDown}
           handleMouseEnter={handleMouseEnter}
@@ -238,7 +310,7 @@ const commitCurrentFloor = (csvAbsorb) => {
       {view === 'detail' && selectedBp && (
         <DetailView
           selectedBp={selectedBp}
-          setView={setView}
+          setView={handleSetView} 
           comments={commentsData[selectedBp.id] || []}
           commentInput={commentInput}
           setCommentInput={setCommentInput}
@@ -249,7 +321,7 @@ const commitCurrentFloor = (csvAbsorb) => {
           onEditBlueprint={() => {
             setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
             setHistory([]);
-            setView('editor');
+            handleSetView('editor'); 
           }}
         />
       )}

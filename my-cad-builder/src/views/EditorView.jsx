@@ -291,6 +291,7 @@ export default function EditorView({
   // ===================== CSV → 정밀 격자 불러오기 끝 =====================
 
   // 🌟 현재 회전 상태가 적용된 블록 (미리보기 + "편집본 다운로드"에 사용)
+// 🌟 현재 회전 상태가 적용된 블록 (미리보기 + "편집본 다운로드"에 사용)
   const rotatedBlocks = useMemo(() => {
     if (extracted3DData.length === 0) return [];
     if (rotationQuat === IDENTITY_QUAT) return extracted3DData;
@@ -298,20 +299,35 @@ export default function EditorView({
   }, [extracted3DData, rotationQuat]);
 
   // 🎯 묶여있던 handleCloudSave 함수를 useMemo 바깥으로 독립시켰습니다.
+ // 🎯 묶여있던 handleCloudSave 함수를 useMemo 바깥으로 독립시켰습니다.
   const handleCloudSave = () => {
+    // 📸 공통: 화면에 있는 3D 캔버스를 찾아 썸네일(Base64) 추출
+    const canvas = document.querySelector('canvas');
+    const thumbnailBase64 = canvas ? canvas.toDataURL('image/png') : null;
+
     if (editorTab === 'grid') {
-      // 1. 2D 모드일 때 저장
-      uploadToShowcase({ grid_data: grid });
+      // ✅ 1. 2D 모드일 때 저장 (수정됨)
+      if (allStackedBlocks.length === 0) {
+        alert("저장할 데이터가 없습니다.");
+        return;
+      }
+      
+      // 지금까지 작업/불러온 모든 층(stackedFloors + csvPages + 현재 grid)을 3D CSV 텍스트로 변환
+      const csvText = blocksToCsvText(allStackedBlocks, []);
+      
+      // DB에 1층 단면도(grid_data)와 전체 층 3D 모델(csv_data)을 모두 보냄
+      uploadToShowcase({ 
+        grid_data: grid, 
+        csv_data: csvText, 
+        thumbnail_url: thumbnailBase64 
+      });
+      
     } else {
-      // 2. 3D 모드일 때 저장
+      // 2. 3D 사진 추출 모드일 때 저장 (기존과 동일)
       if (rotatedBlocks.length === 0) {
         alert("추출된 3D 데이터가 없습니다.");
         return;
       }
-
-      // 화면에 있는 3D 캔버스를 찾아 사진(Base64)으로 찰칵!
-      const canvas = document.querySelector('canvas');
-      const thumbnailBase64 = canvas ? canvas.toDataURL('image/png') : null;
 
       // 3D 데이터를 CSV 텍스트로 직렬화
       const csvText = blocksToCsvText(rotatedBlocks, csvHeaders);
