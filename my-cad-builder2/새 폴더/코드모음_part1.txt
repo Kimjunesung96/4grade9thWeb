@@ -1,0 +1,919 @@
+// FILE PATH: src/backend/main.py
+// MODIFIED: 26-06-30 11:12 | LINES: 202
+```py
+import io
+import pillow_avif  # noqa: F401  (AVIF 포맷 지원 — PIL 기본 탑재 아님, import만 해도 등록됨)
+import requests
+import trimesh
+import numpy as np
+import uvicorn
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from PIL import Image
+
+app = FastAPI()
+
+# 리액트(Vite) 프론트엔드에서 API를 호출할 수 있도록 CORS 허용 세팅
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 실제 배포 시에는 "http://localhost:5173" 등으로 제한
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ====================================================================
+# 🌟 콜랍에서 띄운 ngrok 주소. 콜랍 노트북을 다시 켤 때마다 바뀌니
+#    매번 여기를 갱신해줘야 합니다!
+# ====================================================================
+COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
+
+MAX_BLOCKS = 10000          # 유니티 렌더링 한도 (블록 렌더링 X / 10,000 MAX)
+GRID_PITCH = 3.0            # 기존 스케일 약속: 3유닛 = 15cm
+UNITS_PER_METER = 20.0      # 1m = 20유닛 (3유닛=15cm 이므로 1m = 6.667*3유닛 -> 20유닛)
+
+
+def format_id(val):
+    """
+    JS의 formatID 완벽 재현!
+    소수점을 10배수로 날리고 015, -105 형태로 포맷팅합니다.
+    """
+    abs_val = round(abs(val))
+    sign = "-" if val < 0 else "0"
+    return f"{sign}{str(abs_val).zfill(3)}"
+
+
+def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
+    """
+    콜랍에 올려둔 TripoSR API에 사진을 보내고, 생성된 3D 메시(.glb)를 받아옵니다.
+    (정면 사진 한 장 → AI가 뒷면/옆면까지 추론해서 만든 입체 메시)
+    """
+    resp = requests.post(
+        COLAB_API_URL,
+        files={"image": ("input.png", img_bytes, "image/png")},
+        timeout=180,
+    )
+    resp.raise_for_status()
+
+    mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
+    # GLB는 여러 메시가 묶인 Scene으로 로드될 수 있어서 하나로 합쳐줍니다
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(mesh.dump())
+    return mesh
+
+
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
+    """
+    🌟 건프라 축소 비율 방식: 건물 표면적에 맞춰 블록 크기(pitch)를 역산해서,
+    랜덤 솎아내기 없이 max_blocks 예산 안에서 표면 전체를 빈틈없이 덮습니다.
+    """
+    # 0. 🌟 TripoSR 출력 메시는 좌표축이 누운 상태로 나오는 경향이 있어 세로로 세움
+    #    (X축 기준 +90도 회전 — TripoSR 커뮤니티에서 알려진 표준 보정값)
+    rotation_matrix = trimesh.transformations.rotation_matrix(
+        angle=np.radians(90), direction=[1, 0, 0], point=mesh.centroid
+    )
+    mesh.apply_transform(rotation_matrix)
+
+    # 1. AI가 만든 메시는 임의 크기라, 사용자가 입력한 실제 건물 높이에 맞춰 스케일 보정
+    mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
+    if mesh_height_raw <= 0:
+        raise ValueError("메시 높이를 계산할 수 없습니다 (생성된 메시가 비정상일 수 있음)")
+
+    target_height_units = real_height_m * UNITS_PER_METER
+    mesh.apply_scale(target_height_units / mesh_height_raw)
+    mesh.apply_translation([0, -mesh.bounds[0][1], 0])  # 바닥을 Y=0(유니티 그라운드)에 맞춤
+
+    surface_area = mesh.area
+    pitch = max(GRID_PITCH, round(((surface_area / max_blocks) ** 0.5) / GRID_PITCH) * GRID_PITCH)
+
+
+    # 2. 안전장치: 예산을 넘기면 랜덤 제거 대신 pitch를 키워 재시도 (균일 압축 유지, 구멍 방지)
+    raw_blocks = []
+    for attempt in range(5):
+        estimated_cells = surface_area / (pitch ** 2)
+        sample_count = max(int(estimated_cells * 6), 5000)
+        points, face_indices = trimesh.sample.sample_surface(mesh, count=sample_count)
+        normals = mesh.face_normals[face_indices]
+
+        raw_blocks = []
+        seen_ids = set()
+        for (x, y, z), normal in zip(points, normals):
+            grid_x = round((x - 1.5) / pitch)
+            grid_y = round((y - 1.5) / pitch)
+            grid_z = round((z - 1.5) / pitch)
+
+            # 🌟 칸 번호(grid_x/y/z)는 그대로 유지, 저장 좌표는 항상 GRID_PITCH(3)로 압축
+            #    → 점 개수/모양은 안 바뀌고, 점들 사이 실제 거리만 좁아짐 (유니티 코드 안 건드려도 됨)
+            pos_x = grid_x * GRID_PITCH + 1.5
+            pos_y = grid_y * GRID_PITCH + 1.5
+            pos_z = grid_z * GRID_PITCH + 1.5
+
+            id_x = format_id(pos_x * 10)
+            id_z = format_id(pos_z * 10)
+            id_y = format_id(pos_y * 10)
+            block_id = f"{id_x}_{id_z}_{id_y}"
+            if block_id in seen_ids:
+                continue
+            seen_ids.add(block_id)
+
+            # 표면 법선의 Y성분으로 바닥/지붕(Floor) vs 벽(Wall) 자동 판정
+            block_type = "Floor" if abs(normal[1]) > 0.7 else "Wall"
+
+            raw_blocks.append({
+                "BlockID": block_id,
+                "PosX": round(pos_x, 2),
+                "PosY": round(pos_y, 2),
+                "PosZ": round(pos_z, 2),
+                "Stress": 0.00,
+                "RiskLevel": "Safe",
+                "Prescription": "N",
+                "Material": "Default",
+                "Tensile": 400.0,
+                "Compressive": 400.0,
+                "Tool": "Existing",
+                "Type": block_type,
+            })
+
+        print(f"📐 시도 {attempt + 1}: pitch={pitch} → {len(raw_blocks)}개 블록")
+        if len(raw_blocks) <= max_blocks:
+            break
+        pitch += GRID_PITCH  # 넘쳤으면 한 칸 더 키워서 재시도
+
+    return raw_blocks
+
+
+@app.post("/api/extract-3d-csv")
+async def extract_3d_csv(
+    file: UploadFile = File(...),
+    startX: float = Form(...),
+    startY: float = Form(...),
+    endX: float = Form(...),
+    endY: float = Form(...),
+    realHeightMeters: float = Form(...),
+):
+    print(f"📥 사진 데이터 및 박스 좌표 수신: ({startX}, {startY}) ~ ({endX}, {endY}) | 실제 높이: {realHeightMeters}m")
+
+    # 1. 이미지 로드 (박스 영역만 잘라서 콜랍으로 보내면 결과가 더 정확함)
+    img_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이미지를 읽을 수 없습니다 (지원하지 않는 포맷일 수 있음): {e}",
+        )
+
+    sx, sy = max(0, int(startX)), max(0, int(startY))
+    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
+    cropped = image.crop((sx, sy, ex, ey))
+
+    crop_bytes_io = io.BytesIO()
+    cropped.save(crop_bytes_io, format="PNG")
+    crop_bytes = crop_bytes_io.getvalue()
+
+    # 2. 콜랍 TripoSR 모델로 단일 사진 → 3D 메시 생성 (뒷면/옆면까지 AI가 추론)
+    print("🤖 콜랍 AI 모델에 메시 생성 요청 중...")
+    mesh = get_mesh_from_colab(crop_bytes)
+    print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
+
+    # 3. 메시를 실제 크기로 스케일 보정 후, 표면(겉면)만 빈틈없이 블록화
+    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
+
+    # 4. Pandas 데이터프레임화
+    df = pd.DataFrame(raw_blocks)
+    df = df.drop_duplicates(subset=["BlockID"])
+    df = df.sort_values(by=["PosZ", "PosX", "PosY"])
+
+    print(f"✅ 총 {len(df)}개의 3D 빌딩 블록 엑셀 변환 완료! (속은 비어있는 표면 전용 구조)")
+
+    # 5. CSV 스트리밍 반환
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    output.seek(0)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ai_extracted_3d.csv"},
+    )
+
+
+if __name__ == "__main__":
+    print("🚀 CAD AI 백엔드 서버를 시작합니다. (포트 8000)")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+// FILE PATH: src/components/LiveDemoViewer.jsx
+// MODIFIED: 26-06-29 00:53 | LINES: 103
+```jsx
+import React, { useMemo } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls, Stage } from '@react-three/drei';
+import { FLOOR_COLORS } from '../utils/cadUtils'; // 🌟 뷰어 안에서 색상 계산
+
+const MATERIAL_COLORS = {
+  Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50',
+  Glass: '#3498db', Default: '#bdc3c7'
+};
+
+function VoxelBlocks({ blocks }) {
+  return (
+    <group>
+      {blocks.map((block, index) => {
+        const isGlass = block.mat === 'Glass';
+        return (
+          <mesh key={index} position={[block.x, block.y, block.z]}>
+            <boxGeometry args={[3, 3, 3]} />
+            <meshStandardMaterial 
+              // 🌟 고유 색상(color)이 있으면 최우선으로 적용!
+              color={block.color || MATERIAL_COLORS[block.mat] || MATERIAL_COLORS.Default} 
+              transparent={isGlass} 
+              opacity={isGlass ? 0.6 : 1} 
+              roughness={isGlass ? 0.1 : 0.8}
+            />
+          </mesh>
+        );
+      })}
+    </group>
+  );
+}
+
+export default function LiveDemoViewer({ grid = null, data = null, mode = 'static', maxBlocks = 10000 }) {
+  
+  // 🌟 2D 배열(grid)이 들어오면 3D 뷰어가 알아서 층수와 색상을 번역합니다.
+  const displayData = useMemo(() => {
+    let blocks = [];
+
+    if (grid) {
+      // 🔍 기존 grid.forEach 내부의 blocks.push 부분을 아래처럼 수정합니다.
+grid.forEach((row, rIdx) => {
+  row.forEach((cell, cIdx) => {
+    if (cell) {
+      // 1~5층 벽이면 해당 숫자만큼, 바닥(9)이면 1층 높이로 설정
+      const totalFloors = (cell >= 1 && cell <= 5) ? cell : 1; 
+      
+      let hexColor = '#bdc3c7';
+      if (cell >= 1 && cell <= 5) hexColor = FLOOR_COLORS[cell].hex;
+      else if (cell === 9) hexColor = '#D2D2D2';
+
+      // 🌟 핵심: 1층부터 해당 층 높이까지 차곡차곡 기둥을 쌓아 올립니다!
+      for (let h = 1; h <= totalFloors; h++) {
+        blocks.push({
+          x: cIdx * 3.0, 
+          y: h * 3.0 - 1.5, // 1층(1.5f), 2층(4.5f), 3층(7.5f) 순으로 차례대로 쌓임
+          z: rIdx * 3.0, 
+          color: hexColor,
+          mat: 'Concrete'
+        });
+      }
+    }
+  });
+});
+    } else if (data) {
+      // 🌟 AI 사진 추출 데이터(EditorView의 parseCsvToBlocks가 {x,y,z,mat,color,type} 형태로 변환해서 넘김)
+      blocks = data;
+    }
+
+    if (blocks.length > maxBlocks) {
+      return blocks.slice(0, maxBlocks);
+    }
+    return blocks;
+  }, [grid, data, maxBlocks]);
+
+  return (
+    <div className="w-full h-full min-h-[400px] bg-gray-900 rounded-2xl overflow-hidden relative shadow-inner">
+      <div className="absolute top-4 left-4 z-10 bg-black/60 backdrop-blur-sm text-white px-4 py-2 rounded-xl text-sm font-bold flex flex-col gap-1">
+        <span className="text-blue-400">
+          {mode === 'realtime' ? '🟢 실시간 에디터 모드' : '🌐 갤러리 감상 모드'}
+        </span>
+        <span>
+          블록 렌더링: <span className={displayData.length >= maxBlocks ? "text-red-400" : "text-green-400"}>
+            {displayData.length.toLocaleString()}
+          </span> / {maxBlocks.toLocaleString()} MAX
+        </span>
+      </div>
+
+      <div className="absolute bottom-4 right-4 z-10 bg-black/60 backdrop-blur-sm text-gray-300 px-3 py-1 rounded-lg text-xs">
+        좌클릭: 회전 | 우클릭: 이동 | 휠: 확대/축소
+      </div>
+
+      <Canvas camera={{ position: [50, 50, 50], fov: 45 }}>
+        <color attach="background" args={['#0f172a']} />
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[20, 40, 20]} intensity={1.5} castShadow />
+        <Stage environment="city" intensity={0.5} adjustCamera={true}>
+          <VoxelBlocks blocks={displayData} />
+        </Stage>
+        <OrbitControls makeDefault autoRotate={mode === 'static'} autoRotateSpeed={1.5} />
+      </Canvas>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/views/EditorView.jsx
+// MODIFIED: 26-06-29 00:53 | LINES: 353
+```jsx
+import React, { useState, useRef, useMemo } from 'react';
+import Button from '../components/ui/Button';
+import { exportToPNG, exportToCSV, importPNGToGrid, getCellColorClass, FLOOR_COLORS } from '../utils/cadUtils';
+import LiveDemoViewer from '../components/LiveDemoViewer';
+
+// 🌟 백엔드 CSV 행({PosX,PosY,PosZ,Material,...}) → LiveDemoViewer가 기대하는 블록 형태({x,y,z,mat,color})로 변환
+const MATERIAL_HEX = {
+  Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50',
+  Glass: '#3498db', Default: '#bdc3c7'
+};
+
+function parseCsvToBlocks(csvText) {
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const idx = {
+    x: headers.indexOf('PosX'),
+    y: headers.indexOf('PosY'),
+    z: headers.indexOf('PosZ'),
+    mat: headers.indexOf('Material'),
+    type: headers.indexOf('Type'),
+  };
+
+  const blocks = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const cols = lines[i].split(',');
+    const matName = idx.mat !== -1 ? cols[idx.mat] : 'Default';
+    blocks.push({
+      x: parseFloat(cols[idx.x]),
+      y: parseFloat(cols[idx.y]),
+      z: parseFloat(cols[idx.z]),
+      mat: matName,
+      color: MATERIAL_HEX[matName] || MATERIAL_HEX.Default,
+      type: idx.type !== -1 ? cols[idx.type] : undefined,
+    });
+  }
+  return blocks;
+}
+
+export default function EditorView({ 
+  grid, setGrid, mode, setMode, activeFloor, setActiveFloor, setView, 
+  undo, saveHistory, uploadToShowcase, isInsidePreview, 
+  handleMouseDown, handleMouseEnter, handleMouseUp 
+}) {
+  
+  // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
+  const [editorTab, setEditorTab] = useState('grid');
+  
+  // AI 사진 추출 결과 → 3D 뷰어에 띄울 데이터
+  const [extracted3DData, setExtracted3DData] = useState([]);
+
+  // 🌟 AI 사진 추출용 추가 상태들
+  const [imageSrc, setImageSrc] = useState(null);
+  const [imageFile, setImageFile] = useState(null);
+  const [box, setBox] = useState(null); // 박스 좌표 {startX, startY, endX, endY}
+  const [isDrawingBox, setIsDrawingBox] = useState(false);
+  const [snapshots, setSnapshots] = useState([]); // 3스냅샷 제한 관리
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
+  const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
+
+  const handlePngSave = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", "신축도면");
+    if (name === null) return;
+    exportToPNG(grid, name);
+  };
+
+  // 1. 사진 업로드 처리 (3스냅샷 리미터 작동!)
+  const handleImageUpload = (e) => {
+    if (snapshots.length >= 3) {
+      alert("🚨 사진 3D 추출은 프로젝트당 최대 3개의 스냅샷까지만 저장 가능합니다! 기존 스냅샷을 삭제해 주세요.");
+      return;
+    }
+    const file = e.target.files[0];
+    if (file) {
+      setImageFile(file);
+      setImageSrc(URL.createObjectURL(file));
+      setBox(null);
+    }
+  };
+
+  // 2. 파이썬 서버로 데이터 쏘기
+  const handleExtract3D = async () => {
+    if (!box || !imageFile || !imgRef.current || !realHeightMeters) return;
+    setIsExtracting(true);
+
+    try {
+      // 이미지의 화면상 비율을 실제 원본 이미지 픽셀 비율로 변환
+      const scaleX = imgRef.current.naturalWidth / imgRef.current.width;
+      const scaleY = imgRef.current.naturalHeight / imgRef.current.height;
+      
+      const realStartX = Math.min(box.startX, box.endX) * scaleX;
+      const realStartY = Math.min(box.startY, box.endY) * scaleY;
+      const realEndX = Math.max(box.startX, box.endX) * scaleX;
+      const realEndY = Math.max(box.startY, box.endY) * scaleY;
+
+      // 파일과 박스 좌표를 함께 포장 (FormData)
+      const formData = new FormData();
+      formData.append('file', imageFile);
+      formData.append('startX', realStartX);
+      formData.append('startY', realStartY);
+      formData.append('endX', realEndX);
+      formData.append('endY', realEndY);
+      formData.append('realHeightMeters', realHeightMeters); // 🌟 백엔드 필수값 — 빼먹으면 422 에러
+
+      // 🚀 파이썬 FastAPI 서버 호출!
+      const response = await fetch('http://localhost:8000/api/extract-3d-csv', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error("서버 변환 실패");
+
+      // 반환된 CSV를 텍스트로 받아서 미리보기용 블록 데이터로 변환 + 다운로드는 그대로 유지
+      const csvText = await response.text();
+      const parsedBlocks = parseCsvToBlocks(csvText);
+      setExtracted3DData(parsedBlocks); // 🌟 실시간 3D 미리보기에 즉시 반영
+
+      const blob = new Blob([csvText], { type: 'text/csv' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ai_extracted_${Date.now()}.csv`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+
+      // 스냅샷 카운트 증가
+      setSnapshots(prev => [...prev, blob]);
+      alert(`✅ 성공적으로 ${parsedBlocks.length.toLocaleString()}개 3D 블록을 추출했습니다!`);
+      
+    } catch (error) {
+      console.error(error);
+      alert("❌ AI 추출 중 오류가 발생했습니다. 파이썬 서버가 켜져 있는지 확인하세요.");
+    } finally {
+      setIsExtracting(false);
+    }
+  };
+
+  return (
+    <div className="h-screen w-screen bg-gray-50 flex flex-col overflow-hidden select-none">
+      
+      {/* --- 최상단 공통 헤더 --- */}
+      <header className="p-4 bg-white border-b border-gray-200 flex justify-between items-center shadow-sm z-10">
+        <div className="flex items-center space-x-3">
+          <button onClick={() => setView('dashboard')} className="p-2 text-gray-400 hover:text-blue-600 font-bold">◀ 뒤로가기</button>
+          <div className="h-6 w-px bg-gray-200 mx-2" />
+          <h1 className="text-xl font-black text-gray-800">CAD 에디터</h1>
+        </div>
+        <div className="flex space-x-2">
+          <Button variant="primary" onClick={uploadToShowcase}>🌐 클라우드 저장</Button>
+          <Button variant="dark" onClick={handlePngSave}>PNG 저장 (mbs_)</Button>
+          <Button variant="secondary" onClick={() => exportToCSV(grid)}>CSV 내보내기</Button>
+        </div>
+      </header>
+
+      {/* --- 메인 작업 영역: 2단 분할 --- */}
+      <div className="flex-1 flex overflow-hidden bg-gray-50">
+        
+        {/* [왼쪽 영역] : 탭 및 작업 공간 */}
+        <div className="flex-1 flex flex-col border-r border-gray-200">
+          
+          {/* ⭐ 탭 네비게이션 */}
+          <div className="flex bg-white border-b border-gray-200">
+            <button 
+              onClick={() => setEditorTab('grid')}
+              className={`flex-1 py-4 font-bold text-sm transition-colors border-b-2 ${
+                editorTab === 'grid' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:bg-gray-50'
+              }`}
+            >
+              📐 정밀 격자 제작 모드
+            </button>
+            <button 
+              onClick={() => setEditorTab('photo')}
+              className={`flex-1 py-4 font-bold text-sm transition-colors border-b-2 ${
+                editorTab === 'photo' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:bg-gray-50'
+              }`}
+            >
+              📸 AI 사진 3D 추출 모드
+            </button>
+          </div>
+
+          {/* ⭐ 탭 컨텐츠 */}
+          <div className="flex-1 overflow-auto bg-gray-50">
+            
+            {/* 1️⃣ 정밀 격자 제작 탭 */}
+            {editorTab === 'grid' && (
+              <div className="flex flex-col h-full">
+                {/* 툴바 (벽 그리기, 바닥 채우기 등) */}
+                <div className="p-3 bg-white border-b border-gray-200 flex items-center space-x-2 shadow-sm justify-center">
+                  <div className="flex bg-gray-100 p-1 rounded-lg">
+                    <Button variant={mode === 'wall_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('wall_rect')}>🧱 벽 그리기</Button>
+                    <Button variant={mode === 'floor_fill' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_fill')}>🪣 바닥 채우기</Button>
+                    <Button variant={mode === 'floor_rect' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('floor_rect')}>🏁 바닥 드래그</Button>
+                    <Button variant={mode === 'rect_eraser' ? 'tabActive' : 'tabInactive'} onClick={() => setMode('rect_eraser')} className={mode === 'rect_eraser' ? '!text-red-500' : ''}>🧼 지우개</Button>
+                  </div>
+                  {mode === 'wall_rect' && (
+                    <div className="flex items-center bg-gray-100 p-1 rounded-lg space-x-1">
+                      {[1, 2, 3, 4, 5].map(floorNum => (
+                        <button
+                          key={floorNum}
+                          onClick={() => setActiveFloor(floorNum)}
+                          className={`w-7 h-7 rounded-md border-2 flex items-center justify-center text-[10px] font-bold transition-all ${
+                            activeFloor === floorNum ? 'border-blue-500 scale-110' : 'border-transparent opacity-70 hover:opacity-100'
+                          }`}
+                          style={{ backgroundColor: FLOOR_COLORS[floorNum].hex, color: floorNum === 1 ? '#111' : '#fff' }}
+                        >
+                          {floorNum}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <Button variant="secondary" onClick={undo}>↩ 되돌리기</Button>
+                  <label className="cursor-pointer px-3 py-2 bg-white border border-blue-200 text-blue-600 rounded-md text-xs font-bold hover:bg-blue-50">
+                    📂 PNG 불러오기
+                    <input type="file" accept="image/*" className="hidden" onChange={e => {
+                      const file = e.target.files[0];
+                      if (file) importPNGToGrid(file, g => { saveHistory(); setGrid(g); });
+                    }} />
+                  </label>
+                </div>
+
+                {/* 50x50 캔버스 영역 */}
+                <div className="flex-1 p-10 flex justify-center items-start" onMouseUp={handleMouseUp}>
+                  <div className="bg-white shadow-2xl border border-gray-200 relative" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
+                    {grid.map((row, rIdx) => row.map((cell, cIdx) => {
+                      const inPreview = isInsidePreview(rIdx, cIdx);
+                      let bgColor = getCellColorClass(cell);
+                      if (inPreview) {
+                        if (mode === 'wall_rect') bgColor = FLOOR_COLORS[activeFloor].tw + '/60';
+                        else if (mode === 'floor_rect') bgColor = "bg-blue-300/40";
+                        else bgColor = "bg-red-200";
+                      }
+                      return (
+                        <div key={`${rIdx}-${cIdx}`} onMouseDown={() => handleMouseDown(rIdx, cIdx)} onMouseEnter={() => handleMouseEnter(rIdx, cIdx)}
+                          className={`w-[14px] h-[14px] border-[0.1px] border-gray-50 ${bgColor} hover:bg-blue-50 transition-colors`} />
+                      );
+                    }))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 2️⃣ AI 사진 3D 추출 탭 */}
+            {editorTab === 'photo' && (
+              <div className="h-full p-6 flex flex-col items-center overflow-y-auto relative"
+                onMouseMove={(e) => {
+                  if (!isDrawingBox || !imgRef.current) return;
+                  const rect = imgRef.current.getBoundingClientRect();
+                  const currentX = e.clientX - rect.left;
+                  const currentY = e.clientY - rect.top;
+                  setBox(prev => ({ ...prev, endX: currentX, endY: currentY }));
+                }}
+                onMouseUp={() => setIsDrawingBox(false)}
+                onMouseLeave={() => setIsDrawingBox(false)}
+              >
+                {!imageSrc ? (
+                  // [사진 업로드 전 화면]
+                  <div className="w-full max-w-2xl bg-white p-10 rounded-3xl shadow-lg border border-gray-200 flex flex-col items-center text-center mt-10">
+                    <div className="text-5xl mb-6">📸</div>
+                    <h2 className="text-2xl font-black text-gray-900 mb-2">건물/객체 사진 업로드</h2>
+                    <p className="text-gray-500 mb-8 font-medium">사진을 올리고 원하는 건물을 박스로 치면, AI가 1만 개 이하의 3D 엑셀 블록으로 추출합니다.</p>
+                    
+                    <label className="cursor-pointer w-full flex flex-col items-center justify-center h-48 border-2 border-dashed border-blue-300 rounded-2xl bg-blue-50 hover:bg-blue-100 transition-colors">
+                      <span className="text-blue-600 font-bold mb-2">클릭하여 이미지 파일 선택</span>
+                      <span className="text-xs text-blue-400">지원 형식: JPG, PNG</span>
+                      <input type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
+                    </label>
+                  </div>
+                ) : (
+                  // [사진 업로드 후 - 박스 그리기 화면]
+                  <div className="w-full flex flex-col items-center">
+                    <div className="w-full flex justify-between items-center mb-4 bg-white p-4 rounded-2xl shadow-sm border border-gray-200">
+                      <div>
+                        <h3 className="font-bold text-gray-800">🎯 추출할 건물을 마우스로 드래그하세요!</h3>
+                        <p className="text-xs text-gray-500">현재 스냅샷: {snapshots.length} / 3 MAX</p>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        {/* 🌟 실제 건물 높이(m) 입력 — 백엔드 스케일 보정 필수값 */}
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          placeholder="실제 높이(m)"
+                          value={realHeightMeters}
+                          onChange={e => setRealHeightMeters(e.target.value)}
+                          className="w-28 px-2 py-2 border border-gray-300 rounded-md text-sm"
+                        />
+                        <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); }}>취소</Button>
+                        <Button variant="primary" onClick={handleExtract3D} disabled={!box || isExtracting || !realHeightMeters}>
+                          {isExtracting ? 'AI 추출 중...⏳' : '⚡ 3D 추출 & CSV 다운로드'}
+                        </Button>
+                      </div>
+                    </div>
+
+                    {/* 🌟 크롭(박스) 에디터 영역 */}
+                    <div className="relative inline-block border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl select-none">
+                      <img 
+                        ref={imgRef}
+                        src={imageSrc} 
+                        alt="upload" 
+                        className="max-w-[700px] max-h-[600px] object-contain cursor-crosshair"
+                        draggable="false"
+                        onMouseDown={(e) => {
+                          const rect = imgRef.current.getBoundingClientRect();
+                          const startX = e.clientX - rect.left;
+                          const startY = e.clientY - rect.top;
+                          setIsDrawingBox(true);
+                          setBox({ startX, startY, endX: startX, endY: startY });
+                        }}
+                      />
+                      {/* 유저가 그리는 반투명 네모 박스 */}
+                      {box && (
+                        <div 
+                          className="absolute border-2 border-blue-500 bg-blue-400/30 pointer-events-none"
+                          style={{
+                            left: Math.min(box.startX, box.endX),
+                            top: Math.min(box.startY, box.endY),
+                            width: Math.abs(box.endX - box.startX),
+                            height: Math.abs(box.endY - box.startY)
+                          }}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+          </div>
+        </div>
+
+        {/* ⭐ [오른쪽 영역] : 3D 라이브 데모 (공통) */}
+        <div className="w-[450px] bg-white shadow-2xl flex flex-col z-20 shrink-0">
+          <div className="p-4 bg-gray-900 text-white font-bold flex justify-between items-center text-sm">
+            <span>🏗️ 실시간 3D 시공 미리보기</span>
+            <span className="text-xs text-green-400 font-black animate-pulse">● Live</span>
+          </div>
+          <div className="flex-1 relative">
+            <LiveDemoViewer 
+              grid={editorTab === 'grid' ? grid : null} 
+              data={editorTab === 'photo' ? extracted3DData : null} 
+              mode="realtime" 
+              maxBlocks={10000} 
+            />
+          </div>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+```
+
+// FILE PATH: 요약2.py
+// MODIFIED: 26-06-29 00:49 | LINES: 83
+```py
+import os
+import datetime
+
+def gather_files():
+    # 🔍 수집할 핵심 파일 확장자 (.js, .css 등 추가 가능)
+    target_extensions = ('.py', '.jsx', '.html', '.bat', '.js')
+    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+    
+    # 💡 1000줄 넘으면 다음 part로 분할
+    MAX_LINES_PER_FILE = 1000 
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_data = []
+    
+    print("📦 파일 스캔 및 내용 수집 중...")
+    
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_folders]
+        
+        for file in files:
+            if file.endswith(target_extensions):
+                # 💡 만들어진 결과물이 다시 스캔되는 것을 방지
+                if file.startswith("코드모음_"):
+                    continue
+                    
+                filepath = os.path.join(root, file)
+                # AI가 파일 구조를 이해하기 쉽도록 절대경로 대신 상대경로 추출
+                rel_path = os.path.relpath(filepath, base_dir) 
+                
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
+                    
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                        content = "".join(lines)
+                        line_count = len(lines)
+                        
+                    files_data.append({
+                        'path': rel_path.replace("\\", "/"), # 윈도우 경로(\)를 표준(/)으로 변경
+                        'time': dt,
+                        'line_count': line_count,
+                        'content': content,
+                        'extension': file.split('.')[-1]
+                    })
+                except Exception as e:
+                    print(f"⚠️ {file} 읽기 실패: {e}")
+                    
+    files_data.sort(key=lambda x: x['time'], reverse=True)
+    
+    if not files_data:
+        print("❌ 수집할 파일이 없습니다.")
+        return
+
+    current_part = 1
+    current_lines = 0
+    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+    
+    for f_data in files_data:
+        # 💡 AI가 완벽하게 파싱할 수 있는 파일 헤더와 마크다운 코드 블록 양식
+        header = f"// FILE PATH: {f_data['path']}\n"
+        header += f"// MODIFIED: {f_data['time']} | LINES: {f_data['line_count']}\n"
+        code_block_start = f"```{f_data['extension']}\n"
+        code_block_end = "\n```\n\n"
+        
+        formatted_content = header + code_block_start + f_data['content'] + code_block_end
+        
+        added_lines = f_data['line_count'] + 6 
+        
+        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
+            out_f.close()
+            current_part += 1
+            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+            current_lines = 0
+            
+        out_f.write(formatted_content)
+        current_lines += added_lines
+        
+    out_f.close()
+    print(f"✅ 총 {current_part}개의 파트로 AI 최적화 코드 모음이 생성되었습니다.")
+
+if __name__ == "__main__":
+    gather_files()
+```
+
+// FILE PATH: src/views/DetailView.jsx
+// MODIFIED: 26-06-28 14:47 | LINES: 153
+```jsx
+import React, { useMemo } from 'react'; // useMemo 추가
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+// ⭐ 1. 우리가 만든 3D 라이브 데모 뷰어 컴포넌트 불러오기
+import LiveDemoViewer from '../components/LiveDemoViewer';
+
+export default function DetailView({
+  selectedBp,
+  setView,
+  comments,
+  commentInput,
+  setCommentInput,
+  likeCount,
+  hasLiked,
+  onLikeToggle,
+  onAddComment,
+  onEditBlueprint
+}) {
+  // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
+  const calculateFileSize = () => {
+    if (!selectedBp?.grid_data) return "0.00 KB";
+    const strLen = JSON.stringify(selectedBp.grid_data).length;
+    return (strLen / 1024).toFixed(2) + " KB";
+  };
+
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
+  };
+
+
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
+      {/* 상단 네비게이션 헤더 */}
+      <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shadow-sm sticky top-0 z-10">
+        <div className="flex items-center space-x-4">
+          <button 
+            onClick={() => setView('dashboard')} 
+            className="p-2 hover:bg-gray-100 rounded-xl text-gray-600 font-bold transition-all flex items-center space-x-1 text-sm"
+          >
+            <span>◀</span> <span>대시보드로 가기</span>
+          </button>
+          <div className="h-6 w-[1px] bg-gray-200" />
+          <h2 className="text-xl font-black text-gray-900">{selectedBp.name}</h2>
+        </div>
+        <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
+          설계도 뷰어 모드
+        </div>
+      </header>
+
+      {/* 대화형 메인 그리드 및 소셜 시스템 (2분할 구성) */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 flex flex-col md:flex-row gap-8">
+        
+        {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
+        <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
+          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">구조물 설계도 평면도 미리보기</div>
+          
+          {/* ⭐ 3. 기존 2D 평면도 윗부분에 3D 라이브 데모 추가 */}
+          <div className="w-full h-[300px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+            <LiveDemoViewer grid={selectedBp?.grid_data} mode="static" maxBlocks={10000} />
+          </div>
+
+          <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
+              {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
+                <div
+                  key={`detail-cell-${rIdx}-${cIdx}`}
+                  className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
+                />
+              )))}
+            </div>
+          </div>
+          
+          <div className="w-full flex flex-col gap-3 mt-6">
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
+                📸 PNG 이미지 다운로드 (mbs_)
+              </button>
+              <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
+                📊 CSV 데이터 내보내기
+              </button>
+            </div>
+            <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
+              📐 이 도면 편집기로 열기 (CAD 작업실 이동)
+            </button>
+          </div>
+        </div>
+
+        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 (기존 코드 완벽 유지) */}
+        <div className="w-full md:w-[400px] bg-white border border-gray-200 rounded-2xl p-6 flex flex-col shadow-sm justify-between">
+          <div>
+            <h3 className="text-base font-black text-gray-900 mb-4 pb-2 border-b border-gray-100">📋 설계 도면 정보</h3>
+            
+            <div className="bg-gray-50 p-4 rounded-xl text-xs space-y-3 text-gray-600 font-medium mb-5 border border-gray-100">
+              <div className="flex justify-between"><span>👤 설계자</span> <span className="text-blue-600 font-bold">{selectedBp.author}</span></div>
+              <div className="flex justify-between"><span>📅 제작일자</span> <span className="text-gray-900 font-bold">{new Date(selectedBp.created_at).toLocaleString()}</span></div>
+              <div className="flex justify-between"><span>💾 파일 용량</span> <span className="text-green-600 font-bold">{calculateFileSize()}</span></div>
+            </div>
+
+            <div className="mb-6">
+              <button 
+                onClick={onLikeToggle} 
+                className={`flex items-center space-x-2 px-5 py-2.5 rounded-full border text-xs font-bold transition-all shadow-sm ${
+                  hasLiked ? 'bg-red-50 border-red-200 text-red-500 shadow-red-100/30' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <span>{hasLiked ? '❤️' : '🤍'}</span>
+                <span>좋아요 {likeCount}개</span>
+              </button>
+            </div>
+
+            <div className="border-t border-gray-100 pt-5">
+              <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">💬 피드백 및 댓글 ({comments.length})</h4>
+              <div className="space-y-3 max-h-[260px] overflow-y-auto pr-1">
+                {comments.length === 0 ? (
+                  <div className="text-center py-10 bg-gray-50 rounded-xl border border-dashed border-gray-200 text-xs text-gray-400 font-medium">
+                    등록된 피드백이 없습니다.<br/>첫 댓글을 달아 칭찬해보세요!
+                  </div>
+                ) : (
+                  comments.map(comment => (
+                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs border border-gray-100">
+                      <div className="flex justify-between font-bold text-gray-700 mb-1">
+                        <span>{comment.username || '익명'}</span>
+                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
+                      </div>
+                      <p className="text-gray-600 font-medium break-all whitespace-pre-wrap">{comment.content}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-100 pt-4 mt-6 flex gap-2">
+            <input 
+              type="text" 
+              value={commentInput}
+              onChange={e => setCommentInput(e.target.value)}
+              placeholder="댓글을 남겨보세요..."
+              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 focus:bg-white transition-all font-medium"
+              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
+            />
+            <button onClick={onAddComment} className="px-5 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 shadow-sm transition-all whitespace-nowrap">
+              등록
+            </button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  );
+}
+```
+

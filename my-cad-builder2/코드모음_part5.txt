@@ -1,0 +1,95 @@
+// FILE PATH: src/main.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+```
+
+// FILE PATH: src/supabaseClient.js
+// MODIFIED: 26-06-03 17:04 | LINES: 7
+```js
+import { createClient } from '@supabase/supabase-js'
+
+// 금고(.env)에서 자재 꺼내오기
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+```
+
+// FILE PATH: src/components/ui/Button.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 13
+```jsx
+import React from 'react';
+
+export default function Button({ children, variant = 'primary', className = '', ...props }) {
+  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
+  const styles = {
+    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
+    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
+    dark: "bg-gray-800 text-white hover:bg-black",
+    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
+    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
+  };
+  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
+}
+```
+
+// FILE PATH: src/components/ui/Input.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import React from 'react';
+
+export default function Input({ label, className = '', ...props }) {
+  return (
+    <div className="space-y-1 w-full">
+      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
+      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/views/AuthView.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 29
+```jsx
+import React from 'react';
+import Input from '../components/ui/Input';
+import Button from '../components/ui/Button';
+
+export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
+  return (
+    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
+      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
+        <div className="text-blue-600 text-center mb-8">
+          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
+          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
+        </div>
+        <div className="space-y-4">
+          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
+          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
+          {authMode === 'signup' && (
+            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
+          )}
+          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
+            {authMode === 'login' ? '로그인' : '회원가입 하기'}
+          </Button>
+          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
+            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+

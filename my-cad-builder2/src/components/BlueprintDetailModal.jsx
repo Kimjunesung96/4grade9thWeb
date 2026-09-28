@@ -1,5 +1,5 @@
 import React from 'react';
-import { exportToPNG, exportToCSV } from '../utils/cadUtils';
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
 
 export default function BlueprintDetailModal({
   selectedBp,
@@ -12,6 +12,12 @@ export default function BlueprintDetailModal({
   onLikeToggle,
   onAddComment
 }) {
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
+  };
+
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col md:flex-row overflow-hidden">
@@ -24,15 +30,15 @@ export default function BlueprintDetailModal({
               {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
                 <div
                   key={`modal-cell-${rIdx}-${cIdx}`}
-                  className={`w-[6px] h-[6px] border-[0.05px] border-gray-100 ${cell === 1 ? 'bg-black' : cell === 2 ? 'bg-gray-300' : 'bg-white'}`}
+                  className={`w-[6px] h-[6px] border-[0.05px] border-gray-100 ${getCellColorClass(cell)}`}
                 />
               )))}
             </div>
           </div>
           
           <div className="w-full grid grid-cols-2 gap-3 mt-6">
-            <button onClick={() => exportToPNG(selectedBp.grid_data)} className="p-3 bg-gray-880 text-white rounded-xl text-xs font-bold hover:bg-black transition-all">
-              📸 PNG 이미지 다운
+            <button onClick={handlePngDownload} className="p-3 bg-gray-880 text-white rounded-xl text-xs font-bold hover:bg-black transition-all">
+              📸 PNG 이미지 다운 (mbs_)
             </button>
             <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all">
               📊 CSV 데이터 내보내기

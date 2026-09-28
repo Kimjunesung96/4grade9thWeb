@@ -1,0 +1,979 @@
+// FILE PATH: src/utils/cadUtils.js
+// MODIFIED: 26-06-28 02:35 | LINES: 197
+```js
+import CryptoJS from 'crypto-js';
+
+// 비밀번호 암호화 로직
+export const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
+
+// ===================== 층별 벽 색상 매핑 =====================
+// grid 값 체계: 0=빈칸, 1~5=벽(1~5층), 9=바닥
+export const FLOOR_COLORS = {
+  1: { hex: '#9CA3AF', tw: 'bg-gray-400', label: '1층' },   // 회색
+  2: { hex: '#EF4444', tw: 'bg-red-500',  label: '2층' },   // 빨강
+  3: { hex: '#F97316', tw: 'bg-orange-500', label: '3층' }, // 주황
+  4: { hex: '#EAB308', tw: 'bg-yellow-500', label: '4층' }, // 노랑
+  5: { hex: '#000000', tw: 'bg-black',    label: '5층' },   // 검정
+};
+export const FLOOR_VALUE = 9; // 바닥 칸 값 (기존 2에서 변경 → 1~5 벽 값과 충돌 방지)
+
+// 셀 값을 기준으로 표시 색상(hex)을 반환
+export const getCellColorHex = (cell) => {
+  if (cell === FLOOR_VALUE) return '#D2D2D2';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].hex;
+  return '#FFFFFF';
+};
+
+// 셀 값을 기준으로 표시 색상(tailwind 클래스)을 반환
+export const getCellColorClass = (cell) => {
+  if (cell === FLOOR_VALUE) return 'bg-gray-300';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].tw;
+  return 'bg-white';
+};
+
+// Flood Fill 알고리즘
+export const floodFill = (grid, r, c, replacementVal) => {
+  const targetVal = grid[r][c];
+  if (targetVal === replacementVal) return grid;
+  const newGrid = JSON.parse(JSON.stringify(grid));
+  const stack = [[r, c]];
+  while (stack.length > 0) {
+    const [currR, currC] = stack.pop();
+    if (currR >= 0 && currR < 50 && currC >= 0 && currC < 50 && newGrid[currR][currC] === targetVal) {
+      newGrid[currR][currC] = replacementVal;
+      stack.push([currR + 1, currC], [currR - 1, currC], [currR, currC + 1], [currR, currC - 1]);
+    }
+  }
+  return newGrid;
+};
+
+// 블록 ID 포맷 생성기
+export const formatID = (val) => {
+  const absVal = Math.round(Math.abs(val));
+  const sign = val < 0 ? "-" : "0";
+  return sign + absVal.toString().padStart(3, '0');
+};
+
+// 사각형 테두리(두께 2칸)만 칠하고 안쪽은 비우는 벽 그리기 로직
+// startR/endR/startC/endC: 드래그 영역의 행/열 범위 (min~max 정렬된 값)
+// thickness: 테두리 두께 (기본 2칸)
+export const applyWallBorder = (gridRef, startR, endR, startC, endC, floorValue, thickness = 2) => {
+  for (let r = startR; r <= endR; r++) {
+    for (let c = startC; c <= endC; c++) {
+      const distFromTop = r - startR;
+      const distFromBottom = endR - r;
+      const distFromLeft = c - startC;
+      const distFromRight = endC - c;
+      const minDist = Math.min(distFromTop, distFromBottom, distFromLeft, distFromRight);
+      // 테두리(바깥쪽 thickness칸)에 해당하면 칠하고, 안쪽이면 건드리지 않음
+      if (minDist < thickness) {
+        gridRef[r][c] = floorValue;
+      }
+    }
+  }
+  return gridRef;
+};
+
+// CSV 구조 데이터 파일 추출 (1~5층 벽 + 바닥)
+export const exportToCSV = (grid) => {
+  let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell === 0) return;
+      const xCoord = cIdx * 3 + 1.5;
+      const zCoord = rIdx * 3 + 1.5;
+      const idX = formatID(xCoord * 10);
+      const idZ = formatID(zCoord * 10);
+
+      if (cell >= 1 && cell <= 5) {
+        // cell 값 = 층 번호. 해당 층 높이에만 벽 블록 생성
+        const floorNum = cell;
+        const yCoord = floorNum * 3 - 1.5;
+        const idY = formatID(yCoord * 10);
+        csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Wall_F${floorNum}\n`;
+      } else if (cell === FLOOR_VALUE) {
+        csvContent += `${idX}_${idZ}_015,${xCoord.toFixed(2)},1.50,${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Floor\n`;
+      }
+    });
+  });
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `blueprint_final.csv`;
+  link.click();
+};
+
+// PNG 캔버스 이미지 저장 (mbs_ 접두사 자동 부여)
+export const exportToPNG = (grid, fileName) => {
+  const cellSize = 10;
+  const canvas = document.createElement('canvas');
+  canvas.width = 50 * cellSize; canvas.height = 50 * cellSize;
+  const ctx = canvas.getContext('2d');
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      ctx.fillStyle = getCellColorHex(cell);
+      ctx.fillRect(cIdx * cellSize, rIdx * cellSize, cellSize, cellSize);
+    });
+  });
+
+  // 유니티 스캐너 인식용 mbs_ 접두사 강제 부여
+  let baseName = (fileName && fileName.trim()) ? fileName.trim() : 'blueprint_draw';
+  baseName = baseName.replace(/\.png$/i, ''); // 혹시 사용자가 .png까지 입력해도 중복 방지
+  baseName = baseName.replace(/^mbs_/i, '');   // 이미 mbs_가 붙어있으면 중복 방지
+  const finalName = `mbs_${baseName}.png`;
+
+  const link = document.createElement('a');
+  link.download = finalName;
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+};
+
+// 이미지 파일에서 격자판 역추적 로드 (층별 색상 인식)
+export const importPNGToGrid = (file, callback) => {
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 50; canvas.height = 50;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, 50, 50);
+    const imageData = ctx.getImageData(0, 0, 50, 50).data;
+    const newGrid = Array(50).fill(null).map(() => Array(50).fill(0));
+
+    // 색상 → grid 값 역매핑 테이블 준비 (RGB 거리 기준 최근접 매칭)
+    const colorTable = [
+      { val: FLOOR_VALUE, rgb: [210, 210, 210] }, // 바닥
+      ...Object.entries(FLOOR_COLORS).map(([val, info]) => {
+        const hex = info.hex.replace('#', '');
+        const rgb = [
+          parseInt(hex.substring(0, 2), 16),
+          parseInt(hex.substring(2, 4), 16),
+          parseInt(hex.substring(4, 6), 16),
+        ];
+        return { val: Number(val), rgb };
+      }),
+    ];
+
+    for (let r = 0; r < 50; r++) {
+      for (let c = 0; c < 50; c++) {
+        const idx = (r * 50 + c) * 4;
+        const px = [imageData[idx], imageData[idx + 1], imageData[idx + 2]];
+        // 흰색(빈칸)에 가까우면 0으로 처리
+        if (px[0] > 245 && px[1] > 245 && px[2] > 245) {
+          newGrid[r][c] = 0;
+          continue;
+        }
+        // 가장 가까운 색을 찾아 매핑
+        let bestVal = 0;
+        let bestDist = Infinity;
+        for (const entry of colorTable) {
+          const d = Math.pow(px[0] - entry.rgb[0], 2) + Math.pow(px[1] - entry.rgb[1], 2) + Math.pow(px[2] - entry.rgb[2], 2);
+          if (d < bestDist) { bestDist = d; bestVal = entry.val; }
+        }
+        newGrid[r][c] = bestVal;
+      }
+    }
+    URL.revokeObjectURL(url);
+    callback(newGrid);
+  };
+  img.src = url;
+};
+// 2D 격자 데이터를 3D 뷰어용 배열(x, y, z, mat)로 변환해주는 함수
+export const convertGridTo3DData = (grid) => {
+  if (!grid) return [];
+  const blocks = [];
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell) {
+        // 셀 값이 숫자면 해당 층수, 아니면 기본 1층으로 계산
+        const floorHeight = typeof cell === 'number' ? cell : 1; 
+        blocks.push({
+          x: cIdx * 3.0, 
+          y: floorHeight * 3.0 - 1.5, 
+          z: rIdx * 3.0, 
+          mat: 'Concrete' // 기본 뷰는 콘크리트 재질로 통일
+        });
+      }
+    });
+  });
+  return blocks;
+};
+```
+
+// FILE PATH: src/App.jsx
+// MODIFIED: 26-06-26 17:21 | LINES: 189
+```jsx
+import React, { useState, useEffect } from 'react';
+import { supabase } from './supabaseClient';
+import { hashPw, applyWallBorder, floodFill, FLOOR_VALUE } from './utils/cadUtils';
+import AuthView from './views/AuthView';
+import DashboardView from './views/DashboardView';
+import EditorView from './views/EditorView';
+import DetailView from './views/DetailView';
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('auth');
+  const [authMode, setAuthMode] = useState('login');
+  const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
+  const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
+  const [mode, setMode] = useState('wall_rect');
+  const [activeFloor, setActiveFloor] = useState(1); // 현재 선택된 층 (1~5)
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [startPos, setStartPos] = useState(null);
+  const [currentPos, setCurrentPos] = useState(null);
+  const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
+
+  // 소셜 상태 데이터 전역 상태 관리 저장소
+  const [selectedBp, setSelectedBp] = useState(null);
+  const [commentInput, setCommentInput] = useState('');
+  const [likesData, setLikesData] = useState({}); // { 도면ID: [유저ID리스트] }
+  const [commentsData, setCommentsData] = useState({}); // { 도면ID: [댓글배열] }
+
+  const handleSignUp = async () => {
+    const { error } = await supabase.from('users').insert([{ username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email }]);
+    if (error) alert("이미 존재하는 ID입니다.");
+    else { alert("계정이 생성되었습니다! 로그인해주세요."); setAuthMode('login'); }
+  };
+
+  const handleLogin = async () => {
+    const { data } = await supabase.from('users').select('*').eq('username', authForm.id).eq('password_hash', hashPw(authForm.pw)).single();
+    if (data) { setUser(data); setView('dashboard'); }
+    else alert("아이디 혹은 비밀번호가 틀립니다.");
+  };
+
+  const fetchBlueprints = async () => {
+    const { data: allData } = await supabase.from('blueprints').select('*').order('created_at', { ascending: false });
+    const all = allData || [];
+    setBlueprints({ mine: all.filter(bp => bp.user_id === user?.id), others: all.filter(bp => bp.user_id !== user?.id) });
+  };
+
+  useEffect(() => { if (view === 'dashboard' && user) fetchBlueprints(); }, [view, user]);
+
+  const uploadToShowcase = async () => {
+    if (!user) return;
+    const title = prompt("작품 이름을 지어주세요!", "새 프로젝트");
+    if (!title) return;
+    const { error } = await supabase.from('blueprints').insert([{ name: title, grid_data: grid, user_id: user.id, author: user.username }]);
+    if (!error) { alert("업로드 완료!"); setView('dashboard'); }
+    else alert("에러: " + error.message);
+  };
+
+  const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
+  const undo = () => { if (history.length === 0) return;
+  setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
+
+  const handleMouseDown = (r, c) => {
+    // 바닥 채우기(클릭) 모드는 드래그 개념이 없으므로 즉시 flood fill 실행
+    if (mode === 'floor_fill') {
+      saveHistory();
+      setGrid(prevGrid => floodFill(prevGrid, r, c, FLOOR_VALUE));
+      return;
+    }
+    saveHistory();
+    setIsDrawing(true);
+    setStartPos({ r, c });
+    setCurrentPos({ r, c });
+  };
+
+  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c });
+  };
+
+  const handleMouseUp = () => {
+    if (isDrawing && mode.includes('rect') && startPos && currentPos) {
+      let newGrid = grid.map(row => [...row]);
+      const startR = Math.min(startPos.r, currentPos.r), endR = Math.max(startPos.r, currentPos.r);
+      const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
+
+      if (mode === 'wall_rect') {
+        // 벽: 사각형 테두리만 두께 2칸으로 칠하고 안쪽은 비움 (선택된 층 값으로)
+        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, activeFloor, 2);
+      } else if (mode === 'floor_rect') {
+        // 바닥(드래그): 영역 전체를 채움
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = FLOOR_VALUE; }
+        }
+      } else if (mode === 'rect_eraser') {
+        // 지우개: 영역 전체를 비움
+        for (let r = startR; r <= endR; r++) {
+          for (let c = startC; c <= endC; c++) { newGrid[r][c] = 0; }
+        }
+      }
+      setGrid(newGrid);
+    }
+    setIsDrawing(false); setStartPos(null); setCurrentPos(null);
+  };
+
+  const isInsidePreview = (r, c) => {
+    if (!isDrawing || !startPos || !currentPos || !mode.includes('rect')) return false;
+    return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
+  };
+
+  // 1인 1회 토글형 좋아요 알고리즘 구현
+  const handleLikeToggle = (bpId) => {
+    if (!user) return;
+    const currentLikedUsers = likesData[bpId] || [];
+    if (currentLikedUsers.includes(user.id)) {
+      setLikesData({ ...likesData, [bpId]: currentLikedUsers.filter(uid => uid !== user.id) });
+    } else {
+      setLikesData({ ...likesData, [bpId]: [...currentLikedUsers, user.id] });
+    }
+  };
+
+  // 고유 도면 아이디 기반 독립형 댓글 작성 처리
+  const handleAddComment = (bpId) => {
+    if (!commentInput.trim() || !user) return;
+    const newComment = {
+      id: Date.now(),
+      username: user.username,
+      content: commentInput,
+      created_at: new Date().toISOString()
+    };
+    const currentComments = commentsData[bpId] || [];
+    setCommentsData({ ...commentsData, [bpId]: [...currentComments, newComment] });
+    setCommentInput('');
+  };
+
+  return (
+    <>
+      {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
+      
+      {view === 'dashboard' && (
+        <DashboardView 
+          user={user} 
+          blueprints={blueprints} 
+          setView={setView} 
+          setUser={setUser} 
+          onSelectBlueprint={(bp) => {
+            setSelectedBp(bp);
+            setView('detail'); // 💡 팝업 모달 대신 상세페이지('detail') 뷰로 화면 라우팅 전환
+          }} 
+        />
+      )}
+      
+      {view === 'editor' && (
+        <EditorView
+          grid={grid}
+          setGrid={setGrid}
+          mode={mode}
+          setMode={setMode}
+          activeFloor={activeFloor}
+          setActiveFloor={setActiveFloor}
+          setView={setView}
+          undo={undo}
+          saveHistory={saveHistory}
+          uploadToShowcase={uploadToShowcase}
+          isInsidePreview={isInsidePreview}
+          handleMouseDown={handleMouseDown}
+          handleMouseEnter={handleMouseEnter}
+          handleMouseUp={handleMouseUp}
+        />
+      )}
+
+      {view === 'detail' && selectedBp && (
+        <DetailView
+          selectedBp={selectedBp}
+          setView={setView}
+          comments={commentsData[selectedBp.id] || []}
+          commentInput={commentInput}
+          setCommentInput={setCommentInput}
+          likeCount={(likesData[selectedBp.id] || []).length}
+          hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
+          onLikeToggle={() => handleLikeToggle(selectedBp.id)}
+          onAddComment={() => handleAddComment(selectedBp.id)}
+          onEditBlueprint={() => {
+            setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
+            setHistory([]);
+            setView('editor');
+          }}
+        />
+      )}
+    </>
+  );
+}
+```
+
+// FILE PATH: src/components/BlueprintDetailModal.jsx
+// MODIFIED: 26-06-26 16:55 | LINES: 113
+```jsx
+import React from 'react';
+import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+
+export default function BlueprintDetailModal({
+  selectedBp,
+  onClose,
+  comments,
+  commentInput,
+  setCommentInput,
+  likeCount,
+  hasLiked,
+  onLikeToggle,
+  onAddComment
+}) {
+  const handlePngDownload = () => {
+    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+    if (name === null) return;
+    exportToPNG(selectedBp.grid_data, name);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col md:flex-row overflow-hidden">
+        
+        {/* 왼쪽: 미니 그리드뷰 및 다운로드 */}
+        <div className="w-full md:w-1/2 bg-gray-100 p-6 flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-gray-200">
+          <div className="text-sm font-bold text-gray-500 mb-3 uppercase tracking-wider">구조물 설계도 평면도</div>
+          <div className="bg-white p-2 rounded-xl shadow-md overflow-auto max-w-full max-h-[350px]">
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 6px)', width: '300px' }}>
+              {selectedBp.grid_data?.map((row, rIdx) => row.map((cell, cIdx) => (
+                <div
+                  key={`modal-cell-${rIdx}-${cIdx}`}
+                  className={`w-[6px] h-[6px] border-[0.05px] border-gray-100 ${getCellColorClass(cell)}`}
+                />
+              )))}
+            </div>
+          </div>
+          
+          <div className="w-full grid grid-cols-2 gap-3 mt-6">
+            <button onClick={handlePngDownload} className="p-3 bg-gray-880 text-white rounded-xl text-xs font-bold hover:bg-black transition-all">
+              📸 PNG 이미지 다운 (mbs_)
+            </button>
+            <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all">
+              📊 CSV 데이터 내보내기
+            </button>
+          </div>
+        </div>
+
+        {/* 오른쪽: 소셜 및 정보 영역 */}
+        <div className="w-full md:w-1/2 p-6 flex flex-col h-full overflow-hidden justify-between">
+          <div>
+            <div className="flex justify-between items-start mb-2">
+              <h3 className="text-2xl font-black text-gray-900">{selectedBp.name}</h3>
+              <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl font-bold p-1">✕</button>
+            </div>
+            <div className="text-sm text-gray-500 font-medium mb-4">
+              설계자: <span className="text-blue-600 font-bold">{selectedBp.author}</span>
+            </div>
+
+            {/* 좋아요 버튼 */}
+            <div className="mb-6">
+              <button 
+                onClick={onLikeToggle} 
+                className={`flex items-center space-x-2 px-4 py-2 rounded-full border text-sm font-bold transition-all ${
+                  hasLiked ? 'bg-red-50 border-red-200 text-red-500' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <span>{hasLiked ? '❤️' : '🤍'}</span>
+                <span>좋아요 {likeCount}개</span>
+              </button>
+            </div>
+
+            {/* 댓글 목록 */}
+            <div className="border-t border-gray-100 pt-4">
+              <h4 className="text-sm font-bold text-gray-700 mb-2">댓글 ({comments.length})</h4>
+              <div className="space-y-3 max-h-[220px] overflow-y-auto pr-1">
+                {comments.length === 0 ? (
+                  <p className="text-xs text-gray-400 py-4 text-center">첫 댓글을 남겨 자라나는 구조물을 칭찬해 보세요!</p>
+                ) : (
+                  comments.map(comment => (
+                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs">
+                      <div className="flex justify-between font-bold text-gray-700 mb-1">
+                        <span>{comment.username || '익명'}</span>
+                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
+                      </div>
+                      <p className="text-gray-600 font-medium break-all">{comment.content}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* 댓글 입력 바 */}
+          <div className="border-t border-gray-100 pt-4 mt-4 flex gap-2">
+            <input 
+              type="text" 
+              value={commentInput}
+              onChange={e => setCommentInput(e.target.value)}
+              placeholder="멋진 구조물이네요! 댓글을 남겨보세요..."
+              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 transition-all"
+              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
+            />
+            <button onClick={onAddComment} className="px-4 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 transition-all">
+              등록
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+// FILE PATH: trace_deps.py
+// MODIFIED: 26-06-14 19:17 | LINES: 90
+```py
+import os
+import re
+from collections import defaultdict
+
+# 탐색할 최상위 경로 (현재 스크립트가 있는 폴더 기준)
+BASE_DIR = '.'
+# 무시할 폴더 (스캔 속도를 높이고 불필요한 추적 방지)
+IGNORE_DIRS = {'node_modules', '.git', '.vite', 'dist', 'build', 'public'}
+
+# 그래프 딕셔너리 초기화
+# forward_graph: 이 파일이 가져다 쓰는 코드 목록 (Imports)
+# reverse_graph: 이 파일을 가져다 쓰는 코드 목록 (Used By)
+forward_graph = defaultdict(set)
+reverse_graph = defaultdict(set)
+
+def scan_project():
+    print("🔍 프로젝트 전체 코드를 스캔하여 관계 지도를 그리는 중입니다...\n")
+    
+    # 1. 모든 JS/JSX 파일 찾기
+    all_files = []
+    for root, dirs, files in os.walk(BASE_DIR):
+        # 무시할 폴더 제외
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for file in files:
+            if file.endswith('.js') or file.endswith('.jsx'):
+                all_files.append(os.path.normpath(os.path.join(root, file)))
+
+    # import 구문 찾는 정규식
+    import_pattern = re.compile(r"import\s+.*?(?:from\s+)?['\"](.*?)['\"]")
+
+    # 2. 각 파일의 import 분석하여 관계망 형성
+    for file_path in all_files:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+        matches = import_pattern.findall(content)
+        
+        for match in matches:
+            # 경로에서 마지막 파일명만 추출 (예: ../components/Button -> Button)
+            target_name = match.split('/')[-1] 
+            target_base = target_name.replace('.jsx', '').replace('.js', '')
+            
+            # 스캔된 전체 로컬 파일 중 이름이 일치하는 파일 찾기 (외부 패키지 제외 효과)
+            for target_file in all_files:
+                target_filename_base = os.path.basename(target_file).replace('.jsx', '').replace('.js', '')
+                if target_base == target_filename_base:
+                    forward_graph[file_path].add(target_file)
+                    reverse_graph[target_file].add(file_path)
+
+    print(f"✅ 스캔 완료! 총 {len(all_files)}개의 코드를 분석하여 지도를 완성했습니다.")
+
+def search_dependencies():
+    while True:
+        print("=" * 60)
+        query = input("💡 검색할 파일명 입력 (예: App, cadUtils) / 종료는 q: ").strip()
+        
+        if query.lower() == 'q':
+            print("🚀 프로그램을 종료합니다. 커피 한 잔 하시면서 쉬세요!")
+            break
+            
+        if not query:
+            continue
+            
+        # 검색어와 부분 일치하는 파일 찾기
+        found_files = [f for f in forward_graph.keys() | reverse_graph.keys() if query.lower() in os.path.basename(f).lower()]
+        
+        if not found_files:
+            print(f"❌ '{query}'(이)가 포함된 코드를 찾을 수 없거나, 연결된 의존성이 없습니다.")
+            continue
+            
+        for target in found_files:
+            print(f"\n📂 [선택된 파일]: {target}")
+            
+            print("\n  [⬇️ 이 파일이 가져다 쓰는 코드 (Imports)]")
+            if forward_graph[target]:
+                for dep in sorted(forward_graph[target]):
+                    print(f"    - {dep}")
+            else:
+                print("    (없음)")
+                
+            print("\n  [⬆️ 이 파일을 가져다 쓰는 코드 (Used By)]")
+            if reverse_graph[target]:
+                for dep in sorted(reverse_graph[target]):
+                    print(f"    - {dep}")
+            else:
+                print("    (없음)")
+
+if __name__ == "__main__":
+    scan_project()
+    search_dependencies()
+```
+
+// FILE PATH: eslint.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 21
+```js
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      globals: globals.browser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+  },
+])
+
+```
+
+// FILE PATH: hometinker.html
+// MODIFIED: 26-06-03 17:04 | LINES: 65
+```html
+import React from 'react';
+
+export default function BuilderDashboard() {
+  return (
+    <div className="flex h-screen bg-gray-50">
+      
+      {/* 1. 좌측 사이드바 */}
+      <aside className="w-64 bg-white border-r flex flex-col">
+        <div className="p-6 font-black text-2xl text-blue-600 border-b">
+          🏗️ MY CAD
+        </div>
+        <nav className="flex-col p-4 space-y-2 text-gray-700 font-semibold">
+          <button className="w-full text-left p-3 bg-blue-50 text-blue-600 rounded-lg">🏠 홈</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📐 디자인</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📁 컬렉션</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">📚 튜토리얼</button>
+          <button className="w-full text-left p-3 hover:bg-gray-100 rounded-lg">🏆 랭킹</button>
+        </nav>
+      </aside>
+
+      {/* 2. 우측 메인 대시보드 */}
+      <main className="flex-1 p-8 overflow-y-auto">
+        <header className="flex justify-end mb-8">
+          <button className="bg-blue-600 text-white px-4 py-2 rounded-full font-bold shadow-md hover:bg-blue-700">
+            + 만들기
+          </button>
+        </header>
+
+        {/* 상단 섹션: 3D 구조물 외형 */}
+        <section className="mb-12">
+          <h2 className="text-2xl font-bold mb-6 text-gray-800">🏢 구조물 or 건축물 외형</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* 카드 컴포넌트 예시 */}
+            <div className="h-56 bg-white border rounded-xl shadow-sm hover:shadow-lg transition cursor-pointer flex flex-col">
+              <div className="h-3/4 bg-gray-200 rounded-t-xl flex items-center justify-center text-gray-400">
+                [3D 미리보기 이미지]
+              </div>
+              <div className="p-4 font-semibold text-gray-700">내 첫 번째 대저택</div>
+            </div>
+          </div>
+        </section>
+
+        {/* 하단 섹션: 2D 집 설계도면 */}
+        <section>
+          <h2 className="text-2xl font-bold mb-6 text-gray-800">📝 집 설계도면</h2>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            {/* 새 도면 만들기 카드 */}
+            <div className="h-40 bg-blue-50 border border-blue-200 rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex items-center justify-center flex-col text-blue-600">
+              <span className="text-3xl mb-2">➕</span>
+              <span className="font-bold">새 50x50 도면 그리기</span>
+            </div>
+            {/* 기존 도면 카드 */}
+            <div className="h-40 bg-white border rounded-xl shadow-sm hover:shadow-md transition cursor-pointer flex flex-col">
+              <div className="h-2/3 bg-gray-100 rounded-t-xl p-2 text-xs text-gray-400 overflow-hidden">
+                [격자 도면 미니맵]
+              </div>
+              <div className="p-3 font-semibold text-gray-700 text-sm">1층 평면도_완성본</div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  );
+}
+```
+
+// FILE PATH: index.html
+// MODIFIED: 26-06-03 17:04 | LINES: 13
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>my-cad-builder</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+```
+
+// FILE PATH: postcss.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 6
+```js
+export default {
+  plugins: {
+    "@tailwindcss/postcss": {},
+    autoprefixer: {},
+  },
+}
+```
+
+// FILE PATH: tailwind.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 11
+```js
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+```
+
+// FILE PATH: vite.config.js
+// MODIFIED: 26-06-03 17:04 | LINES: 7
+```js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+
+```
+
+// FILE PATH: 요약.py
+// MODIFIED: 26-06-03 17:04 | LINES: 90
+```py
+import os
+import datetime
+
+def gather_files():
+    # 🔍 수집할 핵심 파일 확장자
+    target_extensions = ('.py', '.jsx', '.html', '.bat')
+    ignore_folders = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+    
+    # 💡 한 텍스트 파일당 최대 몇 줄까지 담을지 설정 (원하시면 숫자를 수정하세요!)
+    MAX_LINES_PER_FILE = 1000 
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_data = []
+    
+    print("📦 파일 스캔 및 내용 수집 중...")
+    
+    for root, dirs, files in os.walk(base_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_folders]
+        
+        for file in files:
+            if file.endswith(target_extensions):
+                # 💡 만들어진 결과물(코드모음_*.txt)이 다시 스캔되는 것을 방지
+                if file.startswith("코드모음_"):
+                    continue
+                    
+                filepath = os.path.join(root, file)
+                
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    dt = datetime.datetime.fromtimestamp(mtime).strftime('%y-%m-%d %H:%M')
+                    
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                        content = "".join(lines)
+                        line_count = len(lines) # 글자 수가 아닌 '줄 수' 계산!
+                    
+                    files_data.append({
+                        'path': os.path.relpath(filepath, base_dir),
+                        'time': dt,
+                        'line_count': line_count,
+                        'mtime': mtime,
+                        'content': content
+                    })
+                    
+                except Exception as e:
+                    pass 
+
+    # 최근 수정된 순서대로 정렬
+    files_data.sort(key=lambda x: x['mtime'], reverse=True)
+    
+    if not files_data:
+        print("❌ 수집할 파일이 없습니다.")
+        return
+
+    # ---------------------------------------------------------
+    # 💡 수집된 내용들을 여러 개의 텍스트 파일로 쪼개서 저장하기
+    # ---------------------------------------------------------
+    current_part = 1
+    current_lines = 0
+    out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+    
+    for f_data in files_data:
+        # 파일별 제목 헤더 (예: [26-05-12 16:44] main.py (50줄))
+        header = f"\n\n{'='*60}\n[{f_data['time']}] {f_data['path']} ({f_data['line_count']}줄)\n{'='*60}\n\n"
+        
+        # 파일 하나를 추가할 때 예상되는 줄 수
+        added_lines = f_data['line_count'] + 6 
+        
+        # 만약 이 파일을 넣었을 때 제한(MAX_LINES_PER_FILE)을 넘는다면 새 파일 만들기
+        # 단, current_lines가 0일 때는 파일 하나가 1000줄이 넘더라도 일단 무조건 넣습니다.
+        if current_lines + added_lines > MAX_LINES_PER_FILE and current_lines > 0:
+            out_f.close()
+            current_part += 1
+            out_f = open(os.path.join(base_dir, f"코드모음_part{current_part}.txt"), "w", encoding="utf-8")
+            current_lines = 0
+            
+        out_f.write(header)
+        out_f.write(f_data['content'])
+        current_lines += added_lines
+
+    out_f.close()
+    
+    print("=" * 60)
+    print(f"✅ 총 {len(files_data)}개의 파일 코드를 성공적으로 수집했습니다!")
+    print(f"📁 '코드모음_part1.txt' ~ '코드모음_part{current_part}.txt' 에 나뉘어 저장되었습니다.")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    gather_files()
+    input("\n엔터를 누르면 종료됩니다...")
+```
+
+// FILE PATH: src/main.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+```
+
+// FILE PATH: src/supabaseClient.js
+// MODIFIED: 26-06-03 17:04 | LINES: 7
+```js
+import { createClient } from '@supabase/supabase-js'
+
+// 금고(.env)에서 자재 꺼내오기
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+```
+
+// FILE PATH: src/components/BlueprintCard.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 19
+```jsx
+import React from 'react';
+
+export default function BlueprintCard({ bp, onClick }) {
+  return (
+    <div 
+      onClick={onClick} 
+      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98"
+    >
+      <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">🏗️</div>
+      <div className="p-5">
+        <div className="font-bold text-lg text-gray-900">{bp.name}</div>
+        <div className="flex justify-between items-center mt-2">
+          <span className="text-sm text-blue-600 font-bold">{bp.author}</span>
+          <span className="text-xs text-gray-400">{new Date(bp.created_at).toLocaleDateString()}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/components/ui/Button.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 13
+```jsx
+import React from 'react';
+
+export default function Button({ children, variant = 'primary', className = '', ...props }) {
+  const base = "px-4 py-2 rounded-lg font-bold transition-all text-xs select-none active:scale-98";
+  const styles = {
+    primary: "bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100",
+    secondary: "bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200",
+    dark: "bg-gray-800 text-white hover:bg-black",
+    tabActive: "px-4 py-1.5 bg-white text-blue-600 shadow-sm rounded-md text-xs font-bold",
+    tabInactive: "px-4 py-1.5 text-gray-500 hover:bg-gray-200/50 rounded-md text-xs font-bold"
+  };
+  return <button className={`${base} ${styles[variant]} ${className}`} {...props}>{children}</button>;
+}
+```
+
+// FILE PATH: src/components/ui/Input.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 10
+```jsx
+import React from 'react';
+
+export default function Input({ label, className = '', ...props }) {
+  return (
+    <div className="space-y-1 w-full">
+      {label && <label className="text-xs font-bold text-gray-500 ml-1 block">{label}</label>}
+      <input className={`w-full bg-gray-50 border border-gray-200 p-3 rounded-lg outline-none focus:border-blue-500 transition-all text-sm ${className}`} {...props} />
+    </div>
+  );
+}
+```
+
+// FILE PATH: src/views/AuthView.jsx
+// MODIFIED: 26-06-03 17:04 | LINES: 29
+```jsx
+import React from 'react';
+import Input from '../components/ui/Input';
+import Button from '../components/ui/Button';
+
+export default function AuthView({ authMode, setAuthMode, authForm, setAuthForm, handleLogin, handleSignUp }) {
+  return (
+    <div className="h-screen w-screen bg-gray-50 flex items-center justify-center font-sans">
+      <div className="bg-white p-10 rounded-2xl shadow-xl w-96 border border-gray-100">
+        <div className="text-blue-600 text-center mb-8">
+          <h1 className="text-3xl font-black tracking-tight">CAD SYSTEM</h1>
+          <p className="text-sm text-gray-400 mt-1 font-medium italic">Login to your account</p>
+        </div>
+        <div className="space-y-4">
+          <Input label="ID" value={authForm.id} onChange={e => setAuthForm({...authForm, id: e.target.value})} />
+          <Input label="PASSWORD" type="password" value={authForm.pw} onChange={e => setAuthForm({...authForm, pw: e.target.value})} />
+          {authMode === 'signup' && (
+            <Input label="EMAIL" value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} />
+          )}
+          <Button variant="primary" onClick={authMode === 'login' ? handleLogin : handleSignUp} className="w-full p-4 mt-4">
+            {authMode === 'login' ? '로그인' : '회원가입 하기'}
+          </Button>
+          <p className="text-sm text-center text-gray-400 cursor-pointer hover:text-blue-500" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>
+            {authMode === 'login' ? '새 계정 만들기' : '이미 계정이 있나요? 로그인'}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+

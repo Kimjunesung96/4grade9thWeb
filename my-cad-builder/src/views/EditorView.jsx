@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
 import * as THREE from 'three';
 import Button from '../components/ui/Button';
 import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, getCombinedFloors, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
@@ -171,6 +171,113 @@ function downloadCsvText(csvText, filename) {
 
 const IDENTITY_QUAT = [0, 0, 0, 1];
 
+// ============================================================================
+// 🌟 GridCanvas: 기존에 50x50(=2500개, 실루엣 레이어까지 합치면 최대 5000개) <div>로
+//    그리던 걸 <canvas> 하나로 대체. 데이터 형태(grid 2차원 배열, isInsidePreview 등)는
+//    App.jsx 쪽을 전혀 건드리지 않고 그대로 사용 — 오직 "그리는 방식"만 바꿈.
+//    드래그 중 매 프레임 5000개 DOM 노드를 리렌더하던 것을, 캔버스 재도색(raster) 한 번으로 대체.
+// ============================================================================
+const GRID_N = 50;
+const GRID_CELL = 14;              // 기존 w-[14px] h-[14px]와 동일한 칸 크기 유지 (레이아웃 안 깨짐)
+const GRID_SIZE = GRID_N * GRID_CELL; // 700px, 기존 width:'700px'와 동일
+
+function GridCanvas({ grid, ghostGrid, mode, paintColor, isInsidePreview, onCellDown, onCellEnter }) {
+  const canvasRef = useRef(null);
+  const lastCellRef = useRef(null); // 같은 칸에서 mousemove가 여러 번 와도 중복 호출 방지
+
+  // grid/ghostGrid/mode/paintColor/isInsidePreview 중 무엇이 바뀌든(참조가 매 렌더 바뀔 수 있음)
+  // 매 렌더마다 다시 그린다. DOM 노드 수가 1개(canvas)뿐이라 비용이 거의 없다.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, GRID_SIZE, GRID_SIZE);
+
+    // 1) 이전 장 실루엣 (참고용, 반투명)
+    if (ghostGrid) {
+      ghostGrid.forEach((row, r) => row.forEach((cell, c) => {
+        if (cell >= 1 && cell <= 5) {
+          ctx.globalAlpha = 0.25;
+          ctx.fillStyle = FLOOR_COLORS[cell].hex;
+          ctx.fillRect(c * GRID_CELL, r * GRID_CELL, GRID_CELL, GRID_CELL);
+        }
+      }));
+      ctx.globalAlpha = 1;
+    }
+
+    // 2) 현재 페이지 (기존 로직과 동일한 색상 규칙 그대로 이식)
+    grid.forEach((row, r) => row.forEach((cell, c) => {
+      const inPreview = isInsidePreview(r, c);
+      let fill = null;
+      let alpha = 1;
+
+      if (cell === 9) fill = '#D1D5DB';               // 바닥(getCellColorClass의 bg-gray-300에 대응)
+      else if (cell >= 1 && cell <= 5) fill = FLOOR_COLORS[cell].hex;
+
+      if (inPreview) {
+        if (mode === 'wall_rect' || mode === 'floor_rect') { fill = FLOOR_COLORS[paintColor].hex; alpha = 0.6; }
+        else { fill = '#FECACA'; alpha = 1; } // 기존 bg-red-200과 동일 계열
+      }
+
+      if (fill) {
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = fill;
+        ctx.fillRect(c * GRID_CELL, r * GRID_CELL, GRID_CELL, GRID_CELL);
+        ctx.globalAlpha = 1;
+      }
+    }));
+
+    // 3) 셀 경계선 (기존 border-[0.1px] border-gray-50 느낌)
+    ctx.strokeStyle = '#f9fafb';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= GRID_N; i++) {
+      ctx.beginPath(); ctx.moveTo(i * GRID_CELL, 0); ctx.lineTo(i * GRID_CELL, GRID_SIZE); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, i * GRID_CELL); ctx.lineTo(GRID_SIZE, i * GRID_CELL); ctx.stroke();
+    }
+  });
+
+  // 🌟 픽셀 좌표 -> (row, col) 역산. 14px를 하드코딩해서 곱하지 않고
+  //    "실제 화면 표시 크기 기준으로 역산 + 캔버스 내부 해상도로 보정"해서
+  //    확대/축소·레티나 화면에서도 셀이 어긋나지 않게 한다.
+  const posToCell = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = GRID_SIZE / rect.width;
+    const scaleY = GRID_SIZE / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+    const col = Math.min(GRID_N - 1, Math.max(0, Math.floor(x / GRID_CELL)));
+    const row = Math.min(GRID_N - 1, Math.max(0, Math.floor(y / GRID_CELL)));
+    return { row, col };
+  };
+
+  const handleMouseDown = (e) => {
+    const { row, col } = posToCell(e);
+    onCellDown(row, col);
+  };
+
+  const handleMouseMove = (e) => {
+    const { row, col } = posToCell(e);
+    const last = lastCellRef.current;
+    if (last && last.row === row && last.col === col) return; // 같은 칸이면 아무것도 안 함
+    lastCellRef.current = { row, col };
+    onCellEnter(row, col);
+  };
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={GRID_SIZE}
+      height={GRID_SIZE}
+      style={{ width: GRID_SIZE, height: GRID_SIZE, cursor: 'crosshair', display: 'block' }}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+    />
+  );
+}
+// ============================================================================
+// GridCanvas 끝
+// ============================================================================
+
 // 🌟 화면(라이브데모)은 지금 보이는 그대로 유지하고,
 //    "엑셀(CSV) 다운로드" 할 때만 여기에 오른쪽 225도를 추가로 얹어서 내보냄.
 //    즉: 엑셀 = (라이브데모에 보이는 회전) + (오른쪽 225도 추가)
@@ -232,6 +339,12 @@ export default function EditorView({
   const [snapshots, setSnapshots] = useState([]); // 3스냅샷 제한 관리
   const [isExtracting, setIsExtracting] = useState(false);
   const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
+
+  // 🌟 지붕 모서리 A/B/C/D 상세입력 — 4개 다 채워야 보간, 하나라도 비어있으면 평지붕 기본값
+  const [roofLabelMap, setRoofLabelMap] = useState(null); // /api/estimate-roof-corners 응답: {A:{original_position,estimated_height_m}, ...}
+  const [roofCorners, setRoofCorners] = useState({ A: '', B: '', C: '', D: '' });
+  const [isEstimatingRoof, setIsEstimatingRoof] = useState(false);
+
   const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
   const csvUploadRef = useRef(null);
 
@@ -357,6 +470,49 @@ export default function EditorView({
       setImageFile(file);
       setImageSrc(URL.createObjectURL(file));
       setBox(null);
+      setRoofLabelMap(null); // 🌟 새 사진 → 이전 지붕 추정값 무효화
+      setRoofCorners({ A: '', B: '', C: '', D: '' });
+    }
+  };
+
+  // 1.5 지붕 모서리 A/B/C/D 자동 추정 (박스 드래그 완료 후 호출)
+  const handleEstimateRoofCorners = async () => {
+    if (!box || !imageFile) return;
+    setIsEstimatingRoof(true);
+    try {
+      const scaleX = imgRef.current.naturalWidth / imgRef.current.width;
+      const scaleY = imgRef.current.naturalHeight / imgRef.current.height;
+      const realStartX = Math.min(box.startX, box.endX) * scaleX;
+      const realStartY = Math.min(box.startY, box.endY) * scaleY;
+      const realEndX = Math.max(box.startX, box.endX) * scaleX;
+      const realEndY = Math.max(box.startY, box.endY) * scaleY;
+
+      const formData = new FormData();
+      formData.append('file', imageFile);
+      formData.append('startX', realStartX);
+      formData.append('startY', realStartY);
+      formData.append('endX', realEndX);
+      formData.append('endY', realEndY);
+
+      const response = await fetch('http://localhost:8000/api/estimate-roof-corners', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) throw new Error('지붕 모서리 추정 실패');
+
+      const labelMap = await response.json(); // {A:{original_position, estimated_height_m}, B:{...}, ...}
+      setRoofLabelMap(labelMap);
+      // 추정값으로 입력칸 프리필 (사용자가 그대로 쓰거나 수정 가능)
+      setRoofCorners({
+        A: labelMap.A?.estimated_height_m ?? '',
+        B: labelMap.B?.estimated_height_m ?? '',
+        C: labelMap.C?.estimated_height_m ?? '',
+        D: labelMap.D?.estimated_height_m ?? '',
+      });
+    } catch (err) {
+      alert('지붕 모서리 추정에 실패했습니다: ' + err.message);
+    } finally {
+      setIsEstimatingRoof(false);
     }
   };
 
@@ -381,6 +537,25 @@ export default function EditorView({
       formData.append('endX', realEndX);
       formData.append('endY', realEndY);
       formData.append('realHeightMeters', realHeightMeters);
+
+      // 🌟 지붕 A/B/C/D 4개 값이 전부 입력돼 있으면, 추정 시 받은 original_position(TL/TR/BL/BR)
+      //    매핑을 그대로 이용해 서버가 기대하는 roofTL/TR/BL/BR 슬롯에 넣어 보낸다.
+      //    하나라도 비어있거나 추정을 안 했으면 아무것도 안 보내서 서버가 평지붕 기본값으로 처리하게 둔다.
+      const cornerValues = { A: roofCorners.A, B: roofCorners.B, C: roofCorners.C, D: roofCorners.D };
+      const allFilled = Object.values(cornerValues).every(v => v !== '' && v !== null && !Number.isNaN(Number(v)));
+      if (roofLabelMap && allFilled) {
+        const bySlot = {}; // 'TL'|'TR'|'BL'|'BR' -> 미터값
+        for (const letter of ['A', 'B', 'C', 'D']) {
+          const slot = roofLabelMap[letter]?.original_position;
+          if (slot) bySlot[slot] = Number(cornerValues[letter]);
+        }
+        if (['TL', 'TR', 'BL', 'BR'].every(slot => slot in bySlot)) {
+          formData.append('roofTL', bySlot.TL);
+          formData.append('roofTR', bySlot.TR);
+          formData.append('roofBL', bySlot.BL);
+          formData.append('roofBR', bySlot.BR);
+        }
+      }
 
       const response = await fetch('http://localhost:8000/api/extract-3d-csv', {
         method: 'POST',
@@ -598,38 +773,18 @@ export default function EditorView({
                   </div>
                 )}
 
-                {/* 50x50 캔버스 영역 */}
+                {/* 50x50 캔버스 영역 — 기존 div 5000개 대신 <canvas> 1개 */}
                 <div className="flex-1 p-10 flex justify-center items-start" onMouseUp={handleMouseUp}>
-                  <div className="bg-white shadow-2xl border border-gray-200 relative" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)', width: '700px' }}>
-
-                    {/* 이전 장 실루엣 레이어 (참고용, 클릭 통과) */}
-                    {stackedFloors.length > 0 && (
-                      <div className="absolute inset-0 pointer-events-none" style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 14px)' }}>
-                        {stackedFloors[stackedFloors.length - 1].grid.map((row, rIdx) =>
-                          row.map((cell, cIdx) => (
-                            <div key={`ghost-${rIdx}-${cIdx}`} className="w-[14px] h-[14px]"
-                              style={{
-                                backgroundColor: (cell >= 1 && cell <= 5) ? FLOOR_COLORS[cell].hex : 'transparent',
-                                opacity: (cell >= 1 && cell <= 5) ? 0.25 : 0,
-                              }} />
-                          ))
-                        )}
-                      </div>
-                    )}
-
-                    {/* 현재 페이지 그리기 레이어 */}
-                    {grid.map((row, rIdx) => row.map((cell, cIdx) => {
-                      const inPreview = isInsidePreview(rIdx, cIdx);
-                      let bgColor = getCellColorClass(cell);
-                      if (inPreview) {
-                        if (mode === 'wall_rect' || mode === 'floor_rect') bgColor = FLOOR_COLORS[paintColor].tw + '/60';
-                        else bgColor = "bg-red-200";
-                      }
-                      return (
-                        <div key={`${rIdx}-${cIdx}`} onMouseDown={() => handleMouseDown(rIdx, cIdx)} onMouseEnter={() => handleMouseEnter(rIdx, cIdx)}
-                          className={`w-[14px] h-[14px] border-[0.1px] border-gray-50 ${bgColor} hover:bg-blue-50 transition-colors`} />
-                      );
-                    }))}
+                  <div className="bg-white shadow-2xl border border-gray-200 relative" style={{ width: '700px', height: '700px' }}>
+                    <GridCanvas
+                      grid={grid}
+                      ghostGrid={stackedFloors.length > 0 ? stackedFloors[stackedFloors.length - 1].grid : null}
+                      mode={mode}
+                      paintColor={paintColor}
+                      isInsidePreview={isInsidePreview}
+                      onCellDown={handleMouseDown}
+                      onCellEnter={handleMouseEnter}
+                    />
                   </div>
                 </div>
               </div>
@@ -689,12 +844,43 @@ export default function EditorView({
                           onChange={e => setRealHeightMeters(e.target.value)}
                           className="w-28 px-2 py-2 border border-gray-300 rounded-md text-sm"
                         />
-                        <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); }}>취소</Button>
+                        <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); setRoofLabelMap(null); setRoofCorners({ A: '', B: '', C: '', D: '' }); }}>취소</Button>
+                        <Button variant="dark" onClick={handleEstimateRoofCorners} disabled={!box || isEstimatingRoof}>
+                          {isEstimatingRoof ? '추정 중...⏳' : '🏠 지붕 모서리 추정'}
+                        </Button>
                         <Button variant="primary" onClick={handleExtract3D} disabled={!box || isExtracting || !realHeightMeters}>
                           {isExtracting ? 'AI 추출 중...⏳' : '⚡ 3D 추출 (원본 자동 다운로드)'}
                         </Button>
                       </div>
                     </div>
+
+                    {/* 🌟 지붕 모서리 A/B/C/D 상세입력 — 추정을 한 번이라도 실행했을 때만 표시.
+                        4칸 전부 채우면 보간 지붕, 하나라도 비우면 평지붕 기본값으로 추출됨. */}
+                    {roofLabelMap && (
+                      <div className="w-full flex flex-wrap items-center gap-3 mb-4 bg-amber-50 border border-amber-200 rounded-xl p-3">
+                        <span className="text-xs font-bold text-amber-700 shrink-0">
+                          🏠 지붕 모서리 높이(m) — 카메라와 가까운 순 A→D, 4칸 다 채우면 보간 적용:
+                        </span>
+                        {['A', 'B', 'C', 'D'].map(letter => (
+                          <label key={letter} className="flex items-center gap-1 text-sm">
+                            <span className="font-bold text-amber-800">{letter}</span>
+                            <input
+                              type="number"
+                              step="0.1"
+                              value={roofCorners[letter]}
+                              onChange={e => setRoofCorners(prev => ({ ...prev, [letter]: e.target.value }))}
+                              className="w-20 px-2 py-1 border border-amber-300 rounded-md text-sm"
+                            />
+                          </label>
+                        ))}
+                        <Button
+                          variant="secondary"
+                          onClick={() => setRoofCorners({ A: '', B: '', C: '', D: '' })}
+                        >
+                          비우기(평지붕으로)
+                        </Button>
+                      </div>
+                    )}
 
                     {/* 🌟 크롭(박스) 에디터 영역 */}
                     <div className="relative inline-block border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl select-none">

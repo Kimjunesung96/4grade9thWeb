@@ -12,31 +12,23 @@ from PIL import Image
 
 app = FastAPI()
 
-# 리액트(Vite) 프론트엔드에서 API를 호출할 수 있도록 CORS 허용 세팅
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 실제 배포 시에는 "http://localhost:5173" 등으로 제한
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ====================================================================
-# 🌟 콜랍에서 띄운 ngrok 주소. 콜랍 노트북을 다시 켤 때마다 바뀌니
-#    매번 여기를 갱신해줘야 합니다!
-# ====================================================================
 COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
 
-MAX_BLOCKS = 10000          # 유니티 렌더링 한도 (블록 렌더링 X / 10,000 MAX)
-GRID_PITCH = 3.0            # 기존 스케일 약속: 3유닛 = 15cm
-UNITS_PER_METER = 20.0      # 1m = 20유닛 (3유닛=15cm 이므로 1m = 6.667*3유닛 -> 20유닛)
+MAX_BLOCKS = 10000
+GRID_PITCH = 3.0
+UNITS_PER_METER = 20.0
+APPLY_TILT_FIX = True   # False로 바꾸면 기울기 보정 끄기 (A/B 비교용)
 
 
 def format_id(val):
-    """
-    JS의 formatID 완벽 재현!
-    소수점을 10배수로 날리고 015, -105 형태로 포맷팅합니다.
-    """
     abs_val = round(abs(val))
     sign = "-" if val < 0 else "0"
     return f"{sign}{str(abs_val).zfill(3)}"
@@ -57,51 +49,114 @@ def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
     return mesh
 
 
+def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
+                    bins=24, min_deg=0.5, max_deg=30.0):
+    """
+    건물 중간 구간(높이 20~80%)의 층별 중심점을 이어 '쏠린 정도(기울기)'를 구하고,
+    그만큼 되돌려 건물을 똑바로 세운다.
+      mode="shear"  : 각 높이의 층을 옆으로 밀어 중심선을 수직으로 (층은 수평 유지) ← 블록 변환용 기본값
+      mode="rotate" : 메쉬 전체를 회전 (건물 전체가 통째로 기운 경우)
+    기울기가 너무 작거나(min_deg) 너무 크면(max_deg, 추정 실패로 판단) 원본 유지.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    up = up_axis_idx
+    hor = [i for i in range(3) if i != up]
+    h = verts[:, up]
+    h_min, h_max = h.min(), h.max()
+    H = h_max - h_min
+    if H < 1e-6:
+        return mesh
+
+    # 1. 높이 구간별 중심점
+    edges = np.linspace(h_min + low * H, h_min + high * H, bins + 1)
+    ys, cs = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (h >= a) & (h < b)
+        if m.sum() < 20:
+            continue
+        ys.append(h[m].mean())
+        cs.append(verts[m][:, hor].mean(axis=0))
+    if len(ys) < 5:
+        print("📏 기울기 보정 건너뜀: 중심점이 부족함")
+        return mesh
+    ys, cs = np.array(ys), np.array(cs)
+
+    # 2. 두 수평축 각각 직선 피팅 (튀는 점 1회 제거)
+    slopes = []
+    for j in range(2):
+        k, b0 = np.polyfit(ys, cs[:, j], 1)
+        res = cs[:, j] - (k * ys + b0)
+        keep = np.abs(res) <= max(2 * res.std(), 1e-9)
+        if keep.sum() >= 4:
+            k, b0 = np.polyfit(ys[keep], cs[keep, j], 1)
+        slopes.append(k)
+    slopes = np.array(slopes)
+    tilt = float(np.degrees(np.arctan(np.linalg.norm(slopes))))
+
+    if tilt < min_deg or tilt > max_deg:
+        print(f"📏 기울기 보정 건너뜀: 기울기 {tilt:.2f}° (허용 {min_deg}~{max_deg}° 밖)")
+        return mesh
+
+    # 3. 되돌리기
+    if mode == "rotate":
+        u = np.zeros(3)
+        u[up] = 1.0
+        u[hor] = slopes
+        u /= np.linalg.norm(u)
+        t = np.zeros(3)
+        t[up] = 1.0
+        v = np.cross(u, t)
+        c = float(np.dot(u, t))
+        s = float(np.linalg.norm(v))
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+        pivot = verts[h <= h_min + 0.02 * H].mean(axis=0)   # 바닥 중심 기준
+        verts = (verts - pivot) @ R.T + pivot
+    else:
+        verts[:, hor] -= np.outer(h - h_min, slopes)         # 바닥은 고정, 위로 갈수록 되밀기
+
+    mesh.vertices = verts
+    print(f"📏 기울기 보정: {tilt:.2f}° 되돌림 ({mode})")
+    return mesh
+
+
 def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
-    """
-    🌟 건프라 축소 비율 방식: 건물 표면적에 맞춰 블록 크기(pitch)를 역산해서,
-    랜덤 솎아내기 없이 max_blocks 예산 안에서 표면 전체를 빈틈없이 덮습니다.
-    """
-    # 0. 🌟 축 보정: range가 제일 큰 축 = 실제 "높이"라고 보고, 그 축을 Y로 맞춤
-    #    (고정 90도 보정 대신, TripoSR 결과물 방향이 들쭉날쭉해도 항상 맞도록 자동 판별)
-    extents = mesh.bounds[1] - mesh.bounds[0]  # [x_range, y_range, z_range]
+    extents = mesh.bounds[1] - mesh.bounds[0]
     tallest_axis = int(np.argmax(extents))
 
-    if tallest_axis == 2:  # 높이가 Z축 -> X축 기준 -90도 회전해서 Y로
+    if tallest_axis == 2:
         rot = trimesh.transformations.rotation_matrix(
             angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
         )
         mesh.apply_transform(rot)
-    elif tallest_axis == 0:  # 높이가 X축 -> Z축 기준 90도 회전해서 Y로
+    elif tallest_axis == 0:
         rot = trimesh.transformations.rotation_matrix(
             angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
         )
         mesh.apply_transform(rot)
-    # tallest_axis == 1이면 이미 Y축이 높이니까 회전 안 함
 
-    # 🌟 앞뒤(Z축) 반전 보정: TripoSR/GLB 결과물이 항상 앞뒤가 뒤집혀서 나오므로
-    #    여기서 실제 메시 좌표 자체를 거울처럼 뒤집어서 CSV/미리보기가 처음부터 올바르게 나오게 함.
-    #    (프론트엔드에서 화면용으로 임시로 뒤집던 방식은 제거했음 — 이제 데이터 자체가 정답)
     mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
     mesh.apply_transform(mirror)
-    mesh.invert()  # 미러링하면 face winding이 뒤집혀서 법선이 반대로 계산됨 → 다시 뒤집어서 복구
+    mesh.invert()
 
     print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
 
-    # 1. AI가 만든 메시는 임의 크기라, 사용자가 입력한 실제 건물 높이에 맞춰 스케일 보정
+    # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
+    #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
+    if APPLY_TILT_FIX:
+        mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
+
     mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
     if mesh_height_raw <= 0:
         raise ValueError("메시 높이를 계산할 수 없습니다 (생성된 메시가 비정상일 수 있음)")
 
     target_height_units = real_height_m * UNITS_PER_METER
     mesh.apply_scale(target_height_units / mesh_height_raw)
-    mesh.apply_translation([0, -mesh.bounds[0][1], 0])  # 바닥을 Y=0(유니티 그라운드)에 맞춤
+    mesh.apply_translation([0, -mesh.bounds[0][1], 0])
 
     surface_area = mesh.area
     pitch = max(GRID_PITCH, round(((surface_area / max_blocks) ** 0.5) / GRID_PITCH) * GRID_PITCH)
 
-
-    # 2. 안전장치: 예산을 넘기면 랜덤 제거 대신 pitch를 키워 재시도 (균일 압축 유지, 구멍 방지)
     raw_blocks = []
     for attempt in range(5):
         estimated_cells = surface_area / (pitch ** 2)
@@ -116,8 +171,6 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
             grid_y = round((y - 1.5) / pitch)
             grid_z = round((z - 1.5) / pitch)
 
-            # 🌟 칸 번호(grid_x/y/z)는 그대로 유지, 저장 좌표는 항상 GRID_PITCH(3)로 압축
-            #    → 점 개수/모양은 안 바뀌고, 점들 사이 실제 거리만 좁아짐 (유니티 코드 안 건드려도 됨)
             pos_x = grid_x * GRID_PITCH + 1.5
             pos_y = grid_y * GRID_PITCH + 1.5
             pos_z = grid_z * GRID_PITCH + 1.5
@@ -130,7 +183,6 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
                 continue
             seen_ids.add(block_id)
 
-            # 표면 법선의 Y성분으로 바닥/지붕(Floor) vs 벽(Wall) 자동 판정
             block_type = "Floor" if abs(normal[1]) > 0.7 else "Wall"
 
             raw_blocks.append({
@@ -151,9 +203,189 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
         print(f"📐 시도 {attempt + 1}: pitch={pitch} → {len(raw_blocks)}개 블록")
         if len(raw_blocks) <= max_blocks:
             break
-        pitch += GRID_PITCH  # 넘쳤으면 한 칸 더 키워서 재시도
+        pitch += GRID_PITCH
 
     return raw_blocks
+
+
+# ====================================================================
+# 🌟 지붕 모서리 A/B/C/D 자동 추정 (카메라와의 수평 거리 기준 정렬)
+# ====================================================================
+def order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max):
+    """
+    지붕 4개 모서리를 카메라와 가까운 순서대로 A→D 로 라벨링.
+    - 거리 판정은 X,Z 평면(수평)만 사용. Y(높이)는 결과값이라 거리 계산에서 반드시 제외.
+    - main.py의 미러링 보정 이후 좌표계 기준, Z가 큰 쪽이 카메라(정면)에 가깝다고 가정.
+    """
+    verts = mesh.vertices
+    y_max = verts[:, 1].max()
+    y_min = verts[:, 1].min()
+    roof_mask = verts[:, 1] >= y_max - (y_max - y_min) * 0.10
+    roof_verts = verts[roof_mask]
+
+    if len(roof_verts) == 0:
+        roof_verts = verts  # 안전장치: 지붕 영역이 안 잡히면 전체 정점으로 대체
+
+    corners_xz = {
+        "TL": (x_min, z_min),
+        "TR": (x_max, z_min),
+        "BL": (x_min, z_max),
+        "BR": (x_max, z_max),
+    }
+
+    corner_info = {}
+    for key, (cx, cz) in corners_xz.items():
+        # 1. 이 모서리 위치(cx, cz)에 가장 가까운 실제 지붕 꼭짓점 찾기 (X,Z만 비교)
+        dists_to_corner = np.hypot(roof_verts[:, 0] - cx, roof_verts[:, 2] - cz)
+        nearest = roof_verts[dists_to_corner.argmin()]
+        corner_info[key] = {
+            "pos": (float(nearest[0]), float(nearest[1]), float(nearest[2])),
+        }
+
+    # 2. 카메라(정면, Z가 큰 방향)에 가까운 순서로 정렬 — Z값 큰 것부터
+    ordered_keys = sorted(corner_info.keys(), key=lambda k: -corner_info[k]["pos"][2])
+
+    label_map = {}
+    for i, key in enumerate(ordered_keys):
+        letter = chr(ord("A") + i)  # A, B, C, D
+        label_map[letter] = {
+            "original_position": key,
+            "estimated_height_m": round(corner_info[key]["pos"][1] / UNITS_PER_METER, 2),
+        }
+    return label_map
+
+
+# ====================================================================
+# 🌟 지붕 높이 보정: 평지붕(기본값) 또는 4개 모서리 보간(상세입력)
+# ====================================================================
+def _make_fill_block(pos_x: float, pos_y: float, pos_z: float, block_type: str, seen_ids: set):
+    """roof 보정으로 뜬 틈을 메울 Wall 블록 하나 생성. 이미 그 자리에 블록이 있으면 None."""
+    id_x = format_id(pos_x * 10)
+    id_z = format_id(pos_z * 10)
+    id_y = format_id(pos_y * 10)
+    block_id = f"{id_x}_{id_z}_{id_y}"
+    if block_id in seen_ids:
+        return None
+    seen_ids.add(block_id)
+    return {
+        "BlockID": block_id,
+        "PosX": round(pos_x, 2),
+        "PosY": round(pos_y, 2),
+        "PosZ": round(pos_z, 2),
+        "Stress": 0.00,
+        "RiskLevel": "Safe",
+        "Prescription": "N",
+        "Material": "Default",
+        "Tensile": 400.0,
+        "Compressive": 400.0,
+        "Tool": "Existing",
+        "Type": block_type,
+    }
+
+
+def apply_roof_correction(raw_blocks: list, corner_heights: dict | None = None):
+    """
+    corner_heights가 없으면(아무 입력 없음): 모서리 4개 높이가 같다고 가정 → 평지붕으로 강제.
+    corner_heights가 있으면: {"tl":.., "tr":.., "bl":.., "br":..} (미터) 로 bilinear interpolation.
+
+    🌟 Floor 블록을 새 높이로 옮기기만 하면 옛 높이와 새 높이 사이가 뚫려서
+       "몸체와 분리된 지붕(뚜껑)"이 생긴다. 그 틈을 Wall 블록으로 채워서 이어준다.
+    """
+    if not raw_blocks:
+        return raw_blocks
+
+    xs = [b["PosX"] for b in raw_blocks]
+    zs = [b["PosZ"] for b in raw_blocks]
+    ys = [b["PosY"] for b in raw_blocks]
+    x_min, x_max = min(xs), max(xs)
+    z_min, z_max = min(zs), max(zs)
+    y_max, y_min = max(ys), min(ys)
+
+    roof_threshold = y_max - (y_max - y_min) * 0.10
+    roof_blocks = [b for b in raw_blocks if b["Type"] == "Floor" and b["PosY"] >= roof_threshold]
+    roof_ids = {id(b) for b in roof_blocks}
+    other_blocks = [b for b in raw_blocks if id(b) not in roof_ids]
+
+    if not roof_blocks:
+        return raw_blocks
+
+    seen_ids = {b["BlockID"] for b in raw_blocks}
+
+    if corner_heights is None:
+        def target_height(x, z):
+            return round(y_max, 2)
+        print(f"🏠 지붕 상세입력 없음 → 모서리 4개 동일 높이({round(y_max, 2)})로 평지붕 보정")
+    else:
+        tl = corner_heights["tl"] * UNITS_PER_METER
+        tr = corner_heights["tr"] * UNITS_PER_METER
+        bl = corner_heights["bl"] * UNITS_PER_METER
+        br = corner_heights["br"] * UNITS_PER_METER
+
+        def target_height(x, z):
+            u = 0.0 if x_max == x_min else (x - x_min) / (x_max - x_min)
+            v = 0.0 if z_max == z_min else (z - z_min) / (z_max - z_min)
+            top = tl + (tr - tl) * u
+            bot = bl + (br - bl) * u
+            return round(top + (bot - top) * v, 2)
+        print(f"🏠 모서리 4개 입력값으로 지붕 보간 완료 (tl={tl}, tr={tr}, bl={bl}, br={br})")
+
+    fill_blocks = []
+    for b in roof_blocks:
+        old_y = b["PosY"]
+        new_y = target_height(b["PosX"], b["PosZ"])
+
+        if new_y > old_y:
+            # 옛 지붕 높이 → 새 지붕 높이 사이를 Wall로 채워서 몸체와 연결
+            y = old_y + GRID_PITCH
+            while y < new_y - 1e-6:
+                fb = _make_fill_block(b["PosX"], y, b["PosZ"], "Wall", seen_ids)
+                if fb:
+                    fill_blocks.append(fb)
+                y += GRID_PITCH
+        elif new_y < old_y:
+            # 지붕을 낮추는 경우: 원래 위치를 Wall로 남겨서 단면이 뚫리지 않게 함
+            fb = _make_fill_block(b["PosX"], old_y, b["PosZ"], "Wall", seen_ids)
+            if fb:
+                fill_blocks.append(fb)
+
+        b["PosY"] = new_y
+
+    return other_blocks + roof_blocks + fill_blocks
+
+
+# ====================================================================
+# 🌟 새 엔드포인트: 지붕 모서리 A/B/C/D 자동 추정 (박스 드래그 직후 프론트에서 호출)
+# ====================================================================
+@app.post("/api/estimate-roof-corners")
+async def estimate_roof_corners(
+    file: UploadFile = File(...),
+    startX: float = Form(...),
+    startY: float = Form(...),
+    endX: float = Form(...),
+    endY: float = Form(...),
+):
+    img_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"이미지를 읽을 수 없습니다: {e}")
+
+    sx, sy = max(0, int(startX)), max(0, int(startY))
+    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
+    cropped = image.crop((sx, sy, ex, ey))
+
+    crop_bytes_io = io.BytesIO()
+    cropped.save(crop_bytes_io, format="PNG")
+    crop_bytes = crop_bytes_io.getvalue()
+
+    mesh = get_mesh_from_colab(crop_bytes)
+
+    x_min, x_max = float(mesh.bounds[0][0]), float(mesh.bounds[1][0])
+    z_min, z_max = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
+
+    label_map = order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max)
+    return label_map
+    # 예: {"A": {"original_position": "BR", "estimated_height_m": 12.3}, "B": {...}, "C": {...}, "D": {...}}
 
 
 @app.post("/api/extract-3d-csv")
@@ -164,10 +396,14 @@ async def extract_3d_csv(
     endX: float = Form(...),
     endY: float = Form(...),
     realHeightMeters: float = Form(...),
+    # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
+    roofTL: float | None = Form(None),
+    roofTR: float | None = Form(None),
+    roofBL: float | None = Form(None),
+    roofBR: float | None = Form(None),
 ):
     print(f"📥 사진 데이터 및 박스 좌표 수신: ({startX}, {startY}) ~ ({endX}, {endY}) | 실제 높이: {realHeightMeters}m")
 
-    # 1. 이미지 로드 (박스 영역만 잘라서 콜랍으로 보내면 결과가 더 정확함)
     img_bytes = await file.read()
     try:
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -185,22 +421,24 @@ async def extract_3d_csv(
     cropped.save(crop_bytes_io, format="PNG")
     crop_bytes = crop_bytes_io.getvalue()
 
-    # 2. 콜랍 TripoSR 모델로 단일 사진 → 3D 메시 생성 (뒷면/옆면까지 AI가 추론)
     print("🤖 콜랍 AI 모델에 메시 생성 요청 중...")
     mesh = get_mesh_from_colab(crop_bytes)
     print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
 
-    # 3. 메시를 실제 크기로 스케일 보정 후, 표면(겉면)만 빈틈없이 블록화
     raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
 
-    # 4. Pandas 데이터프레임화
+    # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
+    corner_heights = None
+    if None not in (roofTL, roofTR, roofBL, roofBR):
+        corner_heights = {"tl": roofTL, "tr": roofTR, "bl": roofBL, "br": roofBR}
+    raw_blocks = apply_roof_correction(raw_blocks, corner_heights)
+
     df = pd.DataFrame(raw_blocks)
     df = df.drop_duplicates(subset=["BlockID"])
     df = df.sort_values(by=["PosZ", "PosX", "PosY"])
 
     print(f"✅ 총 {len(df)}개의 3D 빌딩 블록 엑셀 변환 완료! (속은 비어있는 표면 전용 구조)")
 
-    # 5. CSV 스트리밍 반환
     output = io.StringIO()
     df.to_csv(output, index=False)
     output.seek(0)
