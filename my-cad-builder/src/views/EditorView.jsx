@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import Button from '../components/ui/Button';
 import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, getCombinedFloors, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
+import BlockEditor3D from '../components/BlockEditor3D';
 
 // 🌟 기입 완료된 모든 페이지(stackedFloors) + 현재 그리는 중인 페이지(grid)를 합쳐서
 //    LiveDemoViewer가 그릴 수 있는 블록 배열({x,y,z,color,mat})로 변환
@@ -295,6 +296,7 @@ export default function EditorView({
 
   // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
   const [editorTab, setEditorTab] = useState('grid');
+  const [showBlockEditor, setShowBlockEditor] = useState(false); // 블록 편집기(선택/삭제/케이지 변형)
 
   // ===================== 🌟 CSV → 정밀 격자 불러오기 (신규) =====================
   // 웹에서 받은 3D CSV(PosX/PosY/PosZ)를 5층 단위 페이지로 쪼개서
@@ -932,6 +934,7 @@ export default function EditorView({
                     </div>
 
                     <div className="flex items-center gap-2 flex-wrap">
+                      <Button variant="secondary" onClick={() => setShowBlockEditor(true)}>🧱 블록 편집기</Button>
                       <Button variant="secondary" onClick={handleDownloadOriginal}>📥 원본 다운로드</Button>
                       <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(화면+225°) 다운로드</Button>
                       <Button variant="dark" onClick={handleDownloadFloorPagesPngs}>🗂️ 층별 PNG 분할 다운로드 (5층씩)</Button>
@@ -964,6 +967,14 @@ export default function EditorView({
         </div>
 
       </div>
+
+      {showBlockEditor && (
+        <BlockEditor3D
+          blocks={extracted3DData}
+          onApply={(b) => { setExtracted3DData(b); setShowBlockEditor(false); }}
+          onClose={() => setShowBlockEditor(false)}
+        />
+      )}
     </div>
   );
 }

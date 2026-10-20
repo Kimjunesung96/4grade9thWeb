@@ -200,16 +200,29 @@ export default function App() {
     }
   };
 
-  const handleAddComment = (bpId) => {
-    if (!commentInput.trim() || !user) return;
-    const newComment = {
-      id: Date.now(),
-      username: user.username,
-      content: commentInput,
-      created_at: new Date().toISOString()
-    };
-    const currentComments = commentsData[bpId] || [];
-    setCommentsData({ ...commentsData, [bpId]: [...currentComments, newComment] });
+  useEffect(() => {
+    if (!selectedBp?.id) return;
+    const bpId = selectedBp.id;
+    supabase.from('comments')
+      .select('id, content, created_at, user_id, users(username)')
+      .eq('blueprint_id', bpId)
+      .order('created_at', { ascending: true })
+      .then(({ data, error }) => {
+        if (error) { console.error('댓글 불러오기 실패:', error.message); return; }
+        const mapped = (data || []).map(c => ({ ...c, username: c.users?.username }));
+        setCommentsData(prev => ({ ...prev, [bpId]: mapped }));
+      });
+  }, [selectedBp?.id]);
+
+  const handleAddComment = async (bpId) => {
+    if (!commentInput.trim()) return;
+    if (!user) { alert('댓글은 로그인 후에 작성할 수 있습니다.'); return; }
+    const { data, error } = await supabase.from('comments')
+      .insert([{ blueprint_id: bpId, user_id: user.id, content: commentInput }])
+      .select('id, content, created_at, user_id')
+      .single();
+    if (error) { alert('댓글 저장 실패: ' + error.message); return; }
+    setCommentsData(prev => ({ ...prev, [bpId]: [...(prev[bpId] || []), { ...data, username: user.username }] }));
     setCommentInput('');
   };
 

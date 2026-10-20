@@ -25,6 +25,7 @@ COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh
 MAX_BLOCKS = 10000
 GRID_PITCH = 3.0
 UNITS_PER_METER = 20.0
+APPLY_TILT_FIX = True   # False로 바꾸면 기울기 보정 끄기 (A/B 비교용)
 
 
 def format_id(val):
@@ -48,6 +49,77 @@ def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
     return mesh
 
 
+def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
+                    bins=24, min_deg=0.5, max_deg=30.0):
+    """
+    건물 중간 구간(높이 20~80%)의 층별 중심점을 이어 '쏠린 정도(기울기)'를 구하고,
+    그만큼 되돌려 건물을 똑바로 세운다.
+      mode="shear"  : 각 높이의 층을 옆으로 밀어 중심선을 수직으로 (층은 수평 유지) ← 블록 변환용 기본값
+      mode="rotate" : 메쉬 전체를 회전 (건물 전체가 통째로 기운 경우)
+    기울기가 너무 작거나(min_deg) 너무 크면(max_deg, 추정 실패로 판단) 원본 유지.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    up = up_axis_idx
+    hor = [i for i in range(3) if i != up]
+    h = verts[:, up]
+    h_min, h_max = h.min(), h.max()
+    H = h_max - h_min
+    if H < 1e-6:
+        return mesh
+
+    # 1. 높이 구간별 중심점
+    edges = np.linspace(h_min + low * H, h_min + high * H, bins + 1)
+    ys, cs = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (h >= a) & (h < b)
+        if m.sum() < 20:
+            continue
+        ys.append(h[m].mean())
+        cs.append(verts[m][:, hor].mean(axis=0))
+    if len(ys) < 5:
+        print("📏 기울기 보정 건너뜀: 중심점이 부족함")
+        return mesh
+    ys, cs = np.array(ys), np.array(cs)
+
+    # 2. 두 수평축 각각 직선 피팅 (튀는 점 1회 제거)
+    slopes = []
+    for j in range(2):
+        k, b0 = np.polyfit(ys, cs[:, j], 1)
+        res = cs[:, j] - (k * ys + b0)
+        keep = np.abs(res) <= max(2 * res.std(), 1e-9)
+        if keep.sum() >= 4:
+            k, b0 = np.polyfit(ys[keep], cs[keep, j], 1)
+        slopes.append(k)
+    slopes = np.array(slopes)
+    tilt = float(np.degrees(np.arctan(np.linalg.norm(slopes))))
+
+    if tilt < min_deg or tilt > max_deg:
+        print(f"📏 기울기 보정 건너뜀: 기울기 {tilt:.2f}° (허용 {min_deg}~{max_deg}° 밖)")
+        return mesh
+
+    # 3. 되돌리기
+    if mode == "rotate":
+        u = np.zeros(3)
+        u[up] = 1.0
+        u[hor] = slopes
+        u /= np.linalg.norm(u)
+        t = np.zeros(3)
+        t[up] = 1.0
+        v = np.cross(u, t)
+        c = float(np.dot(u, t))
+        s = float(np.linalg.norm(v))
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+        pivot = verts[h <= h_min + 0.02 * H].mean(axis=0)   # 바닥 중심 기준
+        verts = (verts - pivot) @ R.T + pivot
+    else:
+        verts[:, hor] -= np.outer(h - h_min, slopes)         # 바닥은 고정, 위로 갈수록 되밀기
+
+    mesh.vertices = verts
+    print(f"📏 기울기 보정: {tilt:.2f}° 되돌림 ({mode})")
+    return mesh
+
+
 def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
     extents = mesh.bounds[1] - mesh.bounds[0]
     tallest_axis = int(np.argmax(extents))
@@ -68,6 +140,11 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
     mesh.invert()
 
     print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
+
+    # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
+    #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
+    if APPLY_TILT_FIX:
+        mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
 
     mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
     if mesh_height_raw <= 0:
@@ -181,10 +258,38 @@ def order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max):
 # ====================================================================
 # 🌟 지붕 높이 보정: 평지붕(기본값) 또는 4개 모서리 보간(상세입력)
 # ====================================================================
+def _make_fill_block(pos_x: float, pos_y: float, pos_z: float, block_type: str, seen_ids: set):
+    """roof 보정으로 뜬 틈을 메울 Wall 블록 하나 생성. 이미 그 자리에 블록이 있으면 None."""
+    id_x = format_id(pos_x * 10)
+    id_z = format_id(pos_z * 10)
+    id_y = format_id(pos_y * 10)
+    block_id = f"{id_x}_{id_z}_{id_y}"
+    if block_id in seen_ids:
+        return None
+    seen_ids.add(block_id)
+    return {
+        "BlockID": block_id,
+        "PosX": round(pos_x, 2),
+        "PosY": round(pos_y, 2),
+        "PosZ": round(pos_z, 2),
+        "Stress": 0.00,
+        "RiskLevel": "Safe",
+        "Prescription": "N",
+        "Material": "Default",
+        "Tensile": 400.0,
+        "Compressive": 400.0,
+        "Tool": "Existing",
+        "Type": block_type,
+    }
+
+
 def apply_roof_correction(raw_blocks: list, corner_heights: dict | None = None):
     """
     corner_heights가 없으면(아무 입력 없음): 모서리 4개 높이가 같다고 가정 → 평지붕으로 강제.
     corner_heights가 있으면: {"tl":.., "tr":.., "bl":.., "br":..} (미터) 로 bilinear interpolation.
+
+    🌟 Floor 블록을 새 높이로 옮기기만 하면 옛 높이와 새 높이 사이가 뚫려서
+       "몸체와 분리된 지붕(뚜껑)"이 생긴다. 그 틈을 Wall 블록으로 채워서 이어준다.
     """
     if not raw_blocks:
         return raw_blocks
@@ -198,34 +303,54 @@ def apply_roof_correction(raw_blocks: list, corner_heights: dict | None = None):
 
     roof_threshold = y_max - (y_max - y_min) * 0.10
     roof_blocks = [b for b in raw_blocks if b["Type"] == "Floor" and b["PosY"] >= roof_threshold]
-    other_blocks = [b for b in raw_blocks if b not in roof_blocks]
+    roof_ids = {id(b) for b in roof_blocks}
+    other_blocks = [b for b in raw_blocks if id(b) not in roof_ids]
 
     if not roof_blocks:
         return raw_blocks
 
+    seen_ids = {b["BlockID"] for b in raw_blocks}
+
     if corner_heights is None:
-        flat_y = round(y_max, 2)
-        for b in roof_blocks:
-            b["PosY"] = flat_y
-        print(f"🏠 지붕 상세입력 없음 → 모서리 4개 동일 높이({flat_y})로 평지붕 보정")
+        def target_height(x, z):
+            return round(y_max, 2)
+        print(f"🏠 지붕 상세입력 없음 → 모서리 4개 동일 높이({round(y_max, 2)})로 평지붕 보정")
     else:
         tl = corner_heights["tl"] * UNITS_PER_METER
         tr = corner_heights["tr"] * UNITS_PER_METER
         bl = corner_heights["bl"] * UNITS_PER_METER
         br = corner_heights["br"] * UNITS_PER_METER
 
-        def interp_height(x, z):
+        def target_height(x, z):
             u = 0.0 if x_max == x_min else (x - x_min) / (x_max - x_min)
             v = 0.0 if z_max == z_min else (z - z_min) / (z_max - z_min)
             top = tl + (tr - tl) * u
             bot = bl + (br - bl) * u
-            return top + (bot - top) * v
-
-        for b in roof_blocks:
-            b["PosY"] = round(interp_height(b["PosX"], b["PosZ"]), 2)
+            return round(top + (bot - top) * v, 2)
         print(f"🏠 모서리 4개 입력값으로 지붕 보간 완료 (tl={tl}, tr={tr}, bl={bl}, br={br})")
 
-    return other_blocks + roof_blocks
+    fill_blocks = []
+    for b in roof_blocks:
+        old_y = b["PosY"]
+        new_y = target_height(b["PosX"], b["PosZ"])
+
+        if new_y > old_y:
+            # 옛 지붕 높이 → 새 지붕 높이 사이를 Wall로 채워서 몸체와 연결
+            y = old_y + GRID_PITCH
+            while y < new_y - 1e-6:
+                fb = _make_fill_block(b["PosX"], y, b["PosZ"], "Wall", seen_ids)
+                if fb:
+                    fill_blocks.append(fb)
+                y += GRID_PITCH
+        elif new_y < old_y:
+            # 지붕을 낮추는 경우: 원래 위치를 Wall로 남겨서 단면이 뚫리지 않게 함
+            fb = _make_fill_block(b["PosX"], old_y, b["PosZ"], "Wall", seen_ids)
+            if fb:
+                fill_blocks.append(fb)
+
+        b["PosY"] = new_y
+
+    return other_blocks + roof_blocks + fill_blocks
 
 
 # ====================================================================

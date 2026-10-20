@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import Button from '../components/ui/Button';
 import { exportToPNG, exportStackedFloorsToCSV, getNextPageBase, getCombinedFloors, importPNGToGrid, getCellColorClass, FLOOR_COLORS, formatID, downloadFloorPagesAsZip, downloadPagesAsPngOrZip, csvDataToFloorPages } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
+import BlockEditor3D from '../components/BlockEditor3D';
 
 // 🌟 기입 완료된 모든 페이지(stackedFloors) + 현재 그리는 중인 페이지(grid)를 합쳐서
 //    LiveDemoViewer가 그릴 수 있는 블록 배열({x,y,z,color,mat})로 변환
@@ -295,6 +296,7 @@ export default function EditorView({
 
   // ⭐ 왼쪽 패널 탭 모드 ('grid' = 수동 제작, 'photo' = AI 사진 추출)
   const [editorTab, setEditorTab] = useState('grid');
+  const [showBlockEditor, setShowBlockEditor] = useState(false); // 블록 편집기(선택/삭제/케이지 변형)
 
   // ===================== 🌟 CSV → 정밀 격자 불러오기 (신규) =====================
   // 웹에서 받은 3D CSV(PosX/PosY/PosZ)를 5층 단위 페이지로 쪼개서
@@ -339,6 +341,12 @@ export default function EditorView({
   const [snapshots, setSnapshots] = useState([]); // 3스냅샷 제한 관리
   const [isExtracting, setIsExtracting] = useState(false);
   const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
+
+  // 🌟 지붕 모서리 A/B/C/D 상세입력 — 4개 다 채워야 보간, 하나라도 비어있으면 평지붕 기본값
+  const [roofLabelMap, setRoofLabelMap] = useState(null); // /api/estimate-roof-corners 응답: {A:{original_position,estimated_height_m}, ...}
+  const [roofCorners, setRoofCorners] = useState({ A: '', B: '', C: '', D: '' });
+  const [isEstimatingRoof, setIsEstimatingRoof] = useState(false);
+
   const imgRef = useRef(null); // 이미지 태그의 실제 크기를 구하기 위함
   const csvUploadRef = useRef(null);
 
@@ -464,6 +472,49 @@ export default function EditorView({
       setImageFile(file);
       setImageSrc(URL.createObjectURL(file));
       setBox(null);
+      setRoofLabelMap(null); // 🌟 새 사진 → 이전 지붕 추정값 무효화
+      setRoofCorners({ A: '', B: '', C: '', D: '' });
+    }
+  };
+
+  // 1.5 지붕 모서리 A/B/C/D 자동 추정 (박스 드래그 완료 후 호출)
+  const handleEstimateRoofCorners = async () => {
+    if (!box || !imageFile) return;
+    setIsEstimatingRoof(true);
+    try {
+      const scaleX = imgRef.current.naturalWidth / imgRef.current.width;
+      const scaleY = imgRef.current.naturalHeight / imgRef.current.height;
+      const realStartX = Math.min(box.startX, box.endX) * scaleX;
+      const realStartY = Math.min(box.startY, box.endY) * scaleY;
+      const realEndX = Math.max(box.startX, box.endX) * scaleX;
+      const realEndY = Math.max(box.startY, box.endY) * scaleY;
+
+      const formData = new FormData();
+      formData.append('file', imageFile);
+      formData.append('startX', realStartX);
+      formData.append('startY', realStartY);
+      formData.append('endX', realEndX);
+      formData.append('endY', realEndY);
+
+      const response = await fetch('http://localhost:8000/api/estimate-roof-corners', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) throw new Error('지붕 모서리 추정 실패');
+
+      const labelMap = await response.json(); // {A:{original_position, estimated_height_m}, B:{...}, ...}
+      setRoofLabelMap(labelMap);
+      // 추정값으로 입력칸 프리필 (사용자가 그대로 쓰거나 수정 가능)
+      setRoofCorners({
+        A: labelMap.A?.estimated_height_m ?? '',
+        B: labelMap.B?.estimated_height_m ?? '',
+        C: labelMap.C?.estimated_height_m ?? '',
+        D: labelMap.D?.estimated_height_m ?? '',
+      });
+    } catch (err) {
+      alert('지붕 모서리 추정에 실패했습니다: ' + err.message);
+    } finally {
+      setIsEstimatingRoof(false);
     }
   };
 
@@ -488,6 +539,25 @@ export default function EditorView({
       formData.append('endX', realEndX);
       formData.append('endY', realEndY);
       formData.append('realHeightMeters', realHeightMeters);
+
+      // 🌟 지붕 A/B/C/D 4개 값이 전부 입력돼 있으면, 추정 시 받은 original_position(TL/TR/BL/BR)
+      //    매핑을 그대로 이용해 서버가 기대하는 roofTL/TR/BL/BR 슬롯에 넣어 보낸다.
+      //    하나라도 비어있거나 추정을 안 했으면 아무것도 안 보내서 서버가 평지붕 기본값으로 처리하게 둔다.
+      const cornerValues = { A: roofCorners.A, B: roofCorners.B, C: roofCorners.C, D: roofCorners.D };
+      const allFilled = Object.values(cornerValues).every(v => v !== '' && v !== null && !Number.isNaN(Number(v)));
+      if (roofLabelMap && allFilled) {
+        const bySlot = {}; // 'TL'|'TR'|'BL'|'BR' -> 미터값
+        for (const letter of ['A', 'B', 'C', 'D']) {
+          const slot = roofLabelMap[letter]?.original_position;
+          if (slot) bySlot[slot] = Number(cornerValues[letter]);
+        }
+        if (['TL', 'TR', 'BL', 'BR'].every(slot => slot in bySlot)) {
+          formData.append('roofTL', bySlot.TL);
+          formData.append('roofTR', bySlot.TR);
+          formData.append('roofBL', bySlot.BL);
+          formData.append('roofBR', bySlot.BR);
+        }
+      }
 
       const response = await fetch('http://localhost:8000/api/extract-3d-csv', {
         method: 'POST',
@@ -776,12 +846,43 @@ export default function EditorView({
                           onChange={e => setRealHeightMeters(e.target.value)}
                           className="w-28 px-2 py-2 border border-gray-300 rounded-md text-sm"
                         />
-                        <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); }}>취소</Button>
+                        <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); setRoofLabelMap(null); setRoofCorners({ A: '', B: '', C: '', D: '' }); }}>취소</Button>
+                        <Button variant="dark" onClick={handleEstimateRoofCorners} disabled={!box || isEstimatingRoof}>
+                          {isEstimatingRoof ? '추정 중...⏳' : '🏠 지붕 모서리 추정'}
+                        </Button>
                         <Button variant="primary" onClick={handleExtract3D} disabled={!box || isExtracting || !realHeightMeters}>
                           {isExtracting ? 'AI 추출 중...⏳' : '⚡ 3D 추출 (원본 자동 다운로드)'}
                         </Button>
                       </div>
                     </div>
+
+                    {/* 🌟 지붕 모서리 A/B/C/D 상세입력 — 추정을 한 번이라도 실행했을 때만 표시.
+                        4칸 전부 채우면 보간 지붕, 하나라도 비우면 평지붕 기본값으로 추출됨. */}
+                    {roofLabelMap && (
+                      <div className="w-full flex flex-wrap items-center gap-3 mb-4 bg-amber-50 border border-amber-200 rounded-xl p-3">
+                        <span className="text-xs font-bold text-amber-700 shrink-0">
+                          🏠 지붕 모서리 높이(m) — 카메라와 가까운 순 A→D, 4칸 다 채우면 보간 적용:
+                        </span>
+                        {['A', 'B', 'C', 'D'].map(letter => (
+                          <label key={letter} className="flex items-center gap-1 text-sm">
+                            <span className="font-bold text-amber-800">{letter}</span>
+                            <input
+                              type="number"
+                              step="0.1"
+                              value={roofCorners[letter]}
+                              onChange={e => setRoofCorners(prev => ({ ...prev, [letter]: e.target.value }))}
+                              className="w-20 px-2 py-1 border border-amber-300 rounded-md text-sm"
+                            />
+                          </label>
+                        ))}
+                        <Button
+                          variant="secondary"
+                          onClick={() => setRoofCorners({ A: '', B: '', C: '', D: '' })}
+                        >
+                          비우기(평지붕으로)
+                        </Button>
+                      </div>
+                    )}
 
                     {/* 🌟 크롭(박스) 에디터 영역 */}
                     <div className="relative inline-block border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl select-none">
@@ -833,6 +934,7 @@ export default function EditorView({
                     </div>
 
                     <div className="flex items-center gap-2 flex-wrap">
+                      <Button variant="secondary" onClick={() => setShowBlockEditor(true)}>🧱 블록 편집기</Button>
                       <Button variant="secondary" onClick={handleDownloadOriginal}>📥 원본 다운로드</Button>
                       <Button variant="primary" onClick={handleDownloadEdited}>✅ 편집본(화면+225°) 다운로드</Button>
                       <Button variant="dark" onClick={handleDownloadFloorPagesPngs}>🗂️ 층별 PNG 분할 다운로드 (5층씩)</Button>
@@ -865,6 +967,14 @@ export default function EditorView({
         </div>
 
       </div>
+
+      {showBlockEditor && (
+        <BlockEditor3D
+          blocks={extracted3DData}
+          onApply={(b) => { setExtracted3DData(b); setShowBlockEditor(false); }}
+          onClose={() => setShowBlockEditor(false)}
+        />
+      )}
     </div>
   );
 }

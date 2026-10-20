@@ -62,8 +62,9 @@ export default function DetailView({
     return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
   }, [selectedBp?.csv_data, is3D]);
 
-  const handlePngDownload = () => {
-    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
+     const handlePngDownload = () => {
+      if (!selectedBp.grid_data) { alert('3D 프로젝트는 PNG 도면 내보내기를 지원하지 않습니다. CSV 내보내기를 이용해주세요.'); return; }
+      const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
     if (name === null) return;
     exportToPNG(selectedBp.grid_data, name);
   };
@@ -128,7 +129,16 @@ export default function DetailView({
               <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
                 📸 PNG 이미지 다운로드 (mbs_)
               </button>
-              <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
+              <button onClick={() => {
+                if (is3D) {
+                  const url = URL.createObjectURL(new Blob([selectedBp.csv_data], { type: 'text/csv' }));
+                  const a = document.createElement('a');
+                  a.href = url; a.download = `mbs_${selectedBp.name || 'model'}.csv`; a.click();
+                  URL.revokeObjectURL(url);
+                } else if (selectedBp.grid_data) {
+                  exportToCSV(selectedBp.grid_data);
+                }
+              }} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
                 📊 CSV 데이터 내보내기
               </button>
             </div>

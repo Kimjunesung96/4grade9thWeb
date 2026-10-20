@@ -1,6 +1,6 @@
 // LINE 1 ~ 7: 에디터에 있던 CSV 문자열 파싱 알고리즘을 가져오고, 파일 용량 계산 함수가 3D text 용량도 지원하도록 수정합니다.
 import React, { useMemo } from 'react';
-import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+import { downloadFloorPagesAsZip, exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
 
 // 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
@@ -62,9 +62,16 @@ export default function DetailView({
     return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
   }, [selectedBp?.csv_data, is3D]);
 
-  const handlePngDownload = () => {
-    const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
-    if (name === null) return;
+  const handlePngDownload = async () => {
+    // 브라우저/웹뷰에서 prompt()가 차단될 수 있으므로 프로젝트 이름을 바로 사용한다.
+    const name = selectedBp.name || '도면';
+
+    if (is3D) {
+      // 3D CSV는 5개 층씩 2D PNG로 변환한다. PNG가 많아지면 ZIP으로 묶어 내려받는다.
+      await downloadFloorPagesAsZip(selectedBp.csv_data, name);
+      return;
+    }
+
     exportToPNG(selectedBp.grid_data, name);
   };
 
@@ -128,7 +135,16 @@ export default function DetailView({
               <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
                 📸 PNG 이미지 다운로드 (mbs_)
               </button>
-              <button onClick={() => exportToCSV(selectedBp.grid_data)} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
+              <button onClick={() => {
+                if (is3D) {
+                  const url = URL.createObjectURL(new Blob([selectedBp.csv_data], { type: 'text/csv' }));
+                  const a = document.createElement('a');
+                  a.href = url; a.download = `mbs_${selectedBp.name || 'model'}.csv`; a.click();
+                  URL.revokeObjectURL(url);
+                } else if (selectedBp.grid_data) {
+                  exportToCSV(selectedBp.grid_data);
+                }
+              }} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
                 📊 CSV 데이터 내보내기
               </button>
             </div>

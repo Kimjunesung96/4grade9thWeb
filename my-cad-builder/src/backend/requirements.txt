@@ -4,3 +4,6 @@ python-multipart
 Pillow
 numpy
 pandas
+trimesh
+requests
+pillow-avif-plugin
