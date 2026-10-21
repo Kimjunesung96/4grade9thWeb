@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { downloadFloorPagesAsZip, exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
 import { parseStressCsv, RISK_ORDER, RISK_COLORS, RISK_LABELS } from '../utils/stressUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
-import StressAnalysisModal from '../components/Stressanalysismodal';
+import StressAnalysisModal from '../components/stressanalysismodal';
 // 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
 function parseCsvToBlocks(csvText) {
   if (!csvText) return [];
