@@ -351,6 +351,7 @@ export default function App() {
           hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
           onLikeToggle={() => handleLikeToggle(selectedBp.id)}
           onAddComment={() => handleAddComment(selectedBp.id)}
+          isOwner={selectedBp.user_id === user?.id}   // ← 추가
           onEditBlueprint={() => {
             setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
             setHistory([]);

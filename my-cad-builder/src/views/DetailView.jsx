@@ -1,8 +1,8 @@
-// LINE 1 ~ 7: 에디터에 있던 CSV 문자열 파싱 알고리즘을 가져오고, 파일 용량 계산 함수가 3D text 용량도 지원하도록 수정합니다.
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { downloadFloorPagesAsZip, exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+import { parseStressCsv, RISK_ORDER, RISK_COLORS, RISK_LABELS } from '../utils/stressUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
-
+import StressAnalysisModal from '../components/Stressanalysismodal';
 // 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
 function parseCsvToBlocks(csvText) {
   if (!csvText) return [];
@@ -44,10 +44,27 @@ export default function DetailView({
   hasLiked,
   onLikeToggle,
   onAddComment,
-  onEditBlueprint
+  onEditBlueprint,
+  isOwner = true
 }) {
+  // 하중 테스트 결과 업로드 팝업
+  const [stressOpen, setStressOpen] = useState(false);
+  const [savedAnalysis, setSavedAnalysis] = useState(selectedBp?.ai_analysis ?? null);
+
+  // 🌟 하중 테스트 결과(CurrentStress.csv 원문) + 뷰어 표시 모드
+  const [stressCsv, setStressCsv] = useState(selectedBp?.stress_csv ?? null);
+  const [colorMode, setColorMode] = useState(selectedBp?.stress_csv ? 'risk' : 'normal'); // 'normal' | 'risk'
+  const [posMode, setPosMode] = useState('orig'); // 'orig' | 'moved'
+
+  // 다른 도면으로 이동하면 이전 도면의 분석/결과가 남지 않도록 초기화
+  useEffect(() => {
+    setSavedAnalysis(selectedBp?.ai_analysis ?? null);
+    setStressCsv(selectedBp?.stress_csv ?? null);
+    setColorMode(selectedBp?.stress_csv ? 'risk' : 'normal');
+    setPosMode('orig');
+  }, [selectedBp?.id]);
+
   // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
-// LINE 205 ~ 207: grid_data가 없으면 csv_data 문자열 길이로 파일 용량을 대신 계산하고, 3D 블록 데이터를 메모이제이션합니다.
   // 🌟 2D/3D 유연하게 대응하는 용량 계산 함수
   const calculateFileSize = () => {
     const targetData = selectedBp?.grid_data || selectedBp?.csv_data;
@@ -62,6 +79,10 @@ export default function DetailView({
     return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
   }, [selectedBp?.csv_data, is3D]);
 
+  // 🌟 위험도 색상 블록 (일반=회색, 주의=노랑, 위험=빨강, 파괴=보라)
+  const stressPreview = useMemo(() => parseStressCsv(stressCsv, posMode), [stressCsv, posMode]);
+  const showRisk = is3D && colorMode === 'risk' && stressPreview.blocks.length > 0;
+
   const handlePngDownload = async () => {
     // 브라우저/웹뷰에서 prompt()가 차단될 수 있으므로 프로젝트 이름을 바로 사용한다.
     const name = selectedBp.name || '도면';
@@ -74,8 +95,6 @@ export default function DetailView({
 
     exportToPNG(selectedBp.grid_data, name);
   };
-
-
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
@@ -101,20 +120,66 @@ export default function DetailView({
         
         {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
         <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
-          // LINE 211 ~ 216: 프로젝트 유형(is3D)에 맞게 제목을 매칭하고, LiveDemoViewer에 알맞은 prop 분배 및 하단 2D 격자 패널 조건부 노출을 처리합니다.
           <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
-            {is3D ? "3D AI 건축물 입체 프리뷰" : "구조물 설계도 평면도 미리보기"}
+            {is3D ? (showRisk ? "3D 하중 테스트 위험도 프리뷰" : "3D AI 건축물 입체 프리뷰") : "구조물 설계도 평면도 미리보기"}
           </div>
+
+          {/* 🌟 하중 테스트 결과가 있을 때만: 기본 색 / 위험도 색 전환 */}
+          {is3D && stressCsv && (
+            <div className="w-full flex flex-wrap items-center justify-between gap-2 mb-3">
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                {[['normal', '기본 색'], ['risk', '위험도 색']].map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setColorMode(key)}
+                    className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                      colorMode === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200/60'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {colorMode === 'risk' && (
+                <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                  {[['orig', '원위치'], ['moved', '테스트 후 위치']].map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => setPosMode(key)}
+                      className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                        posMode === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200/60'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           
-          {/* 🌟 3D 모드라면 parsed3DBlocks 데이터를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
-          <div className="w-full h-[350px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+          {/* 🌟 3D 모드라면 parsed3DBlocks(또는 위험도 색 블록)를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
+          <div className="w-full h-[350px] mb-2 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
             <LiveDemoViewer 
               grid={!is3D ? selectedBp?.grid_data : null} 
-              data={is3D ? parsed3DBlocks : null} 
+              data={is3D ? (showRisk ? stressPreview.blocks : parsed3DBlocks) : null} 
               mode="static" 
               maxBlocks={10000} 
             />
           </div>
+
+          {/* 🌟 위험도 범례 */}
+          {showRisk && (
+            <div className="w-full flex flex-wrap gap-x-4 gap-y-1 mb-4 text-[11px] text-gray-600 font-medium">
+              {RISK_ORDER.map((key) => (
+                <span key={key} className="flex items-center gap-1.5">
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: RISK_COLORS[key] }} />
+                  {RISK_LABELS[key]} {stressPreview.counts[key]}
+                </span>
+              ))}
+            </div>
+          )}
+          {!showRisk && <div className="mb-2" />}
 
           {/* 🌟 2D 설계도일 때만 하단의 미니 격자판(2D 레고 도면)을 렌더링하고, 3D 건축물일 때는 공간을 차지하지 않도록 숨깁니다. */}
           {!is3D && selectedBp.grid_data && (
@@ -130,7 +195,7 @@ export default function DetailView({
             </div>
           )}
           
-          <div className="w-full flex flex-col gap-3 mt-6">
+          <div className="w-full flex flex-col gap-3 mt-4">
             <div className="grid grid-cols-2 gap-3">
               <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
                 📸 PNG 이미지 다운로드 (mbs_)
@@ -151,6 +216,11 @@ export default function DetailView({
             <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
               📐 이 도면 편집기로 열기 (CAD 작업실 이동)
             </button>
+            {is3D && (
+              <button onClick={() => setStressOpen(true)} className="w-full p-4 bg-white text-gray-800 border border-gray-300 rounded-xl text-sm font-bold hover:bg-gray-50 shadow-sm transition-all">
+                🧪 하중 테스트 결과 업로드 · AI 분석
+              </button>
+            )}
           </div>
         </div>
 
@@ -215,6 +285,16 @@ export default function DetailView({
         </div>
 
       </main>
+
+      <StressAnalysisModal
+        isOpen={stressOpen}
+        onClose={() => setStressOpen(false)}
+        blueprint={selectedBp}
+        savedAnalysis={savedAnalysis}
+        canUpload={isOwner}
+        onPreview={(text) => { setStressCsv(text); setColorMode('risk'); }}
+        onUploaded={(f) => { setSavedAnalysis(f.ai_analysis); setStressCsv(f.stress_csv); }}
+      />
     </div>
   );
 }

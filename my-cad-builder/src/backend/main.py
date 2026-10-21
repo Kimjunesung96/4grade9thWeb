@@ -9,9 +9,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from PIL import Image
-
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +17,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from stress_analysis import router as stress_router
+app.include_router(stress_router)
 
 COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
 

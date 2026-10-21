@@ -1,742 +1,719 @@
-// FILE PATH: src/backend/main.py
-// MODIFIED: 26-09-28 14:54 | LINES: 455
-```py
-import io
-import pillow_avif  # noqa: F401  (AVIF 포맷 지원 — PIL 기본 탑재 아님, import만 해도 등록됨)
-import requests
-import trimesh
-import numpy as np
-import uvicorn
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from PIL import Image
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
-
-MAX_BLOCKS = 10000
-GRID_PITCH = 3.0
-UNITS_PER_METER = 20.0
-APPLY_TILT_FIX = True   # False로 바꾸면 기울기 보정 끄기 (A/B 비교용)
-
-
-def format_id(val):
-    abs_val = round(abs(val))
-    sign = "-" if val < 0 else "0"
-    return f"{sign}{str(abs_val).zfill(3)}"
-
-
-def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
-    resp = requests.post(
-        COLAB_API_URL,
-        files={"image": ("input.png", img_bytes, "image/png")},
-        params={"flatten_roof": "false", "snap_grid": "false"},
-        timeout=180,
-    )
-    resp.raise_for_status()
-
-    mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
-    if isinstance(mesh, trimesh.Scene):
-        mesh = trimesh.util.concatenate(mesh.dump())
-    return mesh
-
-
-def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
-                    bins=24, min_deg=0.5, max_deg=30.0):
-    """
-    건물 중간 구간(높이 20~80%)의 층별 중심점을 이어 '쏠린 정도(기울기)'를 구하고,
-    그만큼 되돌려 건물을 똑바로 세운다.
-      mode="shear"  : 각 높이의 층을 옆으로 밀어 중심선을 수직으로 (층은 수평 유지) ← 블록 변환용 기본값
-      mode="rotate" : 메쉬 전체를 회전 (건물 전체가 통째로 기운 경우)
-    기울기가 너무 작거나(min_deg) 너무 크면(max_deg, 추정 실패로 판단) 원본 유지.
-    """
-    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
-    up = up_axis_idx
-    hor = [i for i in range(3) if i != up]
-    h = verts[:, up]
-    h_min, h_max = h.min(), h.max()
-    H = h_max - h_min
-    if H < 1e-6:
-        return mesh
-
-    # 1. 높이 구간별 중심점
-    edges = np.linspace(h_min + low * H, h_min + high * H, bins + 1)
-    ys, cs = [], []
-    for a, b in zip(edges[:-1], edges[1:]):
-        m = (h >= a) & (h < b)
-        if m.sum() < 20:
-            continue
-        ys.append(h[m].mean())
-        cs.append(verts[m][:, hor].mean(axis=0))
-    if len(ys) < 5:
-        print("📏 기울기 보정 건너뜀: 중심점이 부족함")
-        return mesh
-    ys, cs = np.array(ys), np.array(cs)
-
-    # 2. 두 수평축 각각 직선 피팅 (튀는 점 1회 제거)
-    slopes = []
-    for j in range(2):
-        k, b0 = np.polyfit(ys, cs[:, j], 1)
-        res = cs[:, j] - (k * ys + b0)
-        keep = np.abs(res) <= max(2 * res.std(), 1e-9)
-        if keep.sum() >= 4:
-            k, b0 = np.polyfit(ys[keep], cs[keep, j], 1)
-        slopes.append(k)
-    slopes = np.array(slopes)
-    tilt = float(np.degrees(np.arctan(np.linalg.norm(slopes))))
-
-    if tilt < min_deg or tilt > max_deg:
-        print(f"📏 기울기 보정 건너뜀: 기울기 {tilt:.2f}° (허용 {min_deg}~{max_deg}° 밖)")
-        return mesh
-
-    # 3. 되돌리기
-    if mode == "rotate":
-        u = np.zeros(3)
-        u[up] = 1.0
-        u[hor] = slopes
-        u /= np.linalg.norm(u)
-        t = np.zeros(3)
-        t[up] = 1.0
-        v = np.cross(u, t)
-        c = float(np.dot(u, t))
-        s = float(np.linalg.norm(v))
-        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
-        pivot = verts[h <= h_min + 0.02 * H].mean(axis=0)   # 바닥 중심 기준
-        verts = (verts - pivot) @ R.T + pivot
-    else:
-        verts[:, hor] -= np.outer(h - h_min, slopes)         # 바닥은 고정, 위로 갈수록 되밀기
-
-    mesh.vertices = verts
-    print(f"📏 기울기 보정: {tilt:.2f}° 되돌림 ({mode})")
-    return mesh
-
-
-def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
-    extents = mesh.bounds[1] - mesh.bounds[0]
-    tallest_axis = int(np.argmax(extents))
-
-    if tallest_axis == 2:
-        rot = trimesh.transformations.rotation_matrix(
-            angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
-        )
-        mesh.apply_transform(rot)
-    elif tallest_axis == 0:
-        rot = trimesh.transformations.rotation_matrix(
-            angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
-        )
-        mesh.apply_transform(rot)
-
-    mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
-    mesh.apply_transform(mirror)
-    mesh.invert()
-
-    print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
-
-    # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
-    #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
-    if APPLY_TILT_FIX:
-        mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
-
-    mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
-    if mesh_height_raw <= 0:
-        raise ValueError("메시 높이를 계산할 수 없습니다 (생성된 메시가 비정상일 수 있음)")
-
-    target_height_units = real_height_m * UNITS_PER_METER
-    mesh.apply_scale(target_height_units / mesh_height_raw)
-    mesh.apply_translation([0, -mesh.bounds[0][1], 0])
-
-    surface_area = mesh.area
-    pitch = max(GRID_PITCH, round(((surface_area / max_blocks) ** 0.5) / GRID_PITCH) * GRID_PITCH)
-
-    raw_blocks = []
-    for attempt in range(5):
-        estimated_cells = surface_area / (pitch ** 2)
-        sample_count = max(int(estimated_cells * 6), 5000)
-        points, face_indices = trimesh.sample.sample_surface(mesh, count=sample_count)
-        normals = mesh.face_normals[face_indices]
-
-        raw_blocks = []
-        seen_ids = set()
-        for (x, y, z), normal in zip(points, normals):
-            grid_x = round((x - 1.5) / pitch)
-            grid_y = round((y - 1.5) / pitch)
-            grid_z = round((z - 1.5) / pitch)
-
-            pos_x = grid_x * GRID_PITCH + 1.5
-            pos_y = grid_y * GRID_PITCH + 1.5
-            pos_z = grid_z * GRID_PITCH + 1.5
-
-            id_x = format_id(pos_x * 10)
-            id_z = format_id(pos_z * 10)
-            id_y = format_id(pos_y * 10)
-            block_id = f"{id_x}_{id_z}_{id_y}"
-            if block_id in seen_ids:
-                continue
-            seen_ids.add(block_id)
-
-            block_type = "Floor" if abs(normal[1]) > 0.7 else "Wall"
-
-            raw_blocks.append({
-                "BlockID": block_id,
-                "PosX": round(pos_x, 2),
-                "PosY": round(pos_y, 2),
-                "PosZ": round(pos_z, 2),
-                "Stress": 0.00,
-                "RiskLevel": "Safe",
-                "Prescription": "N",
-                "Material": "Default",
-                "Tensile": 400.0,
-                "Compressive": 400.0,
-                "Tool": "Existing",
-                "Type": block_type,
-            })
-
-        print(f"📐 시도 {attempt + 1}: pitch={pitch} → {len(raw_blocks)}개 블록")
-        if len(raw_blocks) <= max_blocks:
-            break
-        pitch += GRID_PITCH
-
-    return raw_blocks
-
-
-# ====================================================================
-# 🌟 지붕 모서리 A/B/C/D 자동 추정 (카메라와의 수평 거리 기준 정렬)
-# ====================================================================
-def order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max):
-    """
-    지붕 4개 모서리를 카메라와 가까운 순서대로 A→D 로 라벨링.
-    - 거리 판정은 X,Z 평면(수평)만 사용. Y(높이)는 결과값이라 거리 계산에서 반드시 제외.
-    - main.py의 미러링 보정 이후 좌표계 기준, Z가 큰 쪽이 카메라(정면)에 가깝다고 가정.
-    """
-    verts = mesh.vertices
-    y_max = verts[:, 1].max()
-    y_min = verts[:, 1].min()
-    roof_mask = verts[:, 1] >= y_max - (y_max - y_min) * 0.10
-    roof_verts = verts[roof_mask]
-
-    if len(roof_verts) == 0:
-        roof_verts = verts  # 안전장치: 지붕 영역이 안 잡히면 전체 정점으로 대체
-
-    corners_xz = {
-        "TL": (x_min, z_min),
-        "TR": (x_max, z_min),
-        "BL": (x_min, z_max),
-        "BR": (x_max, z_max),
-    }
-
-    corner_info = {}
-    for key, (cx, cz) in corners_xz.items():
-        # 1. 이 모서리 위치(cx, cz)에 가장 가까운 실제 지붕 꼭짓점 찾기 (X,Z만 비교)
-        dists_to_corner = np.hypot(roof_verts[:, 0] - cx, roof_verts[:, 2] - cz)
-        nearest = roof_verts[dists_to_corner.argmin()]
-        corner_info[key] = {
-            "pos": (float(nearest[0]), float(nearest[1]), float(nearest[2])),
-        }
-
-    # 2. 카메라(정면, Z가 큰 방향)에 가까운 순서로 정렬 — Z값 큰 것부터
-    ordered_keys = sorted(corner_info.keys(), key=lambda k: -corner_info[k]["pos"][2])
-
-    label_map = {}
-    for i, key in enumerate(ordered_keys):
-        letter = chr(ord("A") + i)  # A, B, C, D
-        label_map[letter] = {
-            "original_position": key,
-            "estimated_height_m": round(corner_info[key]["pos"][1] / UNITS_PER_METER, 2),
-        }
-    return label_map
-
-
-# ====================================================================
-# 🌟 지붕 높이 보정: 평지붕(기본값) 또는 4개 모서리 보간(상세입력)
-# ====================================================================
-def _make_fill_block(pos_x: float, pos_y: float, pos_z: float, block_type: str, seen_ids: set):
-    """roof 보정으로 뜬 틈을 메울 Wall 블록 하나 생성. 이미 그 자리에 블록이 있으면 None."""
-    id_x = format_id(pos_x * 10)
-    id_z = format_id(pos_z * 10)
-    id_y = format_id(pos_y * 10)
-    block_id = f"{id_x}_{id_z}_{id_y}"
-    if block_id in seen_ids:
-        return None
-    seen_ids.add(block_id)
-    return {
-        "BlockID": block_id,
-        "PosX": round(pos_x, 2),
-        "PosY": round(pos_y, 2),
-        "PosZ": round(pos_z, 2),
-        "Stress": 0.00,
-        "RiskLevel": "Safe",
-        "Prescription": "N",
-        "Material": "Default",
-        "Tensile": 400.0,
-        "Compressive": 400.0,
-        "Tool": "Existing",
-        "Type": block_type,
-    }
-
-
-def apply_roof_correction(raw_blocks: list, corner_heights: dict | None = None):
-    """
-    corner_heights가 없으면(아무 입력 없음): 모서리 4개 높이가 같다고 가정 → 평지붕으로 강제.
-    corner_heights가 있으면: {"tl":.., "tr":.., "bl":.., "br":..} (미터) 로 bilinear interpolation.
-
-    🌟 Floor 블록을 새 높이로 옮기기만 하면 옛 높이와 새 높이 사이가 뚫려서
-       "몸체와 분리된 지붕(뚜껑)"이 생긴다. 그 틈을 Wall 블록으로 채워서 이어준다.
-    """
-    if not raw_blocks:
-        return raw_blocks
-
-    xs = [b["PosX"] for b in raw_blocks]
-    zs = [b["PosZ"] for b in raw_blocks]
-    ys = [b["PosY"] for b in raw_blocks]
-    x_min, x_max = min(xs), max(xs)
-    z_min, z_max = min(zs), max(zs)
-    y_max, y_min = max(ys), min(ys)
-
-    roof_threshold = y_max - (y_max - y_min) * 0.10
-    roof_blocks = [b for b in raw_blocks if b["Type"] == "Floor" and b["PosY"] >= roof_threshold]
-    roof_ids = {id(b) for b in roof_blocks}
-    other_blocks = [b for b in raw_blocks if id(b) not in roof_ids]
-
-    if not roof_blocks:
-        return raw_blocks
-
-    seen_ids = {b["BlockID"] for b in raw_blocks}
-
-    if corner_heights is None:
-        def target_height(x, z):
-            return round(y_max, 2)
-        print(f"🏠 지붕 상세입력 없음 → 모서리 4개 동일 높이({round(y_max, 2)})로 평지붕 보정")
-    else:
-        tl = corner_heights["tl"] * UNITS_PER_METER
-        tr = corner_heights["tr"] * UNITS_PER_METER
-        bl = corner_heights["bl"] * UNITS_PER_METER
-        br = corner_heights["br"] * UNITS_PER_METER
-
-        def target_height(x, z):
-            u = 0.0 if x_max == x_min else (x - x_min) / (x_max - x_min)
-            v = 0.0 if z_max == z_min else (z - z_min) / (z_max - z_min)
-            top = tl + (tr - tl) * u
-            bot = bl + (br - bl) * u
-            return round(top + (bot - top) * v, 2)
-        print(f"🏠 모서리 4개 입력값으로 지붕 보간 완료 (tl={tl}, tr={tr}, bl={bl}, br={br})")
-
-    fill_blocks = []
-    for b in roof_blocks:
-        old_y = b["PosY"]
-        new_y = target_height(b["PosX"], b["PosZ"])
-
-        if new_y > old_y:
-            # 옛 지붕 높이 → 새 지붕 높이 사이를 Wall로 채워서 몸체와 연결
-            y = old_y + GRID_PITCH
-            while y < new_y - 1e-6:
-                fb = _make_fill_block(b["PosX"], y, b["PosZ"], "Wall", seen_ids)
-                if fb:
-                    fill_blocks.append(fb)
-                y += GRID_PITCH
-        elif new_y < old_y:
-            # 지붕을 낮추는 경우: 원래 위치를 Wall로 남겨서 단면이 뚫리지 않게 함
-            fb = _make_fill_block(b["PosX"], old_y, b["PosZ"], "Wall", seen_ids)
-            if fb:
-                fill_blocks.append(fb)
-
-        b["PosY"] = new_y
-
-    return other_blocks + roof_blocks + fill_blocks
-
-
-# ====================================================================
-# 🌟 새 엔드포인트: 지붕 모서리 A/B/C/D 자동 추정 (박스 드래그 직후 프론트에서 호출)
-# ====================================================================
-@app.post("/api/estimate-roof-corners")
-async def estimate_roof_corners(
-    file: UploadFile = File(...),
-    startX: float = Form(...),
-    startY: float = Form(...),
-    endX: float = Form(...),
-    endY: float = Form(...),
-):
-    img_bytes = await file.read()
-    try:
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"이미지를 읽을 수 없습니다: {e}")
-
-    sx, sy = max(0, int(startX)), max(0, int(startY))
-    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
-    cropped = image.crop((sx, sy, ex, ey))
-
-    crop_bytes_io = io.BytesIO()
-    cropped.save(crop_bytes_io, format="PNG")
-    crop_bytes = crop_bytes_io.getvalue()
-
-    mesh = get_mesh_from_colab(crop_bytes)
-
-    x_min, x_max = float(mesh.bounds[0][0]), float(mesh.bounds[1][0])
-    z_min, z_max = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
-
-    label_map = order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max)
-    return label_map
-    # 예: {"A": {"original_position": "BR", "estimated_height_m": 12.3}, "B": {...}, "C": {...}, "D": {...}}
-
-
-@app.post("/api/extract-3d-csv")
-async def extract_3d_csv(
-    file: UploadFile = File(...),
-    startX: float = Form(...),
-    startY: float = Form(...),
-    endX: float = Form(...),
-    endY: float = Form(...),
-    realHeightMeters: float = Form(...),
-    # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
-    roofTL: float | None = Form(None),
-    roofTR: float | None = Form(None),
-    roofBL: float | None = Form(None),
-    roofBR: float | None = Form(None),
-):
-    print(f"📥 사진 데이터 및 박스 좌표 수신: ({startX}, {startY}) ~ ({endX}, {endY}) | 실제 높이: {realHeightMeters}m")
-
-    img_bytes = await file.read()
-    try:
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"이미지를 읽을 수 없습니다 (지원하지 않는 포맷일 수 있음): {e}",
-        )
-
-    sx, sy = max(0, int(startX)), max(0, int(startY))
-    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
-    cropped = image.crop((sx, sy, ex, ey))
-
-    crop_bytes_io = io.BytesIO()
-    cropped.save(crop_bytes_io, format="PNG")
-    crop_bytes = crop_bytes_io.getvalue()
-
-    print("🤖 콜랍 AI 모델에 메시 생성 요청 중...")
-    mesh = get_mesh_from_colab(crop_bytes)
-    print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
-
-    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
-
-    # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
-    corner_heights = None
-    if None not in (roofTL, roofTR, roofBL, roofBR):
-        corner_heights = {"tl": roofTL, "tr": roofTR, "bl": roofBL, "br": roofBR}
-    raw_blocks = apply_roof_correction(raw_blocks, corner_heights)
-
-    df = pd.DataFrame(raw_blocks)
-    df = df.drop_duplicates(subset=["BlockID"])
-    df = df.sort_values(by=["PosZ", "PosX", "PosY"])
-
-    print(f"✅ 총 {len(df)}개의 3D 빌딩 블록 엑셀 변환 완료! (속은 비어있는 표면 전용 구조)")
-
-    output = io.StringIO()
-    df.to_csv(output, index=False)
-    output.seek(0)
-
-    return StreamingResponse(
-        io.BytesIO(output.getvalue().encode("utf-8")),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=ai_extracted_3d.csv"},
-    )
-
-
-if __name__ == "__main__":
-    print("🚀 CAD AI 백엔드 서버를 시작합니다. (포트 8000)")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-```
-
-// FILE PATH: src/components/BlueprintCard.jsx
-// MODIFIED: 26-08-24 09:30 | LINES: 45
-```jsx
-// FILE PATH: src/components/BlueprintCard.jsx
-import React from 'react';
-
-export default function BlueprintCard({ bp, onClick }) {
-  // 🌟 기존 유추 로직 제거하고 DB에 있는 명시적 타입 사용!
-  // (과거에 올린 데이터는 project_type이 없을 수 있으므로 기본값 'blueprint' 처리)
-  const type = bp.project_type || 'blueprint';
-
-  return (
-    <div 
-      onClick={onClick} 
-      className="bg-white rounded-2xl border border-gray-200 overflow-hidden hover:shadow-xl transition-all group cursor-pointer active:scale-98 relative"
-    >
-      {/* 🌟 3단계 뱃지 시스템 */}
-      <div className="absolute top-3 right-3 z-10 px-2 py-1 bg-white/90 backdrop-blur-sm rounded-lg shadow-sm text-[10px] font-black border border-gray-100 text-gray-700">
-        {type === '3dmodel' && '🕋 3D AI 모델'}
-        {type === 'structure' && '🏗️ 다층 구조물'}
-        {type === 'blueprint' && '📐 1층 설계도'}
-      </div>
-
-      {/* 썸네일 영역 (3dmodel이면서 썸네일 데이터가 있을 때만 이미지 렌더링) */}
-      {type === '3dmodel' && bp.thumbnail_url ? (
-        <div className="h-40 w-full bg-gray-900 overflow-hidden">
-          <img 
-            src={bp.thumbnail_url} 
-            alt={bp.name} 
-            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-          />
-        </div>
-      ) : (
-        <div className="h-40 bg-gray-100 flex items-center justify-center text-4xl group-hover:bg-blue-50 transition-colors">
-          {type === 'structure' ? '🏢' : '📝'}
-        </div>
-      )}
-      
-      <div className="p-5">
-        <div className="font-bold text-lg text-gray-900 truncate">{bp.name}</div>
-        <div className="flex justify-between items-center mt-2">
-          <span className="text-sm text-blue-600 font-bold truncate pr-2">{bp.author}</span>
-          <span className="text-xs text-gray-400 shrink-0">{new Date(bp.created_at).toLocaleDateString()}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/ExploreView.jsx
-// MODIFIED: 26-08-24 09:30 | LINES: 158
-```jsx
-// FILE PATH: src/views/ExploreView.jsx
-import React, { useState, useMemo, useEffect, useRef } from 'react';
-import BlueprintCard from '../components/BlueprintCard';
-
-const shuffleArray = (array) => {
-  const arr = [...array];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
+// FILE PATH: src/utils/cadUtils.js
+// MODIFIED: 26-10-21 01:57 | LINES: 413
+```js
+import CryptoJS from 'crypto-js';
+import JSZip from 'jszip';
+
+// 비밀번호 암호화 로직
+export const hashPw = (pw) => CryptoJS.SHA256(pw).toString();
+
+// ===================== 층별 벽 색상 매핑 =====================
+// grid 값 체계: 0=빈칸, 1~5=벽(1~5층), 9=바닥
+export const FLOOR_COLORS = {
+  1: { hex: '#9CA3AF', tw: 'bg-gray-400', label: '1층' },   // 회색
+  2: { hex: '#EF4444', tw: 'bg-red-500',  label: '2층' },   // 빨강
+  3: { hex: '#F97316', tw: 'bg-orange-500', label: '3층' }, // 주황
+  4: { hex: '#EAB308', tw: 'bg-yellow-500', label: '4층' }, // 노랑
+  5: { hex: '#000000', tw: 'bg-black',    label: '5층' },   // 검정
+};
+export const FLOOR_VALUE = 9; // 바닥 칸 값 (기존 2에서 변경 → 1~5 벽 값과 충돌 방지)
+
+// 셀 값을 기준으로 표시 색상(hex)을 반환
+export const getCellColorHex = (cell) => {
+  if (cell === FLOOR_VALUE) return '#D2D2D2';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].hex;
+  return '#FFFFFF';
 };
 
-export default function ExploreView({ blueprints, setView, onSelectBlueprint }) {
-  const [searchTerm, setSearchTerm] = useState('');
-  const [searchType, setSearchType] = useState('name'); 
-  
-  const [activeTab, setActiveTab] = useState('all');
+// 셀 값을 기준으로 표시 색상(tailwind 클래스)을 반환
+export const getCellColorClass = (cell) => {
+  if (cell === FLOOR_VALUE) return 'bg-gray-300';
+  if (cell >= 1 && cell <= 5) return FLOOR_COLORS[cell].tw;
+  return 'bg-white';
+};
 
-  const [displayCount, setDisplayCount] = useState(6);
-  const [randomBlueprints, setRandomBlueprints] = useState([]);
-  
-  const scrollContainerRef = useRef(null); 
-  const loaderRef = useRef(null); 
+// Flood Fill 알고리즘
+export const floodFill = (grid, r, c, replacementVal) => {
+  const targetVal = grid[r][c];
+  if (targetVal === replacementVal) return grid;
+  const newGrid = JSON.parse(JSON.stringify(grid));
+  const stack = [[r, c]];
+  while (stack.length > 0) {
+    const [currR, currC] = stack.pop();
+    if (currR >= 0 && currR < 50 && currC >= 0 && currC < 50 && newGrid[currR][currC] === targetVal) {
+      newGrid[currR][currC] = replacementVal;
+      stack.push([currR + 1, currC], [currR - 1, currC], [currR, currC + 1], [currR, currC - 1]);
+    }
+  }
+  return newGrid;
+};
 
-  const allBlueprints = useMemo(() => {
-    return [...blueprints.mine, ...blueprints.others];
-  }, [blueprints]);
+// 블록 ID 포맷 생성기
+export const formatID = (val) => {
+  const absVal = Math.round(Math.abs(val));
+  const sign = val < 0 ? "-" : "0";
+  return sign + absVal.toString().padStart(3, '0');
+};
 
-  useEffect(() => {
-    setRandomBlueprints(shuffleArray(allBlueprints));
-    setDisplayCount(6);
-  }, [allBlueprints]);
-
-  useEffect(() => {
-    setDisplayCount(6);
-  }, [searchTerm, searchType, activeTab]);
-
-  const processedBlueprints = useMemo(() => {
-    // 🌟 1. DB의 project_type을 이용한 초정밀 필터링!
-    const tabFiltered = randomBlueprints.filter(bp => {
-      const type = bp.project_type || 'blueprint'; // 하위 호환
-      if (activeTab === 'blueprint') return type === 'blueprint';
-      if (activeTab === 'structure') return type === 'structure';
-      if (activeTab === '3dmodel') return type === '3dmodel';
-      return true; // 'all'
-    });
-
-    if (!searchTerm.trim()) return tabFiltered;
-
-    const term = searchTerm.toLowerCase().trim();
-    const scored = tabFiltered.map(bp => {
-      let score = 0;
-      const title = bp.name?.toLowerCase() || '';
-      const author = bp.author?.toLowerCase() || '';
-
-      if (searchType === 'name') {
-        if (title === term) score = 100;
-        else if (title.startsWith(term)) score = 50;
-        else if (title.includes(term)) score = 10;
-      } else if (searchType === 'author') {
-        if (author === term) score = 100;
-        else if (author.includes(term)) score = 10;
+// 사각형 테두리(두께 2칸)만 칠하고 안쪽은 비우는 벽 그리기 로직
+// startR/endR/startC/endC: 드래그 영역의 행/열 범위 (min~max 정렬된 값)
+// thickness: 테두리 두께 (기본 2칸)
+export const applyWallBorder = (gridRef, startR, endR, startC, endC, floorValue, thickness = 2) => {
+  for (let r = startR; r <= endR; r++) {
+    for (let c = startC; c <= endC; c++) {
+      const distFromTop = r - startR;
+      const distFromBottom = endR - r;
+      const distFromLeft = c - startC;
+      const distFromRight = endC - c;
+      const minDist = Math.min(distFromTop, distFromBottom, distFromLeft, distFromRight);
+      // 테두리(바깥쪽 thickness칸)에 해당하면 칠하고, 안쪽이면 건드리지 않음
+      if (minDist < thickness) {
+        gridRef[r][c] = floorValue;
       }
-      return { ...bp, score };
-    });
+    }
+  }
+  return gridRef;
+};
 
-    return scored.filter(bp => bp.score > 0).sort((a, b) => b.score - a.score);
-  }, [randomBlueprints, searchTerm, searchType, activeTab]);
+// CSV 구조 데이터 파일 추출 (1~5층 벽 + 바닥)
+export const exportToCSV = (grid) => {
+  let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell === 0) return;
+      const xCoord = cIdx * 3 + 1.5;
+      const zCoord = rIdx * 3 + 1.5;
+      const idX = formatID(xCoord * 10);
+      const idZ = formatID(zCoord * 10);
 
-  useEffect(() => {
-    const observer = new IntersectionObserver((entries) => {
-      if (entries[0].isIntersecting && displayCount < processedBlueprints.length) {
-        setDisplayCount(prev => prev + 6);
+      if (cell >= 1 && cell <= 5) {
+        // cell 값 = 층 번호. 해당 층 높이에만 벽 블록 생성
+        const floorNum = cell;
+        const yCoord = floorNum * 3 - 1.5;
+        const idY = formatID(yCoord * 10);
+        csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Wall_F${floorNum}\n`;
+      } else if (cell === FLOOR_VALUE) {
+        csvContent += `${idX}_${idZ}_015,${xCoord.toFixed(2)},1.50,${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Floor\n`;
       }
-    }, { 
-      root: scrollContainerRef.current,
-      threshold: 0.1 
     });
+  });
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `blueprint_final.csv`;
+  link.click();
+};
 
-    if (loaderRef.current) observer.observe(loaderRef.current);
+// ===================== 무한 누적(페이지 스택) 시스템 =====================
+// 페이지(한 장) 안에서는 셀 값(1~5)이 "그 페이지 안에서의 상대 높이(색)"를 의미.
+// 페이지를 기입(commit)할 때, 그 페이지에서 실제 쓰인 최고 색번호(maxColorUsed)를
+// 이전 페이지의 (pageBase + maxColorUsed) + 1 에 이어붙여서 다음 페이지의 시작 높이를 정한다.
+// → 종이(페이지)를 한 장씩 쌓아 올리되, 페이지마다 두께(1~5칸)가 달라도 절대 안 겹침.
+
+// 현재 grid에서 실제 쓰인 색(1~5) 중 최댓값을 찾는다 (안 쓰였으면 1)
+export const getMaxColorUsed = (grid) => {
+  let maxColorUsed = 0;
+  grid.forEach(row => row.forEach(cell => {
+    if (cell >= 1 && cell <= 5 && cell > maxColorUsed) maxColorUsed = cell;
+  }));
+  return maxColorUsed || 1;
+};
+
+// 이전 스택 정보를 바탕으로 다음 페이지가 시작될 pageBase를 계산
+export const getNextPageBase = (stackedFloors) => {
+  if (stackedFloors.length === 0) return 0;
+  const prev = stackedFloors[stackedFloors.length - 1];
+  return prev.pageBase + prev.maxColorUsed;
+};
+
+// 누적된 모든 페이지를 하나의 CSV로 합쳐서 내보내기
+// 🌟 셀 값(cell, 1~5)은 "그 칸에 쌓을 블록 개수(반복 층수)"를 의미한다.
+//    예: 색=2(빨강)면 pageBase+1층, pageBase+2층 이렇게 2칸을 그 자리에 쌓아 올린다.
+// 🌟 CSV로 불러온 페이지(csvPages)와 수동으로 이어그린 페이지(stackedFloors)를
+//    "지금 실제로 존재하는 건물 전체"로 합쳐서 하나의 stackedFloors 형식 배열로 반환.
+//    - csvPages가 있는 상태(= 아직 "이 페이지 기입하고 다음 장으로"를 눌러 흡수되기 전)라면
+//      CSV 페이지들을 pageBase = pageIndex*5 에 깔아준다. 지금 편집 중인 페이지(csvPageIndex)는
+//      csvPages 스냅샷이 아니라 화면에 있는 최신 grid를 써서, 커밋 전 수정사항도 내보내기/미리보기에 반영되게 한다.
+//    - csvPages가 비어있다면(=CSV 미로드거나 이미 흡수됨) 기존 stackedFloors를 그대로 사용.
+//    ⚠️ 두 시스템은 항상 배타적으로 취급한다: commitCurrentFloor에서 csvPages를 stackedFloors로
+//       흡수시킨 뒤 비우기 때문에, 흡수 이후에는 stackedFloors 쪽 로직만 타면 된다.
+export const getCombinedFloors = (stackedFloors, csvPages, csvPageIndex, currentGrid) => {
+  if (!csvPages || csvPages.length === 0) return stackedFloors;
+  
+  return csvPages.map((pageGrid, i) => {
+    const gridToUse = i === csvPageIndex ? currentGrid : pageGrid;
     
-    return () => {
-      if (loaderRef.current) observer.unobserve(loaderRef.current);
+    return {
+      pageBase: i * 5,
+      maxColorUsed: getMaxColorUsed(gridToUse), // ✅ 실제 쓰인 최고 층수로 동적 계산
+      grid: gridToUse,
     };
-  }, [displayCount, processedBlueprints.length]);
+  });
+};
 
-  const visibleBlueprints = processedBlueprints.slice(0, displayCount);
+export const exportStackedFloorsToCSV = (stackedFloors) => {
+  let csvContent = "BlockID,PosX,PosY,PosZ,Stress,RiskLevel,Prescription,Material,Tensile,Compressive,Tool,Type\n";
+  stackedFloors.forEach(({ pageBase, grid }) => {
+    grid.forEach((row, rIdx) => {
+      row.forEach((cell, cIdx) => {
+        if (cell < 1 || cell > 5) return; // 0(빈칸)은 무시.
+        const xCoord = cIdx * 3 + 1.5;
+        const zCoord = rIdx * 3 + 1.5;
+        const idX = formatID(xCoord * 10);
+        const idZ = formatID(zCoord * 10);
+        for (let layer = 1; layer <= cell; layer++) {
+          const n = pageBase + layer; // 절대 누적 높이 인덱스
+          const yCoord = 1.5 + 3 * n;
+          const idY = formatID(yCoord * 10);
+          csvContent += `${idX}_${idZ}_${idY},${xCoord.toFixed(2)},${yCoord.toFixed(2)},${zCoord.toFixed(2)},0.00,Safe,N,Default,0.0,0.0,Existing,Block_N${n}\n`;
+        }
+      });
+    });
+  });
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `blueprint_stacked.csv`;
+  link.click();
+};
 
-  return (
-    <div className="min-h-screen bg-gray-50 flex flex-col font-sans">
-      <header className="bg-white border-b border-gray-200 px-8 py-4 flex flex-col sm:flex-row items-center justify-between shadow-sm sticky top-0 z-10 gap-4">
-        <div className="flex items-center space-x-4 w-full sm:w-auto">
-          <button onClick={() => setView('dashboard')} className="p-2 hover:bg-gray-100 rounded-xl text-gray-600 font-bold transition-all flex items-center space-x-1 text-sm">
-            <span>◀</span> <span>대시보드로 가기</span>
-          </button>
-          <div className="h-6 w-[1px] bg-gray-200" />
-          <h2 className="text-xl font-black text-gray-900">🌐 커뮤니티 갤러리</h2>
-        </div>
+// PNG 캔버스 이미지 저장 (mbs_ 접두사 자동 부여)
+export const exportToPNG = (grid, fileName) => {
+  const cellSize = 10;
+  const canvas = document.createElement('canvas');
+  canvas.width = 50 * cellSize; canvas.height = 50 * cellSize;
+  const ctx = canvas.getContext('2d');
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      ctx.fillStyle = getCellColorHex(cell);
+      ctx.fillRect(cIdx * cellSize, rIdx * cellSize, cellSize, cellSize);
+    });
+  });
 
-        <div className="flex items-center gap-2 w-full sm:w-auto">
-          <select 
-            value={searchType} 
-            onChange={(e) => setSearchType(e.target.value)}
-            className="bg-gray-50 border border-gray-200 text-sm font-bold p-2.5 rounded-lg outline-none focus:border-blue-500"
-          >
-            <option value="name">제목 검색</option>
-            <option value="author">제작자 검색</option>
-          </select>
-          <input
-            type="text"
-            placeholder={searchType === 'name' ? "도면 제목을 검색하세요..." : "제작자(아이디)를 검색하세요..."}
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full sm:w-72 bg-gray-50 border border-gray-200 p-2.5 rounded-lg outline-none focus:border-blue-500 focus:bg-white transition-all text-sm font-medium"
-          />
-        </div>
-      </header>
+  // 유니티 스캐너 인식용 mbs_ 접두사 강제 부여
+  let baseName = (fileName && fileName.trim()) ? fileName.trim() : 'blueprint_draw';
+  baseName = baseName.replace(/\.png$/i, ''); // 혹시 사용자가 .png까지 입력해도 중복 방지
+  baseName = baseName.replace(/^mbs_/i, '');   // 이미 mbs_가 붙어있으면 중복 방지
+  const finalName = `mbs_${baseName}.png`;
 
-      <main className="flex-1 max-w-7xl w-full mx-auto p-8 flex flex-col">
-        <div className="flex items-center gap-3 mb-6 border-b border-gray-200 pb-4">
-          <button onClick={() => setActiveTab('all')} className={`px-5 py-2 rounded-full text-sm font-bold transition-all ${activeTab === 'all' ? 'bg-blue-600 text-white shadow-md' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'}`}>전체 보기</button>
-          <button onClick={() => setActiveTab('blueprint')} className={`px-5 py-2 rounded-full text-sm font-bold transition-all ${activeTab === 'blueprint' ? 'bg-blue-600 text-white shadow-md' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'}`}>📝 1층 설계도</button>
-          <button onClick={() => setActiveTab('structure')} className={`px-5 py-2 rounded-full text-sm font-bold transition-all ${activeTab === 'structure' ? 'bg-blue-600 text-white shadow-md' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'}`}>🏗️ 다층 구조물</button>
-          <button onClick={() => setActiveTab('3dmodel')} className={`px-5 py-2 rounded-full text-sm font-bold transition-all ${activeTab === '3dmodel' ? 'bg-blue-600 text-white shadow-md' : 'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'}`}>🕋 AI 3D 모델</button>
-          
-          <div className="ml-auto text-sm font-bold text-gray-500 hidden sm:block">
-            {searchTerm.trim() ? '검색 결과' : '전체 수량'}: <span className="text-blue-600">{processedBlueprints.length}</span>개
-          </div>
-        </div>
+  const link = document.createElement('a');
+  link.download = finalName;
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+};
 
-        <div ref={scrollContainerRef} className="flex-1 max-h-[580px] overflow-y-auto pr-3 bg-white p-6 border border-gray-200 rounded-2xl shadow-sm">
-          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6">
-            {visibleBlueprints.length === 0 ? (
-              <div className="col-span-full py-20 flex flex-col items-center justify-center text-gray-400">
-                <span className="text-4xl mb-3">📭</span>
-                <span className="font-medium">해당 카테고리에 등록된 작품이 없습니다.</span>
-              </div>
-            ) : (
-              visibleBlueprints.map(bp => (
-                <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-              ))
-            )}
-          </div>
+// 🌟 grid 하나를 PNG Blob으로 변환 (다운로드 없이 메모리에서만, zip에 넣기 위함)
+const gridToPngBlob = (grid) => {
+  const cellSize = 10;
+  const canvas = document.createElement('canvas');
+  canvas.width = 50 * cellSize; canvas.height = 50 * cellSize;
+  const ctx = canvas.getContext('2d');
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      ctx.fillStyle = getCellColorHex(cell);
+      ctx.fillRect(cIdx * cellSize, rIdx * cellSize, cellSize, cellSize);
+    });
+  });
+  return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+};
 
-          {displayCount < processedBlueprints.length && (
-            <div ref={loaderRef} className="col-span-full py-10 flex items-center justify-center">
-              <div className="animate-pulse flex flex-col items-center">
-                <div className="w-8 h-8 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin mb-2"></div>
-                <span className="text-sm font-bold text-gray-400">더 불러오는 중...</span>
-              </div>
-            </div>
-          )}
-        </div>
-      </main>
-    </div>
+// 🌟 여러 장의 grid를 PNG로 각각 변환한 뒤 zip 파일 하나로 묶어서 한 번에 다운로드
+// pages: [grid1, grid2, ...], labels: 각 grid에 대응하는 파일명(확장자 제외, mbs_ 접두사는 자동 부여)
+export const downloadGridPagesAsZip = async (pages, labels, zipName = 'floor_pages') => {
+  if (!pages || pages.length === 0) return;
+  const zip = new JSZip();
+  for (let i = 0; i < pages.length; i++) {
+    const blob = await gridToPngBlob(pages[i]);
+    const label = (labels && labels[i]) ? labels[i] : `page_${i + 1}`;
+    zip.file(`mbs_${label}.png`, blob);
+  }
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(zipBlob);
+  link.download = `${zipName}.zip`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+};
+
+// 🌟 페이지 수에 따라 자동으로 방식을 결정: 6장 미만이면 개별 PNG 다운로드, 6장 이상이면 zip 하나로 묶어서 다운로드
+// (브라우저 팝업 차단 및 다운로드 폴더 지저분해지는 문제를 방지하기 위한 기준값)
+const ZIP_THRESHOLD = 6;
+export const downloadPagesAsPngOrZip = async (pages, labels, zipName = 'floor_pages') => {
+  if (!pages || pages.length === 0) return;
+  if (pages.length >= ZIP_THRESHOLD) {
+    await downloadGridPagesAsZip(pages, labels, zipName);
+  } else {
+    for (let i = 0; i < pages.length; i++) {
+      const label = (labels && labels[i]) ? labels[i] : `page_${i + 1}`;
+      exportToPNG(pages[i], label);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+};
+
+// 이미지 파일에서 격자판 역추적 로드 (층별 색상 인식)
+export const importPNGToGrid = (file, callback) => {
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 50; canvas.height = 50;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, 50, 50);
+    const imageData = ctx.getImageData(0, 0, 50, 50).data;
+    const newGrid = Array(50).fill(null).map(() => Array(50).fill(0));
+
+    // 색상 → grid 값 역매핑 테이블 준비 (RGB 거리 기준 최근접 매칭)
+    const colorTable = [
+      { val: FLOOR_VALUE, rgb: [210, 210, 210] }, // 바닥
+      ...Object.entries(FLOOR_COLORS).map(([val, info]) => {
+        const hex = info.hex.replace('#', '');
+        const rgb = [
+          parseInt(hex.substring(0, 2), 16),
+          parseInt(hex.substring(2, 4), 16),
+          parseInt(hex.substring(4, 6), 16),
+        ];
+        return { val: Number(val), rgb };
+      }),
+    ];
+
+    for (let r = 0; r < 50; r++) {
+      for (let c = 0; c < 50; c++) {
+        const idx = (r * 50 + c) * 4;
+        const px = [imageData[idx], imageData[idx + 1], imageData[idx + 2]];
+        // 흰색(빈칸)에 가까우면 0으로 처리
+        if (px[0] > 245 && px[1] > 245 && px[2] > 245) {
+          newGrid[r][c] = 0;
+          continue;
+        }
+        // 가장 가까운 색을 찾아 매핑
+        let bestVal = 0;
+        let bestDist = Infinity;
+        for (const entry of colorTable) {
+          const d = Math.pow(px[0] - entry.rgb[0], 2) + Math.pow(px[1] - entry.rgb[1], 2) + Math.pow(px[2] - entry.rgb[2], 2);
+          if (d < bestDist) { bestDist = d; bestVal = entry.val; }
+        }
+        newGrid[r][c] = bestVal;
+      }
+    }
+    URL.revokeObjectURL(url);
+    callback(newGrid);
+  };
+  img.src = url;
+};
+// 2D 격자 데이터를 3D 뷰어용 배열(x, y, z, mat)로 변환해주는 함수
+export const convertGridTo3DData = (grid) => {
+  if (!grid) return [];
+  const blocks = [];
+  grid.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell) {
+        // 셀 값이 숫자면 해당 층수, 아니면 기본 1층으로 계산
+        const floorHeight = typeof cell === 'number' ? cell : 1; 
+        blocks.push({
+          x: cIdx * 3.0, 
+          y: floorHeight * 3.0 - 1.5, 
+          z: rIdx * 3.0, 
+          mat: 'Concrete' // 기본 뷰는 콘크리트 재질로 통일
+        });
+      }
+    });
+  });
+  return blocks;
+};
+
+// ===================== 3D CSV → 층별 PNG 분할 =====================
+// 🌟 Unity에서 넘어온 3D CSV(20층 등 여러 층)를 웹의 2D grid 색상 체계(1~5층)에
+//    맞게 5층씩 잘라서 grid 배열 여러 개로 변환. (각 grid는 exportToPNG 그대로 사용 가능)
+export const csvDataToFloorPages = (csvText, floorsPerPage = 5, gridSize = 50) => {
+  if (!csvText) return [];
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const idx = {
+    x: headers.indexOf('PosX'),
+    y: headers.indexOf('PosY'),
+    z: headers.indexOf('PosZ'),
+  };
+  if (idx.x === -1 || idx.y === -1 || idx.z === -1) return [];
+
+  const points = [];
+  let minX = Infinity, minZ = Infinity;
+  const ySet = new Set();
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const cols = lines[i].split(',');
+    const x = parseFloat(cols[idx.x]);
+    const y = parseFloat(cols[idx.y]);
+    const z = parseFloat(cols[idx.z]);
+    if ([x, y, z].some(Number.isNaN)) continue;
+    points.push({ x, y, z });
+    if (x < minX) minX = x;
+    if (z < minZ) minZ = z;
+    ySet.add(Math.round(y));
+  }
+  if (points.length === 0) return [];
+
+  // 실제 존재하는 층 높이들을 오름차순 정렬 → "몇 번째 층"인지 인덱스 매기기
+  const sortedYs = Array.from(ySet).sort((a, b) => a - b);
+  const floorIndexOf = (y) => sortedYs.indexOf(Math.round(y));
+
+  const totalFloors = sortedYs.length;
+  const pageCount = Math.ceil(totalFloors / floorsPerPage);
+  const pages = Array.from({ length: pageCount }, () =>
+    Array(gridSize).fill().map(() => Array(gridSize).fill(0))
   );
-}
+
+  points.forEach(p => {
+    const col = Math.round((p.x - minX) / 3.0);
+    const row = Math.round((p.z - minZ) / 3.0);
+    if (col < 0 || col >= gridSize || row < 0 || row >= gridSize) return;
+
+    const floorIdx = floorIndexOf(p.y); // 0 ~ totalFloors-1
+    const pageNum = Math.floor(floorIdx / floorsPerPage);
+    const colorInPage = (floorIdx % floorsPerPage) + 1; // 1~5
+
+    // 이미 더 높은 색(층)이 칠해져 있으면 덮어쓰지 않고 최대값 유지
+    pages[pageNum][row][col] = Math.max(pages[pageNum][row][col], colorInPage);
+  });
+
+  return pages; // [grid1, grid2, grid3, ...] 각 grid는 exportToPNG(grid, name) 그대로 사용 가능
+};
+
+// 🌟 쪼갠 grid들을 기존 exportToPNG로 순차 다운로드 (파일이 개별로 여러 장 떨어짐 — 구버전, 호환용으로 유지)
+//    (브라우저가 연속 다운로드를 팝업처럼 막는 경우가 있어 약간의 딜레이를 둠)
+export const downloadFloorPagesAsPngs = async (csvText, baseName = 'structure', floorsPerPage = 5) => {
+  const pages = csvDataToFloorPages(csvText, floorsPerPage);
+  if (pages.length === 0) {
+    alert('CSV에서 유효한 좌표(PosX/PosY/PosZ)를 찾지 못했습니다.');
+    return;
+  }
+  for (let i = 0; i < pages.length; i++) {
+    const startFloor = i * floorsPerPage + 1;
+    const endFloor = Math.min((i + 1) * floorsPerPage, pages.length * floorsPerPage);
+    const label = `${baseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
+    exportToPNG(pages[i], label);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+};
+
+// 🌟 쪼갠 grid들을 PNG로 변환해 하나의 ZIP으로 다운로드한다.
+// 브라우저가 연속 PNG 다운로드를 막아 일부 층만 저장되는 문제를 피한다.
+export const downloadFloorPagesAsZip = async (csvText, baseName = 'structure', floorsPerPage = 5) => {
+  const pages = csvDataToFloorPages(csvText, floorsPerPage);
+  if (pages.length === 0) {
+    alert('CSV에서 유효한 좌표(PosX/PosY/PosZ)를 찾지 못했습니다.');
+    return;
+  }
+  const labels = pages.map((_, i) => {
+    const startFloor = i * floorsPerPage + 1;
+    const endFloor = Math.min((i + 1) * floorsPerPage, pages.length * floorsPerPage);
+    return `${baseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
+  });
+  await downloadGridPagesAsZip(pages, labels, `${baseName}_floors`);
+};
+
 ```
 
-// FILE PATH: src/views/DashboardView.jsx
-// MODIFIED: 26-08-23 22:39 | LINES: 66
+// FILE PATH: src/components/BlockEditor3D.jsx
+// MODIFIED: 26-09-29 12:33 | LINES: 297
 ```jsx
-import React from 'react';
-import BlueprintCard from '../components/BlueprintCard';
-import Button from '../components/ui/Button';
+import React, { useState, useRef, useMemo, useLayoutEffect, useEffect } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
+import { OrbitControls, TransformControls } from '@react-three/drei';
+import * as THREE from 'three';
 
-export default function DashboardView({ user, blueprints, setView, setUser, onSelectBlueprint }) {
+// 블록 편집기: 클릭/박스/연결 선택 + 삭제 + 케이지(FFD) 변형
+// props: blocks([{x,y,z,mat,color,type,raw}]), onApply(newBlocks), onClose()
+
+const S = 3; // 블록 한 변(m)
+const snap = (v) => Math.round((v - 1.5) / S) * S + 1.5;
+const key = (x, y, z) => `${Math.round(x / S)},${Math.round(y / S)},${Math.round(z / S)}`;
+const DIRS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+
+function makeCage(blocks) {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  blocks.forEach(b => [b.x, b.y, b.z].forEach((v, a) => {
+    min[a] = Math.min(min[a], v - S / 2);
+    max[a] = Math.max(max[a], v + S / 2);
+  }));
+  // 코너 번호: i = ix + 2*iy + 4*iz (iy=1이 윗면)
+  const c = [];
+  for (let i = 0; i < 8; i++) {
+    c.push([i & 1 ? max[0] : min[0], i & 2 ? max[1] : min[1], i & 4 ? max[2] : min[2]]);
+  }
+  return { min, max, c };
+}
+
+// 트라일리니어 보간: 박스 안 비율 좌표 → 변형된 코너들의 가중합
+function warp(b, cage) {
+  const t = [b.x, b.y, b.z].map((v, a) => (v - cage.min[a]) / ((cage.max[a] - cage.min[a]) || 1));
+  const out = [0, 0, 0];
+  for (let i = 0; i < 8; i++) {
+    const w = (i & 1 ? t[0] : 1 - t[0]) * (i & 2 ? t[1] : 1 - t[1]) * (i & 4 ? t[2] : 1 - t[2]);
+    for (let a = 0; a < 3; a++) out[a] += w * cage.c[i][a];
+  }
+  return out;
+}
+
+function Blocks({ work, sel, cage, canPick, onPick }) {
+  const ref = useRef();
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+  const col = useMemo(() => new THREE.Color(), []);
+
+  useLayoutEffect(() => {
+    const m = ref.current;
+    if (!m) return;
+    work.forEach((b, i) => {
+      const p = cage ? warp(b, cage) : [b.x, b.y, b.z];
+      dummy.position.set(p[0], p[1], p[2]);
+      dummy.updateMatrix();
+      m.setMatrixAt(i, dummy.matrix);
+      col.set(sel.has(i) ? '#f97316' : (b.color || '#bdc3c7'));
+      m.setColorAt(i, col);
+    });
+    m.instanceMatrix.needsUpdate = true;
+    if (m.instanceColor) m.instanceColor.needsUpdate = true;
+  }, [work, sel, cage, dummy, col]);
+
   return (
-    <div className="flex h-screen bg-gray-50 text-gray-800 font-sans">
-      <aside className="w-64 bg-white border-r border-gray-200 p-6 flex flex-col shrink-0">
-        <div className="text-2xl font-black text-blue-600 mb-10">DESIGN CENTER</div>
-        <div className="bg-blue-50 p-4 rounded-xl mb-10">
-          <div className="text-xs font-bold text-blue-400 uppercase mb-1">Signed in as</div>
-          <div className="font-bold text-blue-700">{user?.username}</div>
-        </div>
-    
-        <nav className="flex-1 space-y-2">
-          <button className="w-full text-left p-3 bg-blue-600 text-white rounded-lg font-bold shadow-md">🏠 대시보드</button>
-          <button onClick={() => setView('editor')} className="w-full text-left p-3 hover:bg-gray-100 rounded-lg text-gray-600 font-medium transition-colors">📐 새 도면 그리기</button>
-          {/* 🌟 나중에 만들 전체 전시관 버튼만 미리 달아뒀습니다 */}
-          <button onClick={() => setView('explore')} className="w-full text-left p-3 hover:bg-gray-100 rounded-lg text-gray-600 font-medium transition-colors">🌐 전체 전시관 (검색)</button>
-        </nav>
-        <button onClick={() => { setUser(null); setView('auth'); }} className="p-3 text-gray-400 font-bold hover:text-red-500 transition-colors">로그아웃</button>
-      </aside>
+    <instancedMesh
+      ref={ref}
+      key={work.length}
+      args={[null, null, work.length]}
+      onClick={(e) => {
+        if (!canPick || e.delta > 4) return; // 카메라 드래그는 클릭으로 안 침
+        e.stopPropagation();
+        onPick(e.instanceId, e.shiftKey);
+      }}
+    >
+      <boxGeometry args={[S, S, S]} />
+      <meshStandardMaterial roughness={0.8} />
+    </instancedMesh>
+  );
+}
 
-      <main className="flex-1 p-10 overflow-y-auto">
-        <header className="flex justify-between items-center mb-6">
-          <h2 className="text-3xl font-black text-gray-900">내 구조물</h2>
-          <Button variant="primary" onClick={() => setView('editor')} className="px-6 py-3 rounded-full">새 프로젝트 시작</Button>
-        </header>
+// 박스 선택용: 각 블록을 화면 좌표로 투영해서 사각형 안에 있는지 검사 (뒤쪽 블록도 관통해서 선택)
+function Bridge({ apiRef, work }) {
+  const { camera, gl } = useThree();
+  useEffect(() => {
+    apiRef.current.pick = (r) => {
+      const box = gl.domElement.getBoundingClientRect();
+      const v = new THREE.Vector3();
+      const hit = [];
+      work.forEach((b, i) => {
+        v.set(b.x, b.y, b.z).project(camera);
+        const sx = ((v.x + 1) / 2) * box.width + box.left;
+        const sy = ((1 - v.y) / 2) * box.height + box.top;
+        if (v.z < 1 && sx >= r.x0 && sx <= r.x1 && sy >= r.y0 && sy <= r.y1) hit.push(i);
+      });
+      return hit;
+    };
+  }, [apiRef, work, camera, gl]);
+  return null;
+}
 
-        {/* 🌟 1. 내 구조물 영역: 높이(약 2줄/6개 분량)를 고정하고 내부 스크롤 활성화 */}
-        <div className="max-h-[580px] overflow-y-auto pr-3 mb-12 border border-transparent hover:border-gray-100 rounded-2xl transition-colors">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {blueprints.mine.length === 0 ? (
-              <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">아직 저장된 도면이 없습니다</div>
-            ) : (
-              blueprints.mine.map(bp => (
-                <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-              ))
-            )}
-          </div>
-        </div>
+// 케이지 12개 모서리를 현재 코너 위치로 그림
+const EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+function CageLines({ cage }) {
+  const geo = useMemo(() => {
+    const pts = EDGES.flatMap(([a, b]) => [...cage.c[a], ...cage.c[b]]);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    return g;
+  }, [cage]);
+  return (
+    <lineSegments geometry={geo}>
+      <lineBasicMaterial color="#38bdf8" depthTest={false} />
+    </lineSegments>
+  );
+}
 
-        <div className="border-t border-gray-200 pt-10">
-          <div className="flex justify-between items-center mb-6">
-            <h2 className="text-2xl font-black text-gray-900">🌐 전체 전시관 미리보기</h2>
-            {/* 🌟 나중에 뚫어놓을 '더보기' 버튼 */}
-            <Button variant="secondary" onClick={() => setView('explore')}>더보기 (전체보기) ➔</Button>
-          </div>
-  
-          {/* 🌟 2. 전체 전시관 영역: 높이 고정 및 내부 스크롤 똑같이 적용 */}
-          <div className="max-h-[580px] overflow-y-auto pr-3 border border-transparent hover:border-gray-100 rounded-2xl transition-colors">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {blueprints.others.length === 0 ? (
-                <div className="col-span-3 h-32 bg-gray-100 rounded-2xl flex items-center justify-center text-gray-400 font-medium">다른 사용자의 도면이 없습니다</div>
+export default function BlockEditor3D({ blocks, onApply, onClose }) {
+  const [work, setWork] = useState(blocks);
+  const [hist, setHist] = useState([]);
+  const [sel, setSel] = useState(new Set());
+  const [tool, setTool] = useState('click'); // 'click' | 'box'
+  const [cage, setCage] = useState(null);
+  const [active, setActive] = useState(null);
+  const [link, setLink] = useState(true); // 윗면 4점 같이 이동 (기울기 보정용)
+  const [rotMode, setRotMode] = useState(false); // 체크하면 바닥 고정 수직축 회전 모드
+  const [rotDeg, setRotDeg] = useState(0);
+  const bottomCenter = useMemo(() => cage
+    ? [0, 1, 2].map(a => (cage.c[0][a] + cage.c[1][a] + cage.c[4][a] + cage.c[5][a]) / 4)
+    : [0, 0, 0], [cage]);
+  const [rect, setRect] = useState(null);
+  const apiRef = useRef({});
+  const cornerRefs = useRef([]);
+
+  const view = useMemo(() => {
+    const c = makeCage(blocks);
+    const ctr = c.min.map((m, a) => (m + c.max[a]) / 2);
+    const size = Math.max(...c.max.map((m, a) => m - c.min[a]));
+    return { ctr, pos: [ctr[0] + size * 1.2, ctr[1] + size * 0.6, ctr[2] + size * 1.2] };
+  }, [blocks]);
+
+  const commit = (next) => {
+    setHist(h => [...h.slice(-19), work]);
+    setWork(next);
+    setSel(new Set());
+  };
+  const undo = () => {
+    if (!hist.length) return;
+    setWork(hist[hist.length - 1]);
+    setHist(h => h.slice(0, -1));
+    setSel(new Set());
+  };
+
+  const pick = (i, shift) => setSel(prev => {
+    if (!shift) return new Set([i]);
+    const n = new Set(prev);
+    n.has(i) ? n.delete(i) : n.add(i);
+    return n;
+  });
+
+  const grow = () => { // 선택한 블록과 붙어 있는 덩어리 전체 선택
+    const idx = new Map(work.map((b, i) => [key(b.x, b.y, b.z), i]));
+    const seen = new Set(sel);
+    const stack = [...sel];
+    while (stack.length) {
+      const b = work[stack.pop()];
+      for (const [dx, dy, dz] of DIRS) {
+        const j = idx.get(key(b.x + dx * S, b.y + dy * S, b.z + dz * S));
+        if (j !== undefined && !seen.has(j)) { seen.add(j); stack.push(j); }
+      }
+    }
+    setSel(seen);
+  };
+  const invert = () => setSel(new Set(work.map((_, i) => i).filter(i => !sel.has(i))));
+  const del = () => sel.size && commit(work.filter((_, i) => !sel.has(i)));
+
+  const applyCage = () => { // 확정할 때만 격자에 스냅 (같은 칸에 겹치면 하나만 남김)
+    const m = new Map();
+    work.forEach(b => {
+      const p = warp(b, cage);
+      const x = snap(p[0]), y = snap(p[1]), z = snap(p[2]);
+      const k = key(x, y, z);
+      if (!m.has(k)) m.set(k, { ...b, x, y, z });
+    });
+    commit([...m.values()]);
+    setCage(null);
+    setActive(null);
+  };
+
+  const onCornerChange = () => {
+    if (active === null) return;
+    const p = cornerRefs.current[active].position;
+    setCage(c => {
+      const next = c.c.map(a => a.slice());
+      const d = [p.x - next[active][0], p.y - next[active][1], p.z - next[active][2]];
+      const targets = link && (active & 2) ? [2, 3, 6, 7] : [active];
+      targets.forEach(i => { for (let a = 0; a < 3; a++) next[i][a] += d[a]; });
+      return { ...c, c: next };
+    });
+  };
+
+  // 도자기 물레처럼: 바닥(iy=0, i&2===0)은 고정하고 윗부분만 바닥 중심축으로 회전
+  const rotate = (deg) => {
+    setRotDeg(deg);
+    const rad = (deg * Math.PI) / 180;
+    const cx = bottomCenter[0], cz = bottomCenter[2];
+    const cs = Math.cos(rad), sn = Math.sin(rad);
+    setCage(c => {
+      const next = c.c.map((p, i) => {
+        if (!(i & 2)) return p.slice(); // 바닥 4점 고정
+        const dx = p[0] - cx, dz = p[2] - cz;
+        return [cx + dx * cs - dz * sn, p[1], cz + dx * sn + dz * cs];
+      });
+      return { ...c, c: next };
+    });
+  };
+
+  const btn = 'px-3 py-1.5 rounded-lg text-xs font-bold bg-gray-700 text-white hover:bg-gray-600 disabled:opacity-40';
+  const on = 'bg-blue-600 hover:bg-blue-500';
+
+  return (
+    <div className="fixed inset-0 z-50 bg-gray-900 flex flex-col">
+      <div className="flex flex-wrap items-center gap-2 p-3 bg-gray-800">
+        <span className="text-white font-black text-sm mr-2">블록 편집기</span>
+        <button className={`${btn} ${tool === 'click' && !cage ? on : ''}`} disabled={!!cage} onClick={() => setTool('click')}>클릭 선택</button>
+        <button className={`${btn} ${tool === 'box' && !cage ? on : ''}`} disabled={!!cage} onClick={() => setTool('box')}>박스 선택</button>
+        <button className={btn} disabled={!sel.size || !!cage} onClick={grow}>연결된 덩어리</button>
+        <button className={btn} disabled={!!cage} onClick={invert}>선택 반전</button>
+        <button className={`${btn} !bg-red-600`} disabled={!sel.size || !!cage} onClick={del}>삭제</button>
+        <button className={btn} disabled={!hist.length} onClick={undo}>되돌리기</button>
+        <span className="w-px h-5 bg-gray-600 mx-1" />
+        {!cage
+          ? <button className={btn} onClick={() => { setCage(makeCage(work)); setRotMode(false); setRotDeg(0); }}>케이지 변형</button>
+          : <>
+              <button className={`${btn} !bg-green-600`} onClick={applyCage}>변형 확정(스냅)</button>
+              <button className={btn} onClick={() => { setCage(null); setActive(null); }}>취소</button>
+              <label className="text-xs text-gray-200 flex items-center gap-1">
+                <input type="checkbox" checked={rotMode} onChange={e => { setRotMode(e.target.checked); setActive(null); }} /> 수직회전 모드(바닥 고정)
+              </label>
+              {rotMode ? (
+                <>
+                  <input type="range" min="-45" max="45" step="0.5" value={rotDeg}
+                    onChange={e => rotate(parseFloat(e.target.value))} className="w-40" />
+                  <span className="text-xs text-gray-200 w-12">{rotDeg.toFixed(1)}°</span>
+                </>
               ) : (
-                blueprints.others.map(bp => (
-                  <BlueprintCard key={bp.id} bp={bp} onClick={() => onSelectBlueprint(bp)} />
-                ))
+                <label className="text-xs text-gray-200 flex items-center gap-1">
+                  <input type="checkbox" checked={link} onChange={e => setLink(e.target.checked)} /> 윗면 4점 같이 이동
+                </label>
               )}
-            </div>
-          </div>
+            </>}
+        <span className="text-xs text-gray-300 ml-2">선택 {sel.size} / 전체 {work.length}</span>
+        <div className="flex-1" />
+        <button className={`${btn} !bg-green-600`} disabled={!!cage} onClick={() => onApply(work)}>적용</button>
+        <button className={btn} onClick={onClose}>닫기</button>
+      </div>
+
+      <div className="flex-1 relative">
+        <Canvas camera={{ position: view.pos, fov: 45, near: 1, far: 5000 }}>
+          <ambientLight intensity={0.7} />
+          <directionalLight position={[100, 200, 100]} intensity={1.2} />
+          <OrbitControls makeDefault target={view.ctr} />
+          <Bridge apiRef={apiRef} work={work} />
+          <Blocks work={work} sel={sel} cage={cage} canPick={tool === 'click' && !cage} onPick={pick} />
+          {cage && cage.c.map((p, i) => (
+            <mesh key={i} ref={el => (cornerRefs.current[i] = el)} position={p}
+              onClick={(e) => { e.stopPropagation(); if (!rotMode) setActive(i); }}>
+              <sphereGeometry args={[3, 16, 16]} />
+              <meshBasicMaterial color={rotMode ? '#6b7280' : (active === i ? '#facc15' : '#38bdf8')} depthTest={false} />
+            </mesh>
+          ))}
+          {cage && <CageLines cage={cage} />}
+          {cage && !rotMode && active !== null && cornerRefs.current[active] && (
+            <TransformControls object={cornerRefs.current[active]} mode="translate" onObjectChange={onCornerChange} />
+          )}
+        </Canvas>
+
+        {tool === 'box' && !cage && (
+          <div
+            className="absolute inset-0 cursor-crosshair"
+            onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); setRect({ x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY }); }}
+            onPointerMove={e => rect && setRect({ ...rect, x1: e.clientX, y1: e.clientY })}
+            onPointerUp={e => {
+              if (!rect) return;
+              const r = { x0: Math.min(rect.x0, e.clientX), x1: Math.max(rect.x0, e.clientX), y0: Math.min(rect.y0, e.clientY), y1: Math.max(rect.y0, e.clientY) };
+              const hit = apiRef.current.pick(r);
+              setSel(prev => (e.shiftKey ? new Set([...prev, ...hit]) : new Set(hit)));
+              setRect(null);
+            }}
+          />
+        )}
+        {rect && (
+          <div className="fixed border border-orange-400 bg-orange-400/20 pointer-events-none"
+            style={{ left: Math.min(rect.x0, rect.x1), top: Math.min(rect.y0, rect.y1), width: Math.abs(rect.x1 - rect.x0), height: Math.abs(rect.y1 - rect.y0) }} />
+        )}
+        <div className="absolute bottom-3 left-3 text-[11px] text-gray-300 bg-black/40 rounded-lg px-3 py-2 pointer-events-none">
+          {cage ? (rotMode ? '슬라이더로 회전 — 바닥은 고정되고 윗부분만 그 축을 중심으로 돌아가요' : '파란 점 클릭 → 화살표 드래그로 이동 (바닥/윗면 코너 모두 가능)') : '클릭: 선택 · Shift: 추가/해제 · 박스 모드는 드래그(뒤쪽 블록도 선택)'}
         </div>
-      </main>
+      </div>
     </div>
   );
 }
