@@ -341,6 +341,7 @@ export default function EditorView({
   const [snapshots, setSnapshots] = useState([]); // 3스냅샷 제한 관리
   const [isExtracting, setIsExtracting] = useState(false);
   const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
+  const [applyTiltFix, setApplyTiltFix] = useState(true); // 🌟 기울기 자동 보정 여부 (마리나베이샌즈 등 경사 건물은 해제 가능)
 
   // 🌟 지붕 모서리 A/B/C/D 상세입력 — 4개 다 채워야 보간, 하나라도 비어있으면 평지붕 기본값
   const [roofLabelMap, setRoofLabelMap] = useState(null); // /api/estimate-roof-corners 응답: {A:{original_position,estimated_height_m}, ...}
@@ -539,6 +540,7 @@ export default function EditorView({
       formData.append('endX', realEndX);
       formData.append('endY', realEndY);
       formData.append('realHeightMeters', realHeightMeters);
+      formData.append('applyTiltFix', applyTiltFix);
 
       // 🌟 지붕 A/B/C/D 4개 값이 전부 입력돼 있으면, 추정 시 받은 original_position(TL/TR/BL/BR)
       //    매핑을 그대로 이용해 서버가 기대하는 roofTL/TR/BL/BR 슬롯에 넣어 보낸다.
@@ -846,6 +848,15 @@ export default function EditorView({
                           onChange={e => setRealHeightMeters(e.target.value)}
                           className="w-28 px-2 py-2 border border-gray-300 rounded-md text-sm"
                         />
+                        <label className="flex items-center space-x-1.5 text-xs text-gray-700 cursor-pointer select-none border border-gray-200 px-2.5 py-2 rounded-md hover:bg-gray-50 bg-white shadow-sm" title="체크 해제 시 마리나베이 샌즈처럼 기울어진 경사형 건물의 본래 각도를 그대로 보존합니다.">
+                          <input
+                            type="checkbox"
+                            checked={applyTiltFix}
+                            onChange={e => setApplyTiltFix(e.target.checked)}
+                            className="rounded text-blue-600 focus:ring-blue-500 w-3.5 h-3.5"
+                          />
+                          <span className="font-medium text-gray-700">기울기 직립 보정</span>
+                        </label>
                         <Button variant="secondary" onClick={() => { setImageSrc(null); setBox(null); setRoofLabelMap(null); setRoofCorners({ A: '', B: '', C: '', D: '' }); }}>취소</Button>
                         <Button variant="dark" onClick={handleEstimateRoofCorners} disabled={!box || isEstimatingRoof}>
                           {isEstimatingRoof ? '추정 중...⏳' : '🏠 지붕 모서리 추정'}

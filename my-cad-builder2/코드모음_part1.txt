@@ -1,11 +1,11 @@
 // FILE PATH: src/views/DetailView.jsx
-// MODIFIED: 26-09-29 13:34 | LINES: 214
+// MODIFIED: 26-10-21 22:45 | LINES: 300
 ```jsx
-// LINE 1 ~ 7: 에디터에 있던 CSV 문자열 파싱 알고리즘을 가져오고, 파일 용량 계산 함수가 3D text 용량도 지원하도록 수정합니다.
-import React, { useMemo } from 'react';
-import { exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+import React, { useEffect, useMemo, useState } from 'react';
+import { downloadFloorPagesAsZip, exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
+import { parseStressCsv, RISK_ORDER, RISK_COLORS, RISK_LABELS } from '../utils/stressUtils';
 import LiveDemoViewer from '../components/LiveDemoViewer';
-
+import StressAnalysisModal from '../components/StressAnalysisModal';
 // 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
 function parseCsvToBlocks(csvText) {
   if (!csvText) return [];
@@ -47,10 +47,27 @@ export default function DetailView({
   hasLiked,
   onLikeToggle,
   onAddComment,
-  onEditBlueprint
+  onEditBlueprint,
+  isOwner = true
 }) {
+  // 하중 테스트 결과 업로드 팝업
+  const [stressOpen, setStressOpen] = useState(false);
+  const [savedAnalysis, setSavedAnalysis] = useState(selectedBp?.ai_analysis ?? null);
+
+  // 🌟 하중 테스트 결과(CurrentStress.csv 원문) + 뷰어 표시 모드
+  const [stressCsv, setStressCsv] = useState(selectedBp?.stress_csv ?? null);
+  const [colorMode, setColorMode] = useState(selectedBp?.stress_csv ? 'risk' : 'normal'); // 'normal' | 'risk'
+  const [posMode, setPosMode] = useState('orig'); // 'orig' | 'moved'
+
+  // 다른 도면으로 이동하면 이전 도면의 분석/결과가 남지 않도록 초기화
+  useEffect(() => {
+    setSavedAnalysis(selectedBp?.ai_analysis ?? null);
+    setStressCsv(selectedBp?.stress_csv ?? null);
+    setColorMode(selectedBp?.stress_csv ? 'risk' : 'normal');
+    setPosMode('orig');
+  }, [selectedBp?.id]);
+
   // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
-// LINE 205 ~ 207: grid_data가 없으면 csv_data 문자열 길이로 파일 용량을 대신 계산하고, 3D 블록 데이터를 메모이제이션합니다.
   // 🌟 2D/3D 유연하게 대응하는 용량 계산 함수
   const calculateFileSize = () => {
     const targetData = selectedBp?.grid_data || selectedBp?.csv_data;
@@ -65,14 +82,22 @@ export default function DetailView({
     return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
   }, [selectedBp?.csv_data, is3D]);
 
-     const handlePngDownload = () => {
-      if (!selectedBp.grid_data) { alert('3D 프로젝트는 PNG 도면 내보내기를 지원하지 않습니다. CSV 내보내기를 이용해주세요.'); return; }
-      const name = prompt("파일 이름을 입력하세요 (mbs_ 가 자동으로 붙습니다)", selectedBp.name || "도면");
-    if (name === null) return;
+  // 🌟 위험도 색상 블록 (일반=회색, 주의=노랑, 위험=빨강, 파괴=보라)
+  const stressPreview = useMemo(() => parseStressCsv(stressCsv, posMode), [stressCsv, posMode]);
+  const showRisk = is3D && colorMode === 'risk' && stressPreview.blocks.length > 0;
+
+  const handlePngDownload = async () => {
+    // 브라우저/웹뷰에서 prompt()가 차단될 수 있으므로 프로젝트 이름을 바로 사용한다.
+    const name = selectedBp.name || '도면';
+
+    if (is3D) {
+      // 3D CSV는 5개 층씩 2D PNG로 변환한다. PNG가 많아지면 ZIP으로 묶어 내려받는다.
+      await downloadFloorPagesAsZip(selectedBp.csv_data, name);
+      return;
+    }
+
     exportToPNG(selectedBp.grid_data, name);
   };
-
-
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
@@ -98,20 +123,66 @@ export default function DetailView({
         
         {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
         <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
-          // LINE 211 ~ 216: 프로젝트 유형(is3D)에 맞게 제목을 매칭하고, LiveDemoViewer에 알맞은 prop 분배 및 하단 2D 격자 패널 조건부 노출을 처리합니다.
           <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
-            {is3D ? "3D AI 건축물 입체 프리뷰" : "구조물 설계도 평면도 미리보기"}
+            {is3D ? (showRisk ? "3D 하중 테스트 위험도 프리뷰" : "3D AI 건축물 입체 프리뷰") : "구조물 설계도 평면도 미리보기"}
           </div>
+
+          {/* 🌟 하중 테스트 결과가 있을 때만: 기본 색 / 위험도 색 전환 */}
+          {is3D && stressCsv && (
+            <div className="w-full flex flex-wrap items-center justify-between gap-2 mb-3">
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                {[['normal', '기본 색'], ['risk', '위험도 색']].map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setColorMode(key)}
+                    className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                      colorMode === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200/60'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {colorMode === 'risk' && (
+                <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                  {[['orig', '원위치'], ['moved', '테스트 후 위치']].map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => setPosMode(key)}
+                      className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                        posMode === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200/60'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           
-          {/* 🌟 3D 모드라면 parsed3DBlocks 데이터를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
-          <div className="w-full h-[350px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
+          {/* 🌟 3D 모드라면 parsed3DBlocks(또는 위험도 색 블록)를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
+          <div className="w-full h-[350px] mb-2 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
             <LiveDemoViewer 
               grid={!is3D ? selectedBp?.grid_data : null} 
-              data={is3D ? parsed3DBlocks : null} 
+              data={is3D ? (showRisk ? stressPreview.blocks : parsed3DBlocks) : null} 
               mode="static" 
               maxBlocks={10000} 
             />
           </div>
+
+          {/* 🌟 위험도 범례 */}
+          {showRisk && (
+            <div className="w-full flex flex-wrap gap-x-4 gap-y-1 mb-4 text-[11px] text-gray-600 font-medium">
+              {RISK_ORDER.map((key) => (
+                <span key={key} className="flex items-center gap-1.5">
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: RISK_COLORS[key] }} />
+                  {RISK_LABELS[key]} {stressPreview.counts[key]}
+                </span>
+              ))}
+            </div>
+          )}
+          {!showRisk && <div className="mb-2" />}
 
           {/* 🌟 2D 설계도일 때만 하단의 미니 격자판(2D 레고 도면)을 렌더링하고, 3D 건축물일 때는 공간을 차지하지 않도록 숨깁니다. */}
           {!is3D && selectedBp.grid_data && (
@@ -127,7 +198,7 @@ export default function DetailView({
             </div>
           )}
           
-          <div className="w-full flex flex-col gap-3 mt-6">
+          <div className="w-full flex flex-col gap-3 mt-4">
             <div className="grid grid-cols-2 gap-3">
               <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
                 📸 PNG 이미지 다운로드 (mbs_)
@@ -148,6 +219,11 @@ export default function DetailView({
             <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
               📐 이 도면 편집기로 열기 (CAD 작업실 이동)
             </button>
+            {is3D && (
+              <button onClick={() => setStressOpen(true)} className="w-full p-4 bg-white text-gray-800 border border-gray-300 rounded-xl text-sm font-bold hover:bg-gray-50 shadow-sm transition-all">
+                🧪 하중 테스트 결과 업로드 · AI 분석
+              </button>
+            )}
           </div>
         </div>
 
@@ -212,658 +288,633 @@ export default function DetailView({
         </div>
 
       </main>
+
+      <StressAnalysisModal
+        isOpen={stressOpen}
+        onClose={() => setStressOpen(false)}
+        blueprint={selectedBp}
+        savedAnalysis={savedAnalysis}
+        canUpload={isOwner}
+        onPreview={(text) => { setStressCsv(text); setColorMode('risk'); }}
+        onUploaded={(f) => { setSavedAnalysis(f.ai_analysis); setStressCsv(f.stress_csv); }}
+      />
     </div>
   );
 }
+
 ```
 
-// FILE PATH: src/App.jsx
-// MODIFIED: 26-09-29 12:37 | LINES: 343
+// FILE PATH: src/components/StressAnalysisModal.jsx
+// MODIFIED: 26-10-21 18:04 | LINES: 232
 ```jsx
-// FILE PATH: src/App.jsx
-import React, { useState, useEffect } from 'react';
-import { supabase } from './supabaseClient';
-import { hashPw, applyWallBorder, floodFill, getMaxColorUsed, getNextPageBase, exportStackedFloorsToCSV } from './utils/cadUtils';
-import Button from './components/ui/Button'; // 🌟 팝업용 버튼 추가
-import AuthView from './views/AuthView';
-import DashboardView from './views/DashboardView';
-import EditorView from './views/EditorView';
-import DetailView from './views/DetailView';
-import ExploreView from './views/ExploreView'; 
+import React, { useMemo, useState } from 'react';
+import { supabase } from '../supabaseClient';
+import LiveDemoViewer from './LiveDemoViewer';
+import { parseStressCsv, RISK_ORDER, RISK_COLORS, RISK_LABELS } from '../utils/stressUtils';
 
-export default function App() {
-  const [user, setUser] = useState(null);
-  const [view, setView] = useState('auth');
-  const [authMode, setAuthMode] = useState('login');
-  const [authForm, setAuthForm] = useState({ id: '', pw: '', email: '' });
-  const [grid, setGrid] = useState(Array(50).fill().map(() => Array(50).fill(0)));
-  const [mode, setMode] = useState('wall_rect');
-  const [paintColor, setPaintColor] = useState(1); 
-  const [stackedFloors, setStackedFloors] = useState([]); 
-  const [isDrawing, setIsDrawing] = useState(false);
-  const [history, setHistory] = useState([]);
-  const [startPos, setStartPos] = useState(null);
-  const [currentPos, setCurrentPos] = useState(null);
-  const [blueprints, setBlueprints] = useState({ mine: [], others: [] });
+const API_URL = 'http://localhost:8000/api/analyze-stress';
 
-  const [selectedBp, setSelectedBp] = useState(null);
-  const [commentInput, setCommentInput] = useState('');
-  const [likesData, setLikesData] = useState({}); 
-  const [commentsData, setCommentsData] = useState({}); 
+const RISK_META = {
+  Safe: { label: RISK_LABELS.Safe, color: RISK_COLORS.Safe },
+  Warning: { label: RISK_LABELS.Warning, color: RISK_COLORS.Warning },
+  Danger: { label: RISK_LABELS.Danger, color: RISK_COLORS.Danger },
+  Destroyed: { label: RISK_LABELS.Destroyed, color: RISK_COLORS.Destroyed },
+};
 
-  // 🌟 업로드 팝업 상태 관리
-  const [uploadModal, setUploadModal] = useState({ isOpen: false, payload: null, title: '새 프로젝트', type: 'blueprint' });
+function RiskBar({ risk, total }) {
+  return (
+    <div>
+      <div className="flex h-3 rounded-full overflow-hidden bg-gray-100">
+        {Object.entries(RISK_META).map(([key, meta]) => {
+          const n = risk[key] || 0;
+          return n > 0 ? (
+            <div key={key} style={{ width: `${(n / total) * 100}%`, backgroundColor: meta.color }} title={`${meta.label} ${n}`} />
+          ) : null;
+        })}
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[11px] text-gray-600 font-medium">
+        {Object.entries(RISK_META).map(([key, meta]) => (
+          <span key={key} className="flex items-center gap-1.5">
+            <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: meta.color }} />
+            {meta.label} {risk[key] || 0}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-  // 브라우저 뒤로가기(popstate) 감지 센서
-  useEffect(() => {
-    const handlePopState = (event) => {
-      if (event.state && event.state.view) {
-        setView(event.state.view);
-      }
-    };
-    window.addEventListener('popstate', handlePopState);
-    return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
+const BTN = 'px-4 py-2.5 rounded-xl text-xs font-bold shadow-sm transition-all disabled:bg-gray-200 disabled:text-gray-400 disabled:shadow-none disabled:cursor-not-allowed';
 
-  // setView를 감싸서 가짜 URL 기록(history)을 남기는 전용 함수
-  const handleSetView = (newView) => {
-    window.history.pushState({ view: newView }, '', `?view=${newView}`);
-    setView(newView);
+export default function StressAnalysisModal({
+  isOpen,
+  onClose,
+  blueprint,
+  savedAnalysis = null, // 이미 저장돼 있는 분석 (있으면 참고용으로 표시)
+  canUpload = true,
+  onUploaded,
+  onPreview, // 파일 선택 즉시 CSV 원문을 부모(DetailView 3D 뷰어)로 전달
+}) {
+  const [file, setFile] = useState(null);
+  const [csvText, setCsvText] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [posMode, setPosMode] = useState('orig'); // 'orig' = 원위치, 'moved' = 테스트 후 위치
+
+  // 🌟 AI 분석을 기다리지 않고, CSV의 RiskLevel만으로 바로 색을 입힌 3D 블록 생성
+  const preview = useMemo(() => parseStressCsv(csvText, posMode), [csvText, posMode]);
+
+  if (!isOpen) return null;
+
+  // 업로드는 "새 분석이 성공적으로 도착한 뒤"에만 활성화
+  const canSubmit = canUpload && !!result?.analysis && !loading && !uploading && !uploaded;
+
+  const handleSelect = async (e) => {
+    const picked = e.target.files?.[0];
+    e.target.value = ''; // 같은 파일을 다시 골라도 change 이벤트가 오도록
+    if (!picked) return;
+    const text = await picked.text();
+    setFile(picked);
+    setCsvText(text);
+    onPreview?.(text); // 🌟 상세 화면 3D 뷰어도 즉시 위험도 색으로 전환
+    setResult(null); // 파일이 바뀌면 이전 분석은 무효 → 업로드 다시 비활성화
+    setError('');
+    setUploaded(false);
   };
 
-  const handleSignUp = async () => {
-    const { error } = await supabase.from('users').insert([{ username: authForm.id, password_hash: hashPw(authForm.pw), email: authForm.email }]);
-    if (error) alert("이미 존재하는 ID입니다.");
-    else { alert("계정이 생성되었습니다! 로그인해주세요."); setAuthMode('login'); }
-  };
-
-  const handleLogin = async () => {
-    const { data } = await supabase.from('users').select('*').eq('username', authForm.id).eq('password_hash', hashPw(authForm.pw)).single();
-    if (data) { 
-      setUser(data); 
-      handleSetView('dashboard'); 
-    } else {
-      alert("아이디 혹은 비밀번호가 틀립니다.");
+  const handleAnalyze = async () => {
+    if (!file) return;
+    setLoading(true);
+    setResult(null);
+    setError('');
+    setUploaded(false);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch(API_URL, { method: 'POST', body: formData });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '분석 요청에 실패했습니다.');
+      setResult(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
   };
 
-  const fetchBlueprints = async () => {
-    const { data: allData } = await supabase.from('blueprints').select('*').order('created_at', { ascending: false });
-    const all = allData || [];
-    setBlueprints({ mine: all.filter(bp => bp.user_id === user?.id), others: all.filter(bp => bp.user_id !== user?.id) });
-  };
+  const handleUpload = async () => {
+    setUploading(true);
+    setError('');
+    const fields = { stress_csv: csvText, ai_analysis: result.analysis };
+    const { data, error: dbError } = await supabase
+      .from('blueprints')
+      .update(fields)
+      .eq('id', blueprint.id)
+      .select('id');
+    setUploading(false);
 
-  useEffect(() => { if (view === 'dashboard' && user) fetchBlueprints(); }, [view, user]);
-
-  // 🌟 에디터에서 저장 버튼 누를 때 팝업 띄우기
-  const triggerUpload = (payload) => {
-    if (!user) return;
-    
-    // 데이터 유무에 따라 기본 타입 스마트 추천
-    let defaultType = 'blueprint';
-    if (payload.thumbnail_url) defaultType = '3dmodel';
-    else if (payload.csv_data) defaultType = 'structure';
-
-    setUploadModal({ isOpen: true, payload, title: '', type: defaultType });
-  };
-
-  // 🌟 팝업에서 최종 '저장하기' 누를 때 DB 인서트
-  const executeUpload = async () => {
-    if (!uploadModal.title.trim()) {
-      alert("작품 이름을 입력해주세요!");
+    // RLS에 막히면 error 없이 0행이 반환될 수 있어서 같이 확인
+    if (dbError || !data?.length) {
+      setError(dbError?.message || '저장 권한이 없거나 도면을 찾을 수 없습니다.');
       return;
     }
-
-    const { error } = await supabase.from('blueprints').insert([{ 
-      name: uploadModal.title, 
-      user_id: user.id, 
-      author: user.username,
-      project_type: uploadModal.type, // DB에 명시적 타입 저장!
-      ...uploadModal.payload 
-    }]);
-
-    if (!error) { 
-      alert("업로드 완료!"); 
-      setUploadModal({ isOpen: false, payload: null, title: '', type: 'blueprint' });
-      fetchBlueprints(); // 업로드 후 최신화
-      handleSetView('dashboard'); 
-    } else {
-      alert("에러: " + error.message);
-    }
+    setUploaded(true);
+    onUploaded?.(fields);
   };
 
-  const saveHistory = () => setHistory(prev => [...prev, JSON.parse(JSON.stringify(grid))].slice(-20));
-  const undo = () => { if (history.length === 0) return;
-  setGrid(history[history.length - 1]); setHistory(prev => prev.slice(0, -1)); };
-
-  const handleMouseDown = (r, c) => {
-    if (mode === 'floor_fill') {
-      saveHistory();
-      setGrid(prevGrid => floodFill(prevGrid, r, c, paintColor));
-      return;
-    }
-    saveHistory();
-    setIsDrawing(true);
-    setStartPos({ r, c });
-    setCurrentPos({ r, c });
-  };
-
-  const handleMouseEnter = (r, c) => { if (isDrawing) setCurrentPos({ r, c });
-  };
-
-  const handleMouseUp = () => {
-    if (isDrawing && mode.includes('rect') && startPos && currentPos) {
-      let newGrid = grid.map(row => [...row]);
-      const startR = Math.min(startPos.r, currentPos.r), endR = Math.max(startPos.r, currentPos.r);
-      const startC = Math.min(startPos.c, currentPos.c), endC = Math.max(startPos.c, currentPos.c);
-
-      if (mode === 'wall_rect') {
-        newGrid = applyWallBorder(newGrid, startR, endR, startC, endC, paintColor, 2);
-      } else if (mode === 'floor_rect') {
-        for (let r = startR; r <= endR; r++) {
-          for (let c = startC; c <= endC; c++) { newGrid[r][c] = paintColor; }
-        }
-      } else if (mode === 'rect_eraser') {
-        for (let r = startR; r <= endR; r++) {
-          for (let c = startC; c <= endC; c++) { newGrid[r][c] = 0; }
-        }
-      }
-      setGrid(newGrid);
-    }
-    setIsDrawing(false); setStartPos(null); setCurrentPos(null);
-  };
-
-  const commitCurrentFloor = (csvAbsorb) => {
-    if (csvAbsorb && csvAbsorb.pages && csvAbsorb.pages.length > 0) {
-      const absorbed = csvAbsorb.pages.map((pageGrid, i) => ({
-        pageBase: i * 5,
-        maxColorUsed: 5,
-        grid: i === csvAbsorb.pageIndex ? grid : pageGrid,
-      }));
-      setStackedFloors(prev => [...prev, ...absorbed]);
-      setGrid(Array(50).fill().map(() => Array(50).fill(0)));
-      setHistory([]);
-      return;
-    }
-    const maxColorUsed = getMaxColorUsed(grid);
-    const pageBase = getNextPageBase(stackedFloors);
-    setStackedFloors(prev => [...prev, { pageBase, maxColorUsed, grid: JSON.parse(JSON.stringify(grid)) }]);
-    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
-    setHistory([]);
-  };
-
-  const goBackToPreviousFloor = () => {
-    if (stackedFloors.length === 0) return;
-    const last = stackedFloors[stackedFloors.length - 1];
-    setGrid(last.grid); 
-    setStackedFloors(prev => prev.slice(0, -1)); 
-    setHistory([]);
-  };
-
-  const resetAllFloors = () => {
-    if (!window.confirm("전체 페이지를 초기화하시겠습니까? 되돌릴 수 없습니다.")) return;
-    setStackedFloors([]);
-    setGrid(Array(50).fill().map(() => Array(50).fill(0)));
-    setHistory([]);
-  };
-
-  const isInsidePreview = (r, c) => {
-    if (!isDrawing || !startPos || !currentPos || !mode.includes('rect')) return false;
-    return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
-  };
-
-  const handleLikeToggle = (bpId) => {
-    if (!user) return;
-    const currentLikedUsers = likesData[bpId] || [];
-    if (currentLikedUsers.includes(user.id)) {
-      setLikesData({ ...likesData, [bpId]: currentLikedUsers.filter(uid => uid !== user.id) });
-    } else {
-      setLikesData({ ...likesData, [bpId]: [...currentLikedUsers, user.id] });
-    }
-  };
-
-  useEffect(() => {
-    if (!selectedBp?.id) return;
-    const bpId = selectedBp.id;
-    supabase.from('comments')
-      .select('id, content, created_at, user_id, users(username)')
-      .eq('blueprint_id', bpId)
-      .order('created_at', { ascending: true })
-      .then(({ data, error }) => {
-        if (error) { console.error('댓글 불러오기 실패:', error.message); return; }
-        const mapped = (data || []).map(c => ({ ...c, username: c.users?.username }));
-        setCommentsData(prev => ({ ...prev, [bpId]: mapped }));
-      });
-  }, [selectedBp?.id]);
-
-  const handleAddComment = async (bpId) => {
-    if (!commentInput.trim()) return;
-    if (!user) { alert('댓글은 로그인 후에 작성할 수 있습니다.'); return; }
-    const { data, error } = await supabase.from('comments')
-      .insert([{ blueprint_id: bpId, user_id: user.id, content: commentInput }])
-      .select('id, content, created_at, user_id')
-      .single();
-    if (error) { alert('댓글 저장 실패: ' + error.message); return; }
-    setCommentsData(prev => ({ ...prev, [bpId]: [...(prev[bpId] || []), { ...data, username: user.username }] }));
-    setCommentInput('');
-  };
+  const stats = result?.stats;
 
   return (
-    <>
-      {/* 🌟 커스텀 업로드 모달 팝업 */}
-      {uploadModal.isOpen && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-white p-6 rounded-2xl shadow-2xl w-full max-w-sm flex flex-col gap-5 border border-gray-100">
-            <h3 className="text-xl font-black text-gray-900 border-b pb-2">🌐 클라우드 업로드</h3>
-            
-            <div>
-              <label className="text-xs font-bold text-gray-500 mb-1.5 block">작품 제목을 입력하세요</label>
-              <input 
-                type="text" 
-                value={uploadModal.title}
-                onChange={e => setUploadModal({...uploadModal, title: e.target.value})}
-                placeholder="예: 내 첫 번째 대저택"
-                className="w-full bg-gray-50 border border-gray-200 p-3 rounded-xl text-sm outline-none focus:border-blue-500 transition-all font-medium"
-              />
-            </div>
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[88vh] overflow-y-auto p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-5">
+          <h3 className="text-base font-black text-gray-900">🧪 하중 테스트 결과 업로드 · AI 분석</h3>
+          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 font-bold text-sm">✕</button>
+        </div>
 
-            <div>
-              <label className="text-xs font-bold text-gray-500 mb-2 block">작품 유형 (자동 분석됨)</label>
-              <div className="flex flex-col gap-2.5 bg-gray-50 p-3 rounded-xl border border-gray-100">
-                <label className="flex items-center gap-2 text-sm font-bold text-gray-700 cursor-pointer">
-                  <input type="radio" name="projectType" value="blueprint" checked={uploadModal.type === 'blueprint'} onChange={e => setUploadModal({...uploadModal, type: e.target.value})} className="w-4 h-4 accent-blue-600"/>
-                  📝 1층 설계도
-                </label>
-                <label className="flex items-center gap-2 text-sm font-bold text-gray-700 cursor-pointer">
-                  <input type="radio" name="projectType" value="structure" checked={uploadModal.type === 'structure'} onChange={e => setUploadModal({...uploadModal, type: e.target.value})} className="w-4 h-4 accent-blue-600"/>
-                  🏗️ 다층 구조물
-                </label>
-                <label className="flex items-center gap-2 text-sm font-bold text-gray-700 cursor-pointer">
-                  <input type="radio" name="projectType" value="3dmodel" checked={uploadModal.type === '3dmodel'} onChange={e => setUploadModal({...uploadModal, type: e.target.value})} className="w-4 h-4 accent-blue-600"/>
-                  🕋 AI 3D 모델
-                </label>
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <label className={`${BTN} bg-gray-800 text-white hover:bg-black cursor-pointer`}>
+            파일 선택
+            <input type="file" accept=".csv" className="hidden" onChange={handleSelect} disabled={loading || uploading} />
+          </label>
+          <button onClick={handleAnalyze} disabled={!file || loading || uploading} className={`${BTN} bg-blue-600 text-white hover:bg-blue-700`}>
+            {loading ? '분석 중...' : result ? '다시 분석' : 'AI 분석'}
+          </button>
+          <button onClick={handleUpload} disabled={!canSubmit} className={`${BTN} bg-green-600 text-white hover:bg-green-700`}>
+            {uploaded ? '업로드 완료' : uploading ? '업로드 중...' : '업로드'}
+          </button>
+        </div>
+        <div className="text-xs text-gray-500 font-medium mb-5">
+          {file ? `선택한 파일: ${file.name}` : 'CurrentStress.csv 파일을 선택하세요.'}
+          {!canUpload && ' · 내가 만든 도면에만 업로드할 수 있어요.'}
+        </div>
+
+        {/* 🌟 위험도 색상 3D 미리보기 (파일 선택 즉시 표시) */}
+        {preview.blocks.length > 0 && (
+          <div className="mb-5">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-xs font-bold text-gray-500">
+                위험도 3D 미리보기 (블록 {preview.blocks.length.toLocaleString()}개)
+              </div>
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                {[['orig', '원위치'], ['moved', '테스트 후 위치']].map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setPosMode(key)}
+                    className={`px-3 py-1 rounded-md text-[11px] font-bold transition-all ${
+                      posMode === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:bg-gray-200/60'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
-
-            <div className="flex gap-3 mt-2">
-              <Button variant="secondary" className="flex-1 py-3" onClick={() => setUploadModal({ isOpen: false, payload: null, title: '', type: 'blueprint' })}>취소</Button>
-              <Button variant="primary" className="flex-1 py-3" onClick={executeUpload}>🚀 저장하기</Button>
+            <div className="h-[400px] rounded-xl overflow-hidden border border-gray-200">
+              <LiveDemoViewer data={preview.blocks} mode="static" maxBlocks={10000} />
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[11px] text-gray-600 font-medium">
+              {RISK_ORDER.map((key) => (
+                <span key={key} className="flex items-center gap-1.5">
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: RISK_COLORS[key] }} />
+                  {RISK_LABELS[key]} {preview.counts[key]}
+                </span>
+              ))}
             </div>
           </div>
-        </div>
-      )}
-
-      {view === 'auth' && <AuthView authMode={authMode} setAuthMode={setAuthMode} authForm={authForm} setAuthForm={setAuthForm} handleLogin={handleLogin} handleSignUp={handleSignUp} />}
-      
-      {view === 'dashboard' && (
-        <DashboardView 
-          user={user} 
-          blueprints={blueprints} 
-          setView={handleSetView} 
-          setUser={setUser} 
-          onSelectBlueprint={(bp) => {
-            setSelectedBp(bp);
-            handleSetView('detail'); 
-          }} 
-        />
-      )}
-
-      {view === 'explore' && (
-        <ExploreView
-          blueprints={blueprints}
-          setView={handleSetView} 
-          onSelectBlueprint={(bp) => {
-            setSelectedBp(bp);
-            handleSetView('detail'); 
-          }}
-        />
-      )}
-      
-      {view === 'editor' && (
-        <EditorView
-          grid={grid}
-          setGrid={setGrid}
-          mode={mode}
-          setMode={setMode}
-          paintColor={paintColor}
-          setPaintColor={setPaintColor}
-          stackedFloors={stackedFloors}
-          commitCurrentFloor={commitCurrentFloor}
-          goBackToPreviousFloor={goBackToPreviousFloor}
-          resetAllFloors={resetAllFloors}
-          setView={handleSetView} 
-          undo={undo}
-          saveHistory={saveHistory}
-          uploadToShowcase={triggerUpload} // 🌟 기존 함수 대신 팝업 트리거 함수 연결
-          isInsidePreview={isInsidePreview}
-          handleMouseDown={handleMouseDown}
-          handleMouseEnter={handleMouseEnter}
-          handleMouseUp={handleMouseUp}
-        />
-      )}
-
-      {view === 'detail' && selectedBp && (
-        <DetailView
-          selectedBp={selectedBp}
-          setView={handleSetView} 
-          comments={commentsData[selectedBp.id] || []}
-          commentInput={commentInput}
-          setCommentInput={setCommentInput}
-          likeCount={(likesData[selectedBp.id] || []).length}
-          hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
-          onLikeToggle={() => handleLikeToggle(selectedBp.id)}
-          onAddComment={() => handleAddComment(selectedBp.id)}
-          onEditBlueprint={() => {
-            setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
-            setHistory([]);
-            handleSetView('editor'); 
-          }}
-        />
-      )}
-    </>
-  );
-}
-```
-
-// FILE PATH: src/components/BlockEditor3D.jsx
-// MODIFIED: 26-09-29 12:33 | LINES: 297
-```jsx
-import React, { useState, useRef, useMemo, useLayoutEffect, useEffect } from 'react';
-import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, TransformControls } from '@react-three/drei';
-import * as THREE from 'three';
-
-// 블록 편집기: 클릭/박스/연결 선택 + 삭제 + 케이지(FFD) 변형
-// props: blocks([{x,y,z,mat,color,type,raw}]), onApply(newBlocks), onClose()
-
-const S = 3; // 블록 한 변(m)
-const snap = (v) => Math.round((v - 1.5) / S) * S + 1.5;
-const key = (x, y, z) => `${Math.round(x / S)},${Math.round(y / S)},${Math.round(z / S)}`;
-const DIRS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
-
-function makeCage(blocks) {
-  const min = [Infinity, Infinity, Infinity];
-  const max = [-Infinity, -Infinity, -Infinity];
-  blocks.forEach(b => [b.x, b.y, b.z].forEach((v, a) => {
-    min[a] = Math.min(min[a], v - S / 2);
-    max[a] = Math.max(max[a], v + S / 2);
-  }));
-  // 코너 번호: i = ix + 2*iy + 4*iz (iy=1이 윗면)
-  const c = [];
-  for (let i = 0; i < 8; i++) {
-    c.push([i & 1 ? max[0] : min[0], i & 2 ? max[1] : min[1], i & 4 ? max[2] : min[2]]);
-  }
-  return { min, max, c };
-}
-
-// 트라일리니어 보간: 박스 안 비율 좌표 → 변형된 코너들의 가중합
-function warp(b, cage) {
-  const t = [b.x, b.y, b.z].map((v, a) => (v - cage.min[a]) / ((cage.max[a] - cage.min[a]) || 1));
-  const out = [0, 0, 0];
-  for (let i = 0; i < 8; i++) {
-    const w = (i & 1 ? t[0] : 1 - t[0]) * (i & 2 ? t[1] : 1 - t[1]) * (i & 4 ? t[2] : 1 - t[2]);
-    for (let a = 0; a < 3; a++) out[a] += w * cage.c[i][a];
-  }
-  return out;
-}
-
-function Blocks({ work, sel, cage, canPick, onPick }) {
-  const ref = useRef();
-  const dummy = useMemo(() => new THREE.Object3D(), []);
-  const col = useMemo(() => new THREE.Color(), []);
-
-  useLayoutEffect(() => {
-    const m = ref.current;
-    if (!m) return;
-    work.forEach((b, i) => {
-      const p = cage ? warp(b, cage) : [b.x, b.y, b.z];
-      dummy.position.set(p[0], p[1], p[2]);
-      dummy.updateMatrix();
-      m.setMatrixAt(i, dummy.matrix);
-      col.set(sel.has(i) ? '#f97316' : (b.color || '#bdc3c7'));
-      m.setColorAt(i, col);
-    });
-    m.instanceMatrix.needsUpdate = true;
-    if (m.instanceColor) m.instanceColor.needsUpdate = true;
-  }, [work, sel, cage, dummy, col]);
-
-  return (
-    <instancedMesh
-      ref={ref}
-      key={work.length}
-      args={[null, null, work.length]}
-      onClick={(e) => {
-        if (!canPick || e.delta > 4) return; // 카메라 드래그는 클릭으로 안 침
-        e.stopPropagation();
-        onPick(e.instanceId, e.shiftKey);
-      }}
-    >
-      <boxGeometry args={[S, S, S]} />
-      <meshStandardMaterial roughness={0.8} />
-    </instancedMesh>
-  );
-}
-
-// 박스 선택용: 각 블록을 화면 좌표로 투영해서 사각형 안에 있는지 검사 (뒤쪽 블록도 관통해서 선택)
-function Bridge({ apiRef, work }) {
-  const { camera, gl } = useThree();
-  useEffect(() => {
-    apiRef.current.pick = (r) => {
-      const box = gl.domElement.getBoundingClientRect();
-      const v = new THREE.Vector3();
-      const hit = [];
-      work.forEach((b, i) => {
-        v.set(b.x, b.y, b.z).project(camera);
-        const sx = ((v.x + 1) / 2) * box.width + box.left;
-        const sy = ((1 - v.y) / 2) * box.height + box.top;
-        if (v.z < 1 && sx >= r.x0 && sx <= r.x1 && sy >= r.y0 && sy <= r.y1) hit.push(i);
-      });
-      return hit;
-    };
-  }, [apiRef, work, camera, gl]);
-  return null;
-}
-
-// 케이지 12개 모서리를 현재 코너 위치로 그림
-const EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
-function CageLines({ cage }) {
-  const geo = useMemo(() => {
-    const pts = EDGES.flatMap(([a, b]) => [...cage.c[a], ...cage.c[b]]);
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-    return g;
-  }, [cage]);
-  return (
-    <lineSegments geometry={geo}>
-      <lineBasicMaterial color="#38bdf8" depthTest={false} />
-    </lineSegments>
-  );
-}
-
-export default function BlockEditor3D({ blocks, onApply, onClose }) {
-  const [work, setWork] = useState(blocks);
-  const [hist, setHist] = useState([]);
-  const [sel, setSel] = useState(new Set());
-  const [tool, setTool] = useState('click'); // 'click' | 'box'
-  const [cage, setCage] = useState(null);
-  const [active, setActive] = useState(null);
-  const [link, setLink] = useState(true); // 윗면 4점 같이 이동 (기울기 보정용)
-  const [rotMode, setRotMode] = useState(false); // 체크하면 바닥 고정 수직축 회전 모드
-  const [rotDeg, setRotDeg] = useState(0);
-  const bottomCenter = useMemo(() => cage
-    ? [0, 1, 2].map(a => (cage.c[0][a] + cage.c[1][a] + cage.c[4][a] + cage.c[5][a]) / 4)
-    : [0, 0, 0], [cage]);
-  const [rect, setRect] = useState(null);
-  const apiRef = useRef({});
-  const cornerRefs = useRef([]);
-
-  const view = useMemo(() => {
-    const c = makeCage(blocks);
-    const ctr = c.min.map((m, a) => (m + c.max[a]) / 2);
-    const size = Math.max(...c.max.map((m, a) => m - c.min[a]));
-    return { ctr, pos: [ctr[0] + size * 1.2, ctr[1] + size * 0.6, ctr[2] + size * 1.2] };
-  }, [blocks]);
-
-  const commit = (next) => {
-    setHist(h => [...h.slice(-19), work]);
-    setWork(next);
-    setSel(new Set());
-  };
-  const undo = () => {
-    if (!hist.length) return;
-    setWork(hist[hist.length - 1]);
-    setHist(h => h.slice(0, -1));
-    setSel(new Set());
-  };
-
-  const pick = (i, shift) => setSel(prev => {
-    if (!shift) return new Set([i]);
-    const n = new Set(prev);
-    n.has(i) ? n.delete(i) : n.add(i);
-    return n;
-  });
-
-  const grow = () => { // 선택한 블록과 붙어 있는 덩어리 전체 선택
-    const idx = new Map(work.map((b, i) => [key(b.x, b.y, b.z), i]));
-    const seen = new Set(sel);
-    const stack = [...sel];
-    while (stack.length) {
-      const b = work[stack.pop()];
-      for (const [dx, dy, dz] of DIRS) {
-        const j = idx.get(key(b.x + dx * S, b.y + dy * S, b.z + dz * S));
-        if (j !== undefined && !seen.has(j)) { seen.add(j); stack.push(j); }
-      }
-    }
-    setSel(seen);
-  };
-  const invert = () => setSel(new Set(work.map((_, i) => i).filter(i => !sel.has(i))));
-  const del = () => sel.size && commit(work.filter((_, i) => !sel.has(i)));
-
-  const applyCage = () => { // 확정할 때만 격자에 스냅 (같은 칸에 겹치면 하나만 남김)
-    const m = new Map();
-    work.forEach(b => {
-      const p = warp(b, cage);
-      const x = snap(p[0]), y = snap(p[1]), z = snap(p[2]);
-      const k = key(x, y, z);
-      if (!m.has(k)) m.set(k, { ...b, x, y, z });
-    });
-    commit([...m.values()]);
-    setCage(null);
-    setActive(null);
-  };
-
-  const onCornerChange = () => {
-    if (active === null) return;
-    const p = cornerRefs.current[active].position;
-    setCage(c => {
-      const next = c.c.map(a => a.slice());
-      const d = [p.x - next[active][0], p.y - next[active][1], p.z - next[active][2]];
-      const targets = link && (active & 2) ? [2, 3, 6, 7] : [active];
-      targets.forEach(i => { for (let a = 0; a < 3; a++) next[i][a] += d[a]; });
-      return { ...c, c: next };
-    });
-  };
-
-  // 도자기 물레처럼: 바닥(iy=0, i&2===0)은 고정하고 윗부분만 바닥 중심축으로 회전
-  const rotate = (deg) => {
-    setRotDeg(deg);
-    const rad = (deg * Math.PI) / 180;
-    const cx = bottomCenter[0], cz = bottomCenter[2];
-    const cs = Math.cos(rad), sn = Math.sin(rad);
-    setCage(c => {
-      const next = c.c.map((p, i) => {
-        if (!(i & 2)) return p.slice(); // 바닥 4점 고정
-        const dx = p[0] - cx, dz = p[2] - cz;
-        return [cx + dx * cs - dz * sn, p[1], cz + dx * sn + dz * cs];
-      });
-      return { ...c, c: next };
-    });
-  };
-
-  const btn = 'px-3 py-1.5 rounded-lg text-xs font-bold bg-gray-700 text-white hover:bg-gray-600 disabled:opacity-40';
-  const on = 'bg-blue-600 hover:bg-blue-500';
-
-  return (
-    <div className="fixed inset-0 z-50 bg-gray-900 flex flex-col">
-      <div className="flex flex-wrap items-center gap-2 p-3 bg-gray-800">
-        <span className="text-white font-black text-sm mr-2">블록 편집기</span>
-        <button className={`${btn} ${tool === 'click' && !cage ? on : ''}`} disabled={!!cage} onClick={() => setTool('click')}>클릭 선택</button>
-        <button className={`${btn} ${tool === 'box' && !cage ? on : ''}`} disabled={!!cage} onClick={() => setTool('box')}>박스 선택</button>
-        <button className={btn} disabled={!sel.size || !!cage} onClick={grow}>연결된 덩어리</button>
-        <button className={btn} disabled={!!cage} onClick={invert}>선택 반전</button>
-        <button className={`${btn} !bg-red-600`} disabled={!sel.size || !!cage} onClick={del}>삭제</button>
-        <button className={btn} disabled={!hist.length} onClick={undo}>되돌리기</button>
-        <span className="w-px h-5 bg-gray-600 mx-1" />
-        {!cage
-          ? <button className={btn} onClick={() => { setCage(makeCage(work)); setRotMode(false); setRotDeg(0); }}>케이지 변형</button>
-          : <>
-              <button className={`${btn} !bg-green-600`} onClick={applyCage}>변형 확정(스냅)</button>
-              <button className={btn} onClick={() => { setCage(null); setActive(null); }}>취소</button>
-              <label className="text-xs text-gray-200 flex items-center gap-1">
-                <input type="checkbox" checked={rotMode} onChange={e => { setRotMode(e.target.checked); setActive(null); }} /> 수직회전 모드(바닥 고정)
-              </label>
-              {rotMode ? (
-                <>
-                  <input type="range" min="-45" max="45" step="0.5" value={rotDeg}
-                    onChange={e => rotate(parseFloat(e.target.value))} className="w-40" />
-                  <span className="text-xs text-gray-200 w-12">{rotDeg.toFixed(1)}°</span>
-                </>
-              ) : (
-                <label className="text-xs text-gray-200 flex items-center gap-1">
-                  <input type="checkbox" checked={link} onChange={e => setLink(e.target.checked)} /> 윗면 4점 같이 이동
-                </label>
-              )}
-            </>}
-        <span className="text-xs text-gray-300 ml-2">선택 {sel.size} / 전체 {work.length}</span>
-        <div className="flex-1" />
-        <button className={`${btn} !bg-green-600`} disabled={!!cage} onClick={() => onApply(work)}>적용</button>
-        <button className={btn} onClick={onClose}>닫기</button>
-      </div>
-
-      <div className="flex-1 relative">
-        <Canvas camera={{ position: view.pos, fov: 45, near: 1, far: 5000 }}>
-          <ambientLight intensity={0.7} />
-          <directionalLight position={[100, 200, 100]} intensity={1.2} />
-          <OrbitControls makeDefault target={view.ctr} />
-          <Bridge apiRef={apiRef} work={work} />
-          <Blocks work={work} sel={sel} cage={cage} canPick={tool === 'click' && !cage} onPick={pick} />
-          {cage && cage.c.map((p, i) => (
-            <mesh key={i} ref={el => (cornerRefs.current[i] = el)} position={p}
-              onClick={(e) => { e.stopPropagation(); if (!rotMode) setActive(i); }}>
-              <sphereGeometry args={[3, 16, 16]} />
-              <meshBasicMaterial color={rotMode ? '#6b7280' : (active === i ? '#facc15' : '#38bdf8')} depthTest={false} />
-            </mesh>
-          ))}
-          {cage && <CageLines cage={cage} />}
-          {cage && !rotMode && active !== null && cornerRefs.current[active] && (
-            <TransformControls object={cornerRefs.current[active]} mode="translate" onObjectChange={onCornerChange} />
-          )}
-        </Canvas>
-
-        {tool === 'box' && !cage && (
-          <div
-            className="absolute inset-0 cursor-crosshair"
-            onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); setRect({ x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY }); }}
-            onPointerMove={e => rect && setRect({ ...rect, x1: e.clientX, y1: e.clientY })}
-            onPointerUp={e => {
-              if (!rect) return;
-              const r = { x0: Math.min(rect.x0, e.clientX), x1: Math.max(rect.x0, e.clientX), y0: Math.min(rect.y0, e.clientY), y1: Math.max(rect.y0, e.clientY) };
-              const hit = apiRef.current.pick(r);
-              setSel(prev => (e.shiftKey ? new Set([...prev, ...hit]) : new Set(hit)));
-              setRect(null);
-            }}
-          />
         )}
-        {rect && (
-          <div className="fixed border border-orange-400 bg-orange-400/20 pointer-events-none"
-            style={{ left: Math.min(rect.x0, rect.x1), top: Math.min(rect.y0, rect.y1), width: Math.abs(rect.x1 - rect.x0), height: Math.abs(rect.y1 - rect.y0) }} />
+
+        {loading && <p className="text-xs text-blue-600 font-bold mb-4">AI 응답까지 최대 2~3분 걸릴 수 있어요.</p>}
+        {error && <p className="text-xs text-red-600 font-bold bg-red-50 border border-red-200 rounded-xl p-3 mb-4">{error}</p>}
+
+        {stats && (
+          <div className="space-y-5">
+            <div>
+              <div className="text-xs font-bold text-gray-500 mb-2">위험도 분포 (블록 {stats.total_blocks}개)</div>
+              <RiskBar risk={stats.risk} total={stats.total_blocks} />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              {Object.entries(stats.by_tool).map(([tool, t]) => (
+                <div key={tool} className="bg-gray-50 border border-gray-100 rounded-xl p-3 text-xs">
+                  <div className="font-bold text-gray-700 mb-1">
+                    {tool === 'Reinforcement' ? '보강 블록' : '기존 블록'} ({t.count})
+                  </div>
+                  <div className="text-gray-500 font-medium">파괴율 {t.destroyed_pct}%</div>
+                  <div className="text-gray-500 font-medium">응력 중앙값 {t.median_stress}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="text-xs text-gray-500 font-medium">
+              보강 블록 {stats.reinforcement_total}개 중 {stats.reinforcement_failed_count}개가 위험/파괴 · 원위치에서 밀려난 블록 {stats.movement.moved_pct}%
+            </div>
+
+            {result.analysis ? (
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-4">
+                <div className="text-xs font-bold text-blue-700 mb-2">AI 분석 결과</div>
+                <p className="text-xs text-gray-800 font-medium leading-relaxed whitespace-pre-wrap">{result.analysis}</p>
+              </div>
+            ) : (
+              <p className="text-xs text-yellow-700 font-bold bg-yellow-50 border border-yellow-200 rounded-xl p-3">
+                AI 분석을 가져오지 못해 업로드할 수 없습니다. 통계는 정상 집계됐어요. ({result.analysis_error})
+              </p>
+            )}
+          </div>
         )}
-        <div className="absolute bottom-3 left-3 text-[11px] text-gray-300 bg-black/40 rounded-lg px-3 py-2 pointer-events-none">
-          {cage ? (rotMode ? '슬라이더로 회전 — 바닥은 고정되고 윗부분만 그 축을 중심으로 돌아가요' : '파란 점 클릭 → 화살표 드래그로 이동 (바닥/윗면 코너 모두 가능)') : '클릭: 선택 · Shift: 추가/해제 · 박스 모드는 드래그(뒤쪽 블록도 선택)'}
-        </div>
+
+        {!result && !loading && savedAnalysis && (
+          <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+            <div className="text-xs font-bold text-gray-500 mb-2">이 도면에 저장된 분석</div>
+            <p className="text-xs text-gray-700 font-medium leading-relaxed whitespace-pre-wrap">{savedAnalysis}</p>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+```
+
+// FILE PATH: src/utils/stressUtils.js
+// MODIFIED: 26-10-21 17:57 | LINES: 99
+```js
+// FILE PATH: src/utils/stressUtils.js
+// CurrentStress.csv -> LiveDemoViewer용 블록 배열 (위험도별 색상)
+
+export const RISK_ORDER = ['Safe', 'Warning', 'Danger', 'Destroyed'];
+
+// 일반(Safe) 블록은 회색, 위험해질수록 노랑 → 빨강 → 보라(파괴)
+export const RISK_COLORS = {
+  Safe: '#9CA3AF',
+  Warning: '#FACC15',
+  Danger: '#EF4444',
+  Destroyed: '#9333EA',
+};
+
+export const RISK_LABELS = {
+  Safe: '안전(일반)',
+  Warning: '주의',
+  Danger: '위험',
+  Destroyed: '파괴',
+};
+
+const RANK = { Safe: 0, Warning: 1, Danger: 2, Destroyed: 3 };
+
+// BlockID = X_Z_Y (부호문자 + 숫자, 값*10) -> [x, y, z]
+function parseIdPos(id) {
+  try {
+    const [sx, sz, sy] = id.split('_');
+    const v = (s) => (s[0] === '-' ? -1 : 1) * parseInt(s.slice(1), 10) / 10;
+    const pos = [v(sx), v(sy), v(sz)];
+    return pos.some(Number.isNaN) ? null : pos;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param csvText      CurrentStress.csv 원문
+ * @param positionMode 'orig'  = BlockID에 적힌 원래 위치 (형태 유지, 색만 확인)
+ *                     'moved' = 테스트 후 현재 위치(PosX/Y/Z) (밀림/붕괴 확인)
+ * @returns { blocks, counts }  blocks: [{x,y,z,mat,color,risk}]
+ */
+export function parseStressCsv(csvText, positionMode = 'orig') {
+  const empty = { blocks: [], counts: { Safe: 0, Warning: 0, Danger: 0, Destroyed: 0 } };
+  if (!csvText) return empty;
+
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) return empty;
+
+  const headers = lines[0].split(',').map((h) => h.trim());
+  const idx = {
+    id: headers.indexOf('BlockID'),
+    x: headers.indexOf('PosX'),
+    y: headers.indexOf('PosY'),
+    z: headers.indexOf('PosZ'),
+    risk: headers.indexOf('RiskLevel'),
+  };
+  if (idx.id === -1 || idx.risk === -1) return empty;
+
+  // 파괴된 블록은 DESTROYED 행으로 중복 기록되므로 BlockID당 1개로 합친다
+  const map = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const cols = lines[i].split(',');
+    const id = (cols[idx.id] || '').trim();
+    if (!id) continue;
+
+    const risk = RANK[cols[idx.risk]?.trim()] !== undefined ? cols[idx.risk].trim() : 'Safe';
+    const px = parseFloat(cols[idx.x]);
+    const py = parseFloat(cols[idx.y]);
+    const pz = parseFloat(cols[idx.z]);
+    const hasPos = [px, py, pz].every(Number.isFinite);
+
+    const prev = map.get(id);
+    if (!prev) {
+      map.set(id, { id, risk, cur: hasPos ? [px, py, pz] : null });
+    } else {
+      if (RANK[risk] > RANK[prev.risk]) prev.risk = risk;
+      if (!prev.cur && hasPos) prev.cur = [px, py, pz];
+    }
+  }
+
+  const counts = { Safe: 0, Warning: 0, Danger: 0, Destroyed: 0 };
+  const blocks = [];
+  map.forEach((b) => {
+    const orig = parseIdPos(b.id);
+    const pos = positionMode === 'moved' ? (b.cur || orig) : (orig || b.cur);
+    if (!pos) return;
+    counts[b.risk] += 1;
+    blocks.push({
+      x: pos[0],
+      y: pos[1],
+      z: pos[2],
+      mat: 'Concrete',
+      color: RISK_COLORS[b.risk],
+      risk: b.risk,
+    });
+  });
+
+  return { blocks, counts };
+}
+```
+
+// FILE PATH: src/backend/stress_analysis.py
+// MODIFIED: 26-10-21 13:39 | LINES: 268
+```py
+"""
+CurrentStress.csv 업로드 -> 정제/요약 -> Google Gemini 분석 -> JSON 반환
+
+main.py 연결 (app = FastAPI() 아래에 2줄):
+    from stress_analysis import router as stress_router
+    app.include_router(stress_router)
+
+환경변수(.env): GEMINI_API_KEY  (선택: GEMINI_MODEL)
+"""
+import io
+import os
+import re
+from pathlib import Path
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
+
+# src/backend/.env 와 프로젝트 루트 .env 를 둘 다 읽는다 (없는 파일은 무시됨)
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
+load_dotenv(Path(__file__).with_name(".env"), override=True)
+
+router = APIRouter()
+
+# Gemini의 OpenAI 호환 엔드포인트. 모델 id는 자주 바뀌니까 앞에서부터 순서대로 시도한다.
+# 특정 모델을 먼저 쓰고 싶으면 .env에 GEMINI_MODEL=... 추가
+LLM_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+DEFAULT_MODELS = [
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+]
+THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+LLM_TIMEOUT = 60  # 모델당 최대 대기 (초과하면 다음 모델 시도)
+MOVED_THRESHOLD = 3.0  # 블록 한 칸(GRID_PITCH) 이상 밀렸으면 이탈로 본다
+
+REQUIRED_COLS = {
+    "BlockID", "PosX", "PosY", "PosZ", "Stress", "RiskLevel",
+    "Material", "Tool", "Type",
+}
+
+SYSTEM_PROMPT = """너는 블록 기반 건축물 구조 시뮬레이션 결과를 분석하는 구조 안전 분석가야.
+입력은 하중 테스트 결과를 요약한 JSON이야. 규칙:
+- 입력에 있는 숫자만 근거로 써. 없는 수치는 만들지 마.
+- Stress 단위는 모르니까 단위를 붙이지 마.
+- H_Beam의 Tensile/Compressive가 0인 것은 '미기록'이야. 강도 0으로 해석하지 마.
+- Prescription 컬럼의 의미는 단정하지 마.
+- orig_x/y/z는 원래 위치, moved는 테스트 후 원래 위치에서 밀려난 거리야. 위치 설명은 orig 기준으로 해.
+- 출력은 한국어 평문(마크다운 기호 없이). 문제점 3~5개를 번호로 쓰고,
+  각 항목마다 '근거 수치 / 위치(높이·구역) / 개선 제안'을 한 줄씩 써.
+- 마지막에 '가장 먼저 손볼 곳' 한 줄로 마무리해."""
+
+
+def parse_block_id(block_id: str):
+    """BlockID = X_Z_Y (각각 부호문자 + 숫자, 값*10). 예: -405_0615_0015 -> (-40.5, 1.5, 61.5)"""
+    try:
+        seg_x, seg_z, seg_y = block_id.split("_")
+        vals = []
+        for seg in (seg_x, seg_y, seg_z):
+            sign = -1 if seg[0] == "-" else 1
+            vals.append(sign * int(seg[1:]) / 10)
+        return tuple(vals)  # (x, y, z)
+    except Exception:
+        return (float("nan"),) * 3
+
+
+def load_blocks(csv_bytes: bytes) -> tuple[pd.DataFrame, int]:
+    """파괴 블록이 DESTROYED 행으로 중복 기록되는 CSV를 BlockID당 1행으로 합친다."""
+    try:
+        df = pd.read_csv(io.BytesIO(csv_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV를 읽을 수 없습니다: {e}")
+
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"필수 컬럼이 없습니다: {', '.join(sorted(missing))}",
+        )
+
+    df["_destroyed"] = df["RiskLevel"].eq("Destroyed")
+    for col in ("PosX", "PosY", "PosZ", "Stress"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")  # 'DESTROYED' -> NaN
+
+    # 좌표가 살아있는 첫 행이 원본 정보(Material/Tool 등)를 가진다
+    base = (
+        df.dropna(subset=["PosX", "PosY", "PosZ"])
+        .drop_duplicates("BlockID", keep="first")
+        .set_index("BlockID")
+    )
+    agg = df.groupby("BlockID").agg(
+        max_stress=("Stress", "max"),
+        destroyed=("_destroyed", "any"),
+    )
+    blocks = base.drop(columns=["_destroyed", "Stress"]).join(agg, how="left")
+    blocks["final_risk"] = blocks["RiskLevel"].where(~blocks["destroyed"], "Destroyed")
+
+    blocks = blocks.reset_index()
+    orig = blocks["BlockID"].map(parse_block_id)
+    blocks["orig_x"] = orig.map(lambda t: t[0])
+    blocks["orig_y"] = orig.map(lambda t: t[1])
+    blocks["orig_z"] = orig.map(lambda t: t[2])
+    # 현재 좌표(PosX/Y/Z)는 테스트 후 위치라서, ID의 원래 좌표와의 거리 = 밀려난 정도
+    blocks["moved"] = (
+        (blocks["PosX"] - blocks["orig_x"]) ** 2
+        + (blocks["PosY"] - blocks["orig_y"]) ** 2
+        + (blocks["PosZ"] - blocks["orig_z"]) ** 2
+    ) ** 0.5
+
+    orphans = df["BlockID"].nunique() - len(blocks)  # 좌표 행이 없는 ID
+    return blocks, int(orphans)
+
+
+def _risk_counts(frame: pd.DataFrame) -> dict:
+    return {k: int(v) for k, v in frame["final_risk"].value_counts().items()}
+
+
+def build_summary(blocks: pd.DataFrame, orphans: int) -> dict:
+    total = len(blocks)
+
+    by_tool = {}
+    for tool, g in blocks.groupby("Tool"):
+        by_tool[tool] = {
+            "count": int(len(g)),
+            "risk": _risk_counts(g),
+            "destroyed_pct": round(float(g["destroyed"].mean()) * 100, 1),
+            "median_stress": round(float(g["max_stress"].median()), 2),
+        }
+
+    by_height = []
+    bands = pd.cut(blocks["orig_y"], bins=5)
+    for band, g in blocks.groupby(bands, observed=True):
+        by_height.append({
+            "y_range": f"{band.left:.1f}~{band.right:.1f}",
+            "count": int(len(g)),
+            "destroyed_pct": round(float(g["destroyed"].mean()) * 100, 1),
+            "median_stress": round(float(g["max_stress"].median()), 2),
+        })
+
+    zones = blocks.assign(
+        zx=pd.cut(blocks["orig_x"], bins=3, labels=["X낮음", "X중간", "X높음"]),
+        zz=pd.cut(blocks["orig_z"], bins=3, labels=["Z낮음", "Z중간", "Z높음"]),
+    )
+    zone_stats = (
+        zones.groupby(["zx", "zz"], observed=True)["destroyed"]
+        .agg(["sum", "count"])
+        .sort_values("sum", ascending=False)
+        .head(3)
+    )
+    top_zones = [
+        {"zone": f"{zx}/{zz}", "destroyed": int(r["sum"]), "blocks": int(r["count"])}
+        for (zx, zz), r in zone_stats.iterrows()
+    ]
+
+    shifted = blocks[blocks["moved"] > MOVED_THRESHOLD]
+    movement = {
+        "threshold": MOVED_THRESHOLD,
+        "moved_count": int(len(shifted)),
+        "moved_pct": round(len(shifted) / total * 100, 1),
+        "moved_median": round(float(shifted["moved"].median()), 1) if len(shifted) else 0.0,
+        "moved_max": round(float(blocks["moved"].max()), 1),
+        "moved_by_risk": _risk_counts(shifted),
+    }
+
+    cols = ["BlockID", "orig_x", "orig_y", "orig_z", "moved", "max_stress", "Tool", "Material", "final_risk"]
+    hotspots = (
+        blocks.sort_values("max_stress", ascending=False)
+        .head(10)[cols]
+        .round(2)
+        .to_dict("records")
+    )
+
+    reinf = blocks[blocks["Tool"] == "Reinforcement"]
+    failed_reinf = reinf[reinf["final_risk"].isin(["Danger", "Destroyed"])]
+
+    return {
+        "total_blocks": int(total),
+        "orphan_destroyed_ids": orphans,
+        "risk": _risk_counts(blocks),
+        "stress_median": round(float(blocks["max_stress"].median()), 2),
+        "stress_max": round(float(blocks["max_stress"].max()), 2),
+        "by_tool": by_tool,
+        "by_height": by_height,
+        "top_destroyed_zones": top_zones,
+        "reinforcement_failed_count": int(len(failed_reinf)),
+        "reinforcement_total": int(len(reinf)),
+        "movement": movement,
+        "hotspots": hotspots,
+    }
+
+
+def model_chain() -> list[str]:
+    custom = os.getenv("GEMINI_MODEL")
+    return ([custom] if custom else []) + [m for m in DEFAULT_MODELS if m != custom]
+
+
+def _post(headers: dict, model: str, summary: dict, low_effort: bool):
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": str(summary)},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4096,
+    }
+    if low_effort:
+        body["reasoning_effort"] = "low"  # 사고 시간을 줄여서 타임아웃 방지
+    return requests.post(LLM_URL, headers=headers, json=body, timeout=LLM_TIMEOUT)
+
+
+def call_llm(summary: dict) -> tuple[str, str]:
+    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip().strip("\"'")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY가 .env에 설정되지 않았습니다.")
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    errors = []
+    for model in model_chain():
+        try:
+            resp = _post(headers, model, summary, low_effort=True)
+            if resp.status_code == 400 and "reasoning" in resp.text.lower():
+                resp = _post(headers, model, summary, low_effort=False)  # 이 모델은 옵션 미지원
+        except requests.exceptions.Timeout:
+            errors.append(f"{model}: 시간초과")
+            continue
+
+        if resp.status_code in (400, 401, 403):
+            raise RuntimeError(
+                f"{resp.status_code} 인증/요청 오류 - 서버가 읽은 키: {key[:4]}...{key[-3:]} (길이 {len(key)}). "
+                f"Gemini 키는 보통 'AIza'로 시작하고 39자입니다. 응답: {resp.text[:200]}"
+            )
+        if resp.status_code == 429:
+            raise RuntimeError("429 무료 한도 초과입니다. 잠시 후(1분 뒤) 다시 시도하세요.")
+        if resp.status_code in (404, 500, 503):  # 없는 모델/일시 장애 -> 다음 모델
+            errors.append(f"{model}: {resp.status_code}")
+            continue
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"]
+        text = THINK_RE.sub("", message.get("content") or "").strip()
+        if text:
+            return text, model
+        errors.append(f"{model}: 빈 응답")
+
+    raise RuntimeError("사용 가능한 모델이 없습니다 -> " + ", ".join(errors))
+
+
+@router.post("/api/analyze-stress")
+async def analyze_stress(file: UploadFile = File(...)):
+    csv_bytes = await file.read()
+    blocks, orphans = load_blocks(csv_bytes)
+    summary = build_summary(blocks, orphans)
+
+    analysis, analysis_error, model_used = None, None, None
+    try:
+        analysis, model_used = await run_in_threadpool(call_llm, summary)
+    except Exception as e:
+        # LLM이 실패해도 통계는 돌려준다
+        analysis_error = str(e)
+
+    return {
+        "stats": summary,
+        "analysis": analysis,
+        "analysis_error": analysis_error,
+        "model": model_used,
+    }
 ```
 

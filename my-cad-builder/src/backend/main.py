@@ -121,7 +121,7 @@ def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
     return mesh
 
 
-def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS, apply_tilt_fix: bool = True):
     extents = mesh.bounds[1] - mesh.bounds[0]
     tallest_axis = int(np.argmax(extents))
 
@@ -144,7 +144,7 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
 
     # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
     #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
-    if APPLY_TILT_FIX:
+    if apply_tilt_fix and APPLY_TILT_FIX:
         mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
 
     mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
@@ -397,6 +397,7 @@ async def extract_3d_csv(
     endX: float = Form(...),
     endY: float = Form(...),
     realHeightMeters: float = Form(...),
+    applyTiltFix: bool = Form(True),
     # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
     roofTL: float | None = Form(None),
     roofTR: float | None = Form(None),
@@ -426,7 +427,7 @@ async def extract_3d_csv(
     mesh = get_mesh_from_colab(crop_bytes)
     print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
 
-    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
+    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters, apply_tilt_fix=applyTiltFix)
 
     # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
     corner_heights = None

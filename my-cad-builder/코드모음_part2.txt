@@ -1,3 +1,464 @@
+// FILE PATH: src/backend/main.py
+// MODIFIED: 26-10-21 11:05 | LINES: 456
+```py
+import io
+import pillow_avif  # noqa: F401  (AVIF 포맷 지원 — PIL 기본 탑재 아님, import만 해도 등록됨)
+import requests
+import trimesh
+import numpy as np
+import uvicorn
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from PIL import Image
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+from stress_analysis import router as stress_router
+app.include_router(stress_router)
+
+COLAB_API_URL = "https://subject-campfire-malformed.ngrok-free.dev/generate-mesh"
+
+MAX_BLOCKS = 10000
+GRID_PITCH = 3.0
+UNITS_PER_METER = 20.0
+APPLY_TILT_FIX = True   # False로 바꾸면 기울기 보정 끄기 (A/B 비교용)
+
+
+def format_id(val):
+    abs_val = round(abs(val))
+    sign = "-" if val < 0 else "0"
+    return f"{sign}{str(abs_val).zfill(3)}"
+
+
+def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
+    resp = requests.post(
+        COLAB_API_URL,
+        files={"image": ("input.png", img_bytes, "image/png")},
+        params={"flatten_roof": "false", "snap_grid": "false"},
+        timeout=180,
+    )
+    resp.raise_for_status()
+
+    mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(mesh.dump())
+    return mesh
+
+
+def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
+                    bins=24, min_deg=0.5, max_deg=30.0):
+    """
+    건물 중간 구간(높이 20~80%)의 층별 중심점을 이어 '쏠린 정도(기울기)'를 구하고,
+    그만큼 되돌려 건물을 똑바로 세운다.
+      mode="shear"  : 각 높이의 층을 옆으로 밀어 중심선을 수직으로 (층은 수평 유지) ← 블록 변환용 기본값
+      mode="rotate" : 메쉬 전체를 회전 (건물 전체가 통째로 기운 경우)
+    기울기가 너무 작거나(min_deg) 너무 크면(max_deg, 추정 실패로 판단) 원본 유지.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    up = up_axis_idx
+    hor = [i for i in range(3) if i != up]
+    h = verts[:, up]
+    h_min, h_max = h.min(), h.max()
+    H = h_max - h_min
+    if H < 1e-6:
+        return mesh
+
+    # 1. 높이 구간별 중심점
+    edges = np.linspace(h_min + low * H, h_min + high * H, bins + 1)
+    ys, cs = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (h >= a) & (h < b)
+        if m.sum() < 20:
+            continue
+        ys.append(h[m].mean())
+        cs.append(verts[m][:, hor].mean(axis=0))
+    if len(ys) < 5:
+        print("📏 기울기 보정 건너뜀: 중심점이 부족함")
+        return mesh
+    ys, cs = np.array(ys), np.array(cs)
+
+    # 2. 두 수평축 각각 직선 피팅 (튀는 점 1회 제거)
+    slopes = []
+    for j in range(2):
+        k, b0 = np.polyfit(ys, cs[:, j], 1)
+        res = cs[:, j] - (k * ys + b0)
+        keep = np.abs(res) <= max(2 * res.std(), 1e-9)
+        if keep.sum() >= 4:
+            k, b0 = np.polyfit(ys[keep], cs[keep, j], 1)
+        slopes.append(k)
+    slopes = np.array(slopes)
+    tilt = float(np.degrees(np.arctan(np.linalg.norm(slopes))))
+
+    if tilt < min_deg or tilt > max_deg:
+        print(f"📏 기울기 보정 건너뜀: 기울기 {tilt:.2f}° (허용 {min_deg}~{max_deg}° 밖)")
+        return mesh
+
+    # 3. 되돌리기
+    if mode == "rotate":
+        u = np.zeros(3)
+        u[up] = 1.0
+        u[hor] = slopes
+        u /= np.linalg.norm(u)
+        t = np.zeros(3)
+        t[up] = 1.0
+        v = np.cross(u, t)
+        c = float(np.dot(u, t))
+        s = float(np.linalg.norm(v))
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+        pivot = verts[h <= h_min + 0.02 * H].mean(axis=0)   # 바닥 중심 기준
+        verts = (verts - pivot) @ R.T + pivot
+    else:
+        verts[:, hor] -= np.outer(h - h_min, slopes)         # 바닥은 고정, 위로 갈수록 되밀기
+
+    mesh.vertices = verts
+    print(f"📏 기울기 보정: {tilt:.2f}° 되돌림 ({mode})")
+    return mesh
+
+
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS):
+    extents = mesh.bounds[1] - mesh.bounds[0]
+    tallest_axis = int(np.argmax(extents))
+
+    if tallest_axis == 2:
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+    elif tallest_axis == 0:
+        rot = trimesh.transformations.rotation_matrix(
+            angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
+        )
+        mesh.apply_transform(rot)
+
+    mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
+    mesh.apply_transform(mirror)
+    mesh.invert()
+
+    print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
+
+    # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
+    #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
+    if APPLY_TILT_FIX:
+        mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
+
+    mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
+    if mesh_height_raw <= 0:
+        raise ValueError("메시 높이를 계산할 수 없습니다 (생성된 메시가 비정상일 수 있음)")
+
+    target_height_units = real_height_m * UNITS_PER_METER
+    mesh.apply_scale(target_height_units / mesh_height_raw)
+    mesh.apply_translation([0, -mesh.bounds[0][1], 0])
+
+    surface_area = mesh.area
+    pitch = max(GRID_PITCH, round(((surface_area / max_blocks) ** 0.5) / GRID_PITCH) * GRID_PITCH)
+
+    raw_blocks = []
+    for attempt in range(5):
+        estimated_cells = surface_area / (pitch ** 2)
+        sample_count = max(int(estimated_cells * 6), 5000)
+        points, face_indices = trimesh.sample.sample_surface(mesh, count=sample_count)
+        normals = mesh.face_normals[face_indices]
+
+        raw_blocks = []
+        seen_ids = set()
+        for (x, y, z), normal in zip(points, normals):
+            grid_x = round((x - 1.5) / pitch)
+            grid_y = round((y - 1.5) / pitch)
+            grid_z = round((z - 1.5) / pitch)
+
+            pos_x = grid_x * GRID_PITCH + 1.5
+            pos_y = grid_y * GRID_PITCH + 1.5
+            pos_z = grid_z * GRID_PITCH + 1.5
+
+            id_x = format_id(pos_x * 10)
+            id_z = format_id(pos_z * 10)
+            id_y = format_id(pos_y * 10)
+            block_id = f"{id_x}_{id_z}_{id_y}"
+            if block_id in seen_ids:
+                continue
+            seen_ids.add(block_id)
+
+            block_type = "Floor" if abs(normal[1]) > 0.7 else "Wall"
+
+            raw_blocks.append({
+                "BlockID": block_id,
+                "PosX": round(pos_x, 2),
+                "PosY": round(pos_y, 2),
+                "PosZ": round(pos_z, 2),
+                "Stress": 0.00,
+                "RiskLevel": "Safe",
+                "Prescription": "N",
+                "Material": "Default",
+                "Tensile": 400.0,
+                "Compressive": 400.0,
+                "Tool": "Existing",
+                "Type": block_type,
+            })
+
+        print(f"📐 시도 {attempt + 1}: pitch={pitch} → {len(raw_blocks)}개 블록")
+        if len(raw_blocks) <= max_blocks:
+            break
+        pitch += GRID_PITCH
+
+    return raw_blocks
+
+
+# ====================================================================
+# 🌟 지붕 모서리 A/B/C/D 자동 추정 (카메라와의 수평 거리 기준 정렬)
+# ====================================================================
+def order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max):
+    """
+    지붕 4개 모서리를 카메라와 가까운 순서대로 A→D 로 라벨링.
+    - 거리 판정은 X,Z 평면(수평)만 사용. Y(높이)는 결과값이라 거리 계산에서 반드시 제외.
+    - main.py의 미러링 보정 이후 좌표계 기준, Z가 큰 쪽이 카메라(정면)에 가깝다고 가정.
+    """
+    verts = mesh.vertices
+    y_max = verts[:, 1].max()
+    y_min = verts[:, 1].min()
+    roof_mask = verts[:, 1] >= y_max - (y_max - y_min) * 0.10
+    roof_verts = verts[roof_mask]
+
+    if len(roof_verts) == 0:
+        roof_verts = verts  # 안전장치: 지붕 영역이 안 잡히면 전체 정점으로 대체
+
+    corners_xz = {
+        "TL": (x_min, z_min),
+        "TR": (x_max, z_min),
+        "BL": (x_min, z_max),
+        "BR": (x_max, z_max),
+    }
+
+    corner_info = {}
+    for key, (cx, cz) in corners_xz.items():
+        # 1. 이 모서리 위치(cx, cz)에 가장 가까운 실제 지붕 꼭짓점 찾기 (X,Z만 비교)
+        dists_to_corner = np.hypot(roof_verts[:, 0] - cx, roof_verts[:, 2] - cz)
+        nearest = roof_verts[dists_to_corner.argmin()]
+        corner_info[key] = {
+            "pos": (float(nearest[0]), float(nearest[1]), float(nearest[2])),
+        }
+
+    # 2. 카메라(정면, Z가 큰 방향)에 가까운 순서로 정렬 — Z값 큰 것부터
+    ordered_keys = sorted(corner_info.keys(), key=lambda k: -corner_info[k]["pos"][2])
+
+    label_map = {}
+    for i, key in enumerate(ordered_keys):
+        letter = chr(ord("A") + i)  # A, B, C, D
+        label_map[letter] = {
+            "original_position": key,
+            "estimated_height_m": round(corner_info[key]["pos"][1] / UNITS_PER_METER, 2),
+        }
+    return label_map
+
+
+# ====================================================================
+# 🌟 지붕 높이 보정: 평지붕(기본값) 또는 4개 모서리 보간(상세입력)
+# ====================================================================
+def _make_fill_block(pos_x: float, pos_y: float, pos_z: float, block_type: str, seen_ids: set):
+    """roof 보정으로 뜬 틈을 메울 Wall 블록 하나 생성. 이미 그 자리에 블록이 있으면 None."""
+    id_x = format_id(pos_x * 10)
+    id_z = format_id(pos_z * 10)
+    id_y = format_id(pos_y * 10)
+    block_id = f"{id_x}_{id_z}_{id_y}"
+    if block_id in seen_ids:
+        return None
+    seen_ids.add(block_id)
+    return {
+        "BlockID": block_id,
+        "PosX": round(pos_x, 2),
+        "PosY": round(pos_y, 2),
+        "PosZ": round(pos_z, 2),
+        "Stress": 0.00,
+        "RiskLevel": "Safe",
+        "Prescription": "N",
+        "Material": "Default",
+        "Tensile": 400.0,
+        "Compressive": 400.0,
+        "Tool": "Existing",
+        "Type": block_type,
+    }
+
+
+def apply_roof_correction(raw_blocks: list, corner_heights: dict | None = None):
+    """
+    corner_heights가 없으면(아무 입력 없음): 모서리 4개 높이가 같다고 가정 → 평지붕으로 강제.
+    corner_heights가 있으면: {"tl":.., "tr":.., "bl":.., "br":..} (미터) 로 bilinear interpolation.
+
+    🌟 Floor 블록을 새 높이로 옮기기만 하면 옛 높이와 새 높이 사이가 뚫려서
+       "몸체와 분리된 지붕(뚜껑)"이 생긴다. 그 틈을 Wall 블록으로 채워서 이어준다.
+    """
+    if not raw_blocks:
+        return raw_blocks
+
+    xs = [b["PosX"] for b in raw_blocks]
+    zs = [b["PosZ"] for b in raw_blocks]
+    ys = [b["PosY"] for b in raw_blocks]
+    x_min, x_max = min(xs), max(xs)
+    z_min, z_max = min(zs), max(zs)
+    y_max, y_min = max(ys), min(ys)
+
+    roof_threshold = y_max - (y_max - y_min) * 0.10
+    roof_blocks = [b for b in raw_blocks if b["Type"] == "Floor" and b["PosY"] >= roof_threshold]
+    roof_ids = {id(b) for b in roof_blocks}
+    other_blocks = [b for b in raw_blocks if id(b) not in roof_ids]
+
+    if not roof_blocks:
+        return raw_blocks
+
+    seen_ids = {b["BlockID"] for b in raw_blocks}
+
+    if corner_heights is None:
+        def target_height(x, z):
+            return round(y_max, 2)
+        print(f"🏠 지붕 상세입력 없음 → 모서리 4개 동일 높이({round(y_max, 2)})로 평지붕 보정")
+    else:
+        tl = corner_heights["tl"] * UNITS_PER_METER
+        tr = corner_heights["tr"] * UNITS_PER_METER
+        bl = corner_heights["bl"] * UNITS_PER_METER
+        br = corner_heights["br"] * UNITS_PER_METER
+
+        def target_height(x, z):
+            u = 0.0 if x_max == x_min else (x - x_min) / (x_max - x_min)
+            v = 0.0 if z_max == z_min else (z - z_min) / (z_max - z_min)
+            top = tl + (tr - tl) * u
+            bot = bl + (br - bl) * u
+            return round(top + (bot - top) * v, 2)
+        print(f"🏠 모서리 4개 입력값으로 지붕 보간 완료 (tl={tl}, tr={tr}, bl={bl}, br={br})")
+
+    fill_blocks = []
+    for b in roof_blocks:
+        old_y = b["PosY"]
+        new_y = target_height(b["PosX"], b["PosZ"])
+
+        if new_y > old_y:
+            # 옛 지붕 높이 → 새 지붕 높이 사이를 Wall로 채워서 몸체와 연결
+            y = old_y + GRID_PITCH
+            while y < new_y - 1e-6:
+                fb = _make_fill_block(b["PosX"], y, b["PosZ"], "Wall", seen_ids)
+                if fb:
+                    fill_blocks.append(fb)
+                y += GRID_PITCH
+        elif new_y < old_y:
+            # 지붕을 낮추는 경우: 원래 위치를 Wall로 남겨서 단면이 뚫리지 않게 함
+            fb = _make_fill_block(b["PosX"], old_y, b["PosZ"], "Wall", seen_ids)
+            if fb:
+                fill_blocks.append(fb)
+
+        b["PosY"] = new_y
+
+    return other_blocks + roof_blocks + fill_blocks
+
+
+# ====================================================================
+# 🌟 새 엔드포인트: 지붕 모서리 A/B/C/D 자동 추정 (박스 드래그 직후 프론트에서 호출)
+# ====================================================================
+@app.post("/api/estimate-roof-corners")
+async def estimate_roof_corners(
+    file: UploadFile = File(...),
+    startX: float = Form(...),
+    startY: float = Form(...),
+    endX: float = Form(...),
+    endY: float = Form(...),
+):
+    img_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"이미지를 읽을 수 없습니다: {e}")
+
+    sx, sy = max(0, int(startX)), max(0, int(startY))
+    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
+    cropped = image.crop((sx, sy, ex, ey))
+
+    crop_bytes_io = io.BytesIO()
+    cropped.save(crop_bytes_io, format="PNG")
+    crop_bytes = crop_bytes_io.getvalue()
+
+    mesh = get_mesh_from_colab(crop_bytes)
+
+    x_min, x_max = float(mesh.bounds[0][0]), float(mesh.bounds[1][0])
+    z_min, z_max = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
+
+    label_map = order_roof_corners_by_distance(mesh, x_min, x_max, z_min, z_max)
+    return label_map
+    # 예: {"A": {"original_position": "BR", "estimated_height_m": 12.3}, "B": {...}, "C": {...}, "D": {...}}
+
+
+@app.post("/api/extract-3d-csv")
+async def extract_3d_csv(
+    file: UploadFile = File(...),
+    startX: float = Form(...),
+    startY: float = Form(...),
+    endX: float = Form(...),
+    endY: float = Form(...),
+    realHeightMeters: float = Form(...),
+    # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
+    roofTL: float | None = Form(None),
+    roofTR: float | None = Form(None),
+    roofBL: float | None = Form(None),
+    roofBR: float | None = Form(None),
+):
+    print(f"📥 사진 데이터 및 박스 좌표 수신: ({startX}, {startY}) ~ ({endX}, {endY}) | 실제 높이: {realHeightMeters}m")
+
+    img_bytes = await file.read()
+    try:
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이미지를 읽을 수 없습니다 (지원하지 않는 포맷일 수 있음): {e}",
+        )
+
+    sx, sy = max(0, int(startX)), max(0, int(startY))
+    ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
+    cropped = image.crop((sx, sy, ex, ey))
+
+    crop_bytes_io = io.BytesIO()
+    cropped.save(crop_bytes_io, format="PNG")
+    crop_bytes = crop_bytes_io.getvalue()
+
+    print("🤖 콜랍 AI 모델에 메시 생성 요청 중...")
+    mesh = get_mesh_from_colab(crop_bytes)
+    print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
+
+    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters)
+
+    # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
+    corner_heights = None
+    if None not in (roofTL, roofTR, roofBL, roofBR):
+        corner_heights = {"tl": roofTL, "tr": roofTR, "bl": roofBL, "br": roofBR}
+    raw_blocks = apply_roof_correction(raw_blocks, corner_heights)
+
+    df = pd.DataFrame(raw_blocks)
+    df = df.drop_duplicates(subset=["BlockID"])
+    df = df.sort_values(by=["PosZ", "PosX", "PosY"])
+
+    print(f"✅ 총 {len(df)}개의 3D 빌딩 블록 엑셀 변환 완료! (속은 비어있는 표면 전용 구조)")
+
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    output.seek(0)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ai_extracted_3d.csv"},
+    )
+
+
+if __name__ == "__main__":
+    print("🚀 CAD AI 백엔드 서버를 시작합니다. (포트 8000)")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
 // FILE PATH: src/App.jsx
 // MODIFIED: 26-10-21 10:59 | LINES: 364
 ```jsx
@@ -366,440 +827,5 @@ export default function App() {
   );
 }
 
-```
-
-// FILE PATH: src/components/Stressanalysismodal.jsx
-// MODIFIED: 26-10-21 10:42 | LINES: 188
-```jsx
-import React, { useState } from 'react';
-import { supabase } from '../supabaseClient';
-
-const API_URL = 'http://localhost:8000/api/analyze-stress';
-
-const RISK_META = {
-  Safe: { label: '안전', bar: 'bg-green-500' },
-  Warning: { label: '주의', bar: 'bg-yellow-400' },
-  Danger: { label: '위험', bar: 'bg-orange-500' },
-  Destroyed: { label: '파괴', bar: 'bg-gray-800' },
-};
-
-function RiskBar({ risk, total }) {
-  return (
-    <div>
-      <div className="flex h-3 rounded-full overflow-hidden bg-gray-100">
-        {Object.entries(RISK_META).map(([key, meta]) => {
-          const n = risk[key] || 0;
-          return n > 0 ? (
-            <div key={key} className={meta.bar} style={{ width: `${(n / total) * 100}%` }} title={`${meta.label} ${n}`} />
-          ) : null;
-        })}
-      </div>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[11px] text-gray-600 font-medium">
-        {Object.entries(RISK_META).map(([key, meta]) => (
-          <span key={key} className="flex items-center gap-1.5">
-            <span className={`inline-block w-2 h-2 rounded-full ${meta.bar}`} />
-            {meta.label} {risk[key] || 0}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const BTN = 'px-4 py-2.5 rounded-xl text-xs font-bold shadow-sm transition-all disabled:bg-gray-200 disabled:text-gray-400 disabled:shadow-none disabled:cursor-not-allowed';
-
-export default function StressAnalysisModal({
-  isOpen,
-  onClose,
-  blueprint,
-  savedAnalysis = null, // 이미 저장돼 있는 분석 (있으면 참고용으로 표시)
-  canUpload = true,
-  onUploaded,
-}) {
-  const [file, setFile] = useState(null);
-  const [csvText, setCsvText] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
-  const [error, setError] = useState('');
-  const [uploading, setUploading] = useState(false);
-  const [uploaded, setUploaded] = useState(false);
-
-  if (!isOpen) return null;
-
-  // 업로드는 "새 분석이 성공적으로 도착한 뒤"에만 활성화
-  const canSubmit = canUpload && !!result?.analysis && !loading && !uploading && !uploaded;
-
-  const handleSelect = async (e) => {
-    const picked = e.target.files?.[0];
-    e.target.value = ''; // 같은 파일을 다시 골라도 change 이벤트가 오도록
-    if (!picked) return;
-    setFile(picked);
-    setCsvText(await picked.text());
-    setResult(null); // 파일이 바뀌면 이전 분석은 무효 → 업로드 다시 비활성화
-    setError('');
-    setUploaded(false);
-  };
-
-  const handleAnalyze = async () => {
-    if (!file) return;
-    setLoading(true);
-    setResult(null);
-    setError('');
-    setUploaded(false);
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const res = await fetch(API_URL, { method: 'POST', body: formData });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || '분석 요청에 실패했습니다.');
-      setResult(data);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleUpload = async () => {
-    setUploading(true);
-    setError('');
-    const fields = { stress_csv: csvText, ai_analysis: result.analysis };
-    const { data, error: dbError } = await supabase
-      .from('blueprints')
-      .update(fields)
-      .eq('id', blueprint.id)
-      .select('id');
-    setUploading(false);
-
-    // RLS에 막히면 error 없이 0행이 반환될 수 있어서 같이 확인
-    if (dbError || !data?.length) {
-      setError(dbError?.message || '저장 권한이 없거나 도면을 찾을 수 없습니다.');
-      return;
-    }
-    setUploaded(true);
-    onUploaded?.(fields);
-  };
-
-  const stats = result?.stats;
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
-      <div
-        className="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[88vh] overflow-y-auto p-6"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between mb-5">
-          <h3 className="text-base font-black text-gray-900">🧪 하중 테스트 결과 업로드 · AI 분석</h3>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 font-bold text-sm">✕</button>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2 mb-2">
-          <label className={`${BTN} bg-gray-800 text-white hover:bg-black cursor-pointer`}>
-            파일 선택
-            <input type="file" accept=".csv" className="hidden" onChange={handleSelect} disabled={loading || uploading} />
-          </label>
-          <button onClick={handleAnalyze} disabled={!file || loading || uploading} className={`${BTN} bg-blue-600 text-white hover:bg-blue-700`}>
-            {loading ? '분석 중...' : result ? '다시 분석' : 'AI 분석'}
-          </button>
-          <button onClick={handleUpload} disabled={!canSubmit} className={`${BTN} bg-green-600 text-white hover:bg-green-700`}>
-            {uploaded ? '업로드 완료' : uploading ? '업로드 중...' : '업로드'}
-          </button>
-        </div>
-        <div className="text-xs text-gray-500 font-medium mb-5">
-          {file ? `선택한 파일: ${file.name}` : 'CurrentStress.csv 파일을 선택하세요.'}
-          {!canUpload && ' · 내가 만든 도면에만 업로드할 수 있어요.'}
-        </div>
-
-        {loading && <p className="text-xs text-blue-600 font-bold mb-4">AI 응답까지 최대 2~3분 걸릴 수 있어요.</p>}
-        {error && <p className="text-xs text-red-600 font-bold bg-red-50 border border-red-200 rounded-xl p-3 mb-4">{error}</p>}
-
-        {stats && (
-          <div className="space-y-5">
-            <div>
-              <div className="text-xs font-bold text-gray-500 mb-2">위험도 분포 (블록 {stats.total_blocks}개)</div>
-              <RiskBar risk={stats.risk} total={stats.total_blocks} />
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              {Object.entries(stats.by_tool).map(([tool, t]) => (
-                <div key={tool} className="bg-gray-50 border border-gray-100 rounded-xl p-3 text-xs">
-                  <div className="font-bold text-gray-700 mb-1">
-                    {tool === 'Reinforcement' ? '보강 블록' : '기존 블록'} ({t.count})
-                  </div>
-                  <div className="text-gray-500 font-medium">파괴율 {t.destroyed_pct}%</div>
-                  <div className="text-gray-500 font-medium">응력 중앙값 {t.median_stress}</div>
-                </div>
-              ))}
-            </div>
-
-            <div className="text-xs text-gray-500 font-medium">
-              보강 블록 {stats.reinforcement_total}개 중 {stats.reinforcement_failed_count}개가 위험/파괴 · 원위치에서 밀려난 블록 {stats.movement.moved_pct}%
-            </div>
-
-            {result.analysis ? (
-              <div className="bg-blue-50 border border-blue-100 rounded-xl p-4">
-                <div className="text-xs font-bold text-blue-700 mb-2">AI 분석 결과</div>
-                <p className="text-xs text-gray-800 font-medium leading-relaxed whitespace-pre-wrap">{result.analysis}</p>
-              </div>
-            ) : (
-              <p className="text-xs text-yellow-700 font-bold bg-yellow-50 border border-yellow-200 rounded-xl p-3">
-                AI 분석을 가져오지 못해 업로드할 수 없습니다. 통계는 정상 집계됐어요. ({result.analysis_error})
-              </p>
-            )}
-          </div>
-        )}
-
-        {!result && !loading && savedAnalysis && (
-          <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
-            <div className="text-xs font-bold text-gray-500 mb-2">이 도면에 저장된 분석</div>
-            <p className="text-xs text-gray-700 font-medium leading-relaxed whitespace-pre-wrap">{savedAnalysis}</p>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-```
-
-// FILE PATH: src/views/DetailView.jsx
-// MODIFIED: 26-10-21 10:32 | LINES: 237
-```jsx
-import React, { useMemo, useState } from 'react';
-import { downloadFloorPagesAsZip, exportToPNG, exportToCSV, getCellColorClass } from '../utils/cadUtils';
-import LiveDemoViewer from '../components/LiveDemoViewer';
-import StressAnalysisModal from '../components/StressAnalysisModal';
-
-// 🌟 DB에 문자열로 저장된 csv_data를 라이브 데모 뷰어가 인식할 수 있는 블록 배열로 바꾸는 헬퍼 함수
-function parseCsvToBlocks(csvText) {
-  if (!csvText) return [];
-  const lines = csvText.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
-
-  const headers = lines[0].split(',').map(h => h.trim());
-  const idx = {
-    x: headers.indexOf('PosX'),
-    y: headers.indexOf('PosY'),
-    z: headers.indexOf('PosZ'),
-    mat: headers.indexOf('Material'),
-  };
-
-  const MATERIAL_HEX = { Concrete: '#95a5a6', Wood: '#d35400', Steel: '#2c3e50', Glass: '#3498db', Default: '#bdc3c7' };
-  const blocks = [];
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i]) continue;
-    const cols = lines[i].split(',');
-    const matName = idx.mat !== -1 ? cols[idx.mat] : 'Default';
-    blocks.push({
-      x: parseFloat(cols[idx.x]),
-      y: parseFloat(cols[idx.y]),
-      z: parseFloat(cols[idx.z]),
-      mat: matName,
-      color: MATERIAL_HEX[matName] || MATERIAL_HEX.Default,
-    });
-  }
-  return blocks;
-}
-
-export default function DetailView({
-  selectedBp,
-  setView,
-  comments,
-  commentInput,
-  setCommentInput,
-  likeCount,
-  hasLiked,
-  onLikeToggle,
-  onAddComment,
-  onEditBlueprint,
-  isOwner = true
-}) {
-  // 하중 테스트 결과 업로드 팝업
-  const [stressOpen, setStressOpen] = useState(false);
-  const [savedAnalysis, setSavedAnalysis] = useState(selectedBp?.ai_analysis ?? null);
-
-  // 격자 데이터를 기반으로 한 실제 용량 계산 로직 (KB단위)
-  // 🌟 2D/3D 유연하게 대응하는 용량 계산 함수
-  const calculateFileSize = () => {
-    const targetData = selectedBp?.grid_data || selectedBp?.csv_data;
-    if (!targetData) return "0.00 KB";
-    const strLen = typeof targetData === 'string' ? targetData.length : JSON.stringify(targetData).length;
-    return (strLen / 1024).toFixed(2) + " KB";
-  };
-
-  // 🌟 현재 도면이 3D AI 기반 프로젝트인지 판별하고 블록 파싱 수행
-  const is3D = !!selectedBp?.csv_data;
-  const parsed3DBlocks = useMemo(() => {
-    return is3D ? parseCsvToBlocks(selectedBp.csv_data) : null;
-  }, [selectedBp?.csv_data, is3D]);
-
-  const handlePngDownload = async () => {
-    // 브라우저/웹뷰에서 prompt()가 차단될 수 있으므로 프로젝트 이름을 바로 사용한다.
-    const name = selectedBp.name || '도면';
-
-    if (is3D) {
-      // 3D CSV는 5개 층씩 2D PNG로 변환한다. PNG가 많아지면 ZIP으로 묶어 내려받는다.
-      await downloadFloorPagesAsZip(selectedBp.csv_data, name);
-      return;
-    }
-
-    exportToPNG(selectedBp.grid_data, name);
-  };
-
-
-
-  return (
-    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans flex flex-col">
-      {/* 상단 네비게이션 헤더 */}
-      <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shadow-sm sticky top-0 z-10">
-        <div className="flex items-center space-x-4">
-          <button 
-            onClick={() => setView('dashboard')} 
-            className="p-2 hover:bg-gray-100 rounded-xl text-gray-600 font-bold transition-all flex items-center space-x-1 text-sm"
-          >
-            <span>◀</span> <span>대시보드로 가기</span>
-          </button>
-          <div className="h-6 w-[1px] bg-gray-200" />
-          <h2 className="text-xl font-black text-gray-900">{selectedBp.name}</h2>
-        </div>
-        <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
-          설계도 뷰어 모드
-        </div>
-      </header>
-
-      {/* 대화형 메인 그리드 및 소셜 시스템 (2분할 구성) */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 flex flex-col md:flex-row gap-8">
-        
-        {/* 왼쪽 영역: 도면 시각화 프리뷰 및 내보내기 다운로드 컨트롤 */}
-        <div className="flex-1 bg-white border border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center shadow-sm">
-          <div className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
-            {is3D ? "3D AI 건축물 입체 프리뷰" : "구조물 설계도 평면도 미리보기"}
-          </div>
-          
-          {/* 🌟 3D 모드라면 parsed3DBlocks 데이터를, 2D 모드라면 기존대로 grid 데이터를 바인딩 */}
-          <div className="w-full h-[350px] mb-4 rounded-2xl overflow-hidden border border-gray-200 shadow-inner">
-            <LiveDemoViewer 
-              grid={!is3D ? selectedBp?.grid_data : null} 
-              data={is3D ? parsed3DBlocks : null} 
-              mode="static" 
-              maxBlocks={10000} 
-            />
-          </div>
-
-          {/* 🌟 2D 설계도일 때만 하단의 미니 격자판(2D 레고 도면)을 렌더링하고, 3D 건축물일 때는 공간을 차지하지 않도록 숨깁니다. */}
-          {!is3D && selectedBp.grid_data && (
-            <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100 shadow-inner overflow-auto max-w-full flex items-center justify-center min-h-[150px] w-full">
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(50, 7px)', gap: '0px' }}>
-                {selectedBp.grid_data.map((row, rIdx) => row.map((cell, cIdx) => (
-                  <div
-                    key={`detail-cell-${rIdx}-${cIdx}`}
-                    className={`w-[7px] h-[7px] border-[0.05px] border-gray-200/50 ${getCellColorClass(cell)}`}
-                  />
-                )))}
-              </div>
-            </div>
-          )}
-          
-          <div className="w-full flex flex-col gap-3 mt-6">
-            <div className="grid grid-cols-2 gap-3">
-              <button onClick={handlePngDownload} className="p-3.5 bg-gray-800 text-white rounded-xl text-xs font-bold hover:bg-black transition-all shadow-sm">
-                📸 PNG 이미지 다운로드 (mbs_)
-              </button>
-              <button onClick={() => {
-                if (is3D) {
-                  const url = URL.createObjectURL(new Blob([selectedBp.csv_data], { type: 'text/csv' }));
-                  const a = document.createElement('a');
-                  a.href = url; a.download = `mbs_${selectedBp.name || 'model'}.csv`; a.click();
-                  URL.revokeObjectURL(url);
-                } else if (selectedBp.grid_data) {
-                  exportToCSV(selectedBp.grid_data);
-                }
-              }} className="p-3.5 bg-blue-50 text-blue-600 border border-blue-200 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all shadow-sm">
-                📊 CSV 데이터 내보내기
-              </button>
-            </div>
-            <button onClick={onEditBlueprint} className="w-full p-4 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
-              📐 이 도면 편집기로 열기 (CAD 작업실 이동)
-            </button>
-            {is3D && (
-              <button onClick={() => setStressOpen(true)} className="w-full p-4 bg-white text-gray-800 border border-gray-300 rounded-xl text-sm font-bold hover:bg-gray-50 shadow-sm transition-all">
-                🧪 하중 테스트 결과 업로드 · AI 분석
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* 오른쪽 영역: 상세 정보 메타데이터 및 실시간 좋아요/댓글 피드백 시스템 (기존 코드 완벽 유지) */}
-        <div className="w-full md:w-[400px] bg-white border border-gray-200 rounded-2xl p-6 flex flex-col shadow-sm justify-between">
-          <div>
-            <h3 className="text-base font-black text-gray-900 mb-4 pb-2 border-b border-gray-100">📋 설계 도면 정보</h3>
-            
-            <div className="bg-gray-50 p-4 rounded-xl text-xs space-y-3 text-gray-600 font-medium mb-5 border border-gray-100">
-              <div className="flex justify-between"><span>👤 설계자</span> <span className="text-blue-600 font-bold">{selectedBp.author}</span></div>
-              <div className="flex justify-between"><span>📅 제작일자</span> <span className="text-gray-900 font-bold">{new Date(selectedBp.created_at).toLocaleString()}</span></div>
-              <div className="flex justify-between"><span>💾 파일 용량</span> <span className="text-green-600 font-bold">{calculateFileSize()}</span></div>
-            </div>
-
-            <div className="mb-6">
-              <button 
-                onClick={onLikeToggle} 
-                className={`flex items-center space-x-2 px-5 py-2.5 rounded-full border text-xs font-bold transition-all shadow-sm ${
-                  hasLiked ? 'bg-red-50 border-red-200 text-red-500 shadow-red-100/30' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                }`}
-              >
-                <span>{hasLiked ? '❤️' : '🤍'}</span>
-                <span>좋아요 {likeCount}개</span>
-              </button>
-            </div>
-
-            <div className="border-t border-gray-100 pt-5">
-              <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">💬 피드백 및 댓글 ({comments.length})</h4>
-              <div className="space-y-3 max-h-[260px] overflow-y-auto pr-1">
-                {comments.length === 0 ? (
-                  <div className="text-center py-10 bg-gray-50 rounded-xl border border-dashed border-gray-200 text-xs text-gray-400 font-medium">
-                    등록된 피드백이 없습니다.<br/>첫 댓글을 달아 칭찬해보세요!
-                  </div>
-                ) : (
-                  comments.map(comment => (
-                    <div key={comment.id} className="bg-gray-50 p-3 rounded-xl text-xs border border-gray-100">
-                      <div className="flex justify-between font-bold text-gray-700 mb-1">
-                        <span>{comment.username || '익명'}</span>
-                        <span className="text-[10px] text-gray-400 font-normal">{new Date(comment.created_at).toLocaleDateString()}</span>
-                      </div>
-                      <p className="text-gray-600 font-medium break-all whitespace-pre-wrap">{comment.content}</p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-
-          <div className="border-t border-gray-100 pt-4 mt-6 flex gap-2">
-            <input 
-              type="text" 
-              value={commentInput}
-              onChange={e => setCommentInput(e.target.value)}
-              placeholder="댓글을 남겨보세요..."
-              className="flex-1 bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs outline-none focus:border-blue-500 focus:bg-white transition-all font-medium"
-              onKeyDown={e => { if(e.key === 'Enter') onAddComment(); }}
-            />
-            <button onClick={onAddComment} className="px-5 py-3 bg-blue-600 text-white rounded-xl text-xs font-bold hover:bg-blue-700 shadow-sm transition-all whitespace-nowrap">
-              등록
-            </button>
-          </div>
-        </div>
-
-      </main>
-
-      <StressAnalysisModal
-        isOpen={stressOpen}
-        onClose={() => setStressOpen(false)}
-        blueprint={selectedBp}
-        savedAnalysis={savedAnalysis}
-        canUpload={isOwner}
-        onUploaded={(f) => setSavedAnalysis(f.ai_analysis)}
-      />
-    </div>
-  );
-}
 ```
 

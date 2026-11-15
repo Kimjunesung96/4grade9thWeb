@@ -41,16 +41,24 @@ REQUIRED_COLS = {
     "Material", "Tool", "Type",
 }
 
-SYSTEM_PROMPT = """너는 블록 기반 건축물 구조 시뮬레이션 결과를 분석하는 구조 안전 분석가야.
-입력은 하중 테스트 결과를 요약한 JSON이야. 규칙:
-- 입력에 있는 숫자만 근거로 써. 없는 수치는 만들지 마.
-- Stress 단위는 모르니까 단위를 붙이지 마.
+SYSTEM_PROMPT = """너는 블록 기반 건축물 구조 시뮬레이션 결과를 진단하고 처방하는 대한민국 최고의 건축구조기술사 겸 AI 구조 안전 분석가야.
+입력은 하중/변위 테스트 결과를 요약한 JSON이야. 규칙:
+- 입력에 있는 숫자만 근거로 써. 없는 가공의 수치를 지어내지 마.
+- Stress 수치는 상대 지표이므로 단위를 붙이지 마.
 - H_Beam의 Tensile/Compressive가 0인 것은 '미기록'이야. 강도 0으로 해석하지 마.
-- Prescription 컬럼의 의미는 단정하지 마.
 - orig_x/y/z는 원래 위치, moved는 테스트 후 원래 위치에서 밀려난 거리야. 위치 설명은 orig 기준으로 해.
-- 출력은 한국어 평문(마크다운 기호 없이). 문제점 3~5개를 번호로 쓰고,
-  각 항목마다 '근거 수치 / 위치(높이·구역) / 개선 제안'을 한 줄씩 써.
-- 마지막에 '가장 먼저 손볼 곳' 한 줄로 마무리해."""
+- 건축물에 tilt_profile(경사/기울어짐)이나 한쪽 방향으로의 쏠림(전도 모멘트, 편심 하중)이 감지되면, 싱가포르 마리나 베이 샌즈(최대 52도 경사)와 같은 '비정형 초고층 경사 구조물'의 붕괴/전도 위험을 명확히 진단해.
+- 개선 제안(구조 보강 처방)에는 다음 첨단 건축 공학 공법을 반드시 구체적인 위치와 함께 제시해:
+  1) 트랜스퍼 트러스 (Transfer Truss):
+     - 경사 건물이 기우는 방향의 횡력과 편심 하중을 인접 코어나 직립 구조체로 전달하기 위해 중간 층(변위 집중 구역)에 철골 트러스 구조물 설치 (하중을 60:40 비율 등으로 분산).
+  2) 포스트 텐션 (Post-Tension / 텐던 케이블 긴장):
+     - 기울어진 외벽 콘크리트 내부에 고장력 케이블(인장재)을 설치해 당겨줌으로써 인장 균열 및 전도를 방지.
+  3) 강재 브레이싱 및 수평 다이어프램 (H-Beam Bracing & Diaphragm):
+     - 횡변위가 급증하는 구역과 기초 지지부의 전단력 보강.
+- 출력은 마크다운 기호 없이 깔끔하고 전문적인 한국어 평문으로 작성해.
+  1. 구조 취약점 진단: 3~4개의 핵심 문제를 번호로 작성 (근거 수치, 높이/구역, 위험 원인 명시)
+  2. 실전 엔지니어링 보강 처방: 각 취약점별 권장 공법(트랜스퍼 트러스, 포스트 텐션, H-Beam 브레이싱 등)과 구체적 설치 위치 제시
+  3. 가장 먼저 손볼 곳: 최우선 보강 위치를 1~2줄로 명확히 지정."""
 
 
 def parse_block_id(block_id: str):
@@ -175,8 +183,31 @@ def build_summary(blocks: pd.DataFrame, orphans: int) -> dict:
     reinf = blocks[blocks["Tool"] == "Reinforcement"]
     failed_reinf = reinf[reinf["final_risk"].isin(["Danger", "Destroyed"])]
 
+
+    # 🌟 경사 건축물(마리나베이샌즈 등) 및 편심 경향 분석
+    tilt_profile = {"is_inclined": False, "description": "수직 직립 구조"}
+    if len(blocks) > 20:
+        y_min, y_max = float(blocks["orig_y"].min()), float(blocks["orig_y"].max())
+        y_span = max(y_max - y_min, 1.0)
+        bot = blocks[blocks["orig_y"] <= y_min + y_span * 0.2]
+        top = blocks[blocks["orig_y"] >= y_max - y_span * 0.2]
+        if len(bot) > 0 and len(top) > 0:
+            drift_x = float(top["orig_x"].mean() - bot["orig_x"].mean())
+            drift_z = float(top["orig_z"].mean() - bot["orig_z"].mean())
+            drift_dist = (drift_x ** 2 + drift_z ** 2) ** 0.5
+            # 높이 대비 수평 이동량이 크면 경사 구조물로 판정
+            if drift_dist > 5.0:
+                tilt_profile = {
+                    "is_inclined": True,
+                    "height_span": round(y_span, 1),
+                    "horizontal_drift_m": round(drift_dist, 1),
+                    "drift_vector": {"dx": round(drift_x, 1), "dz": round(drift_z, 1)},
+                    "description": f"상층부가 하층부 대비 약 {round(drift_dist, 1)}m 수평 편심(기울어짐)된 경사형 구조물"
+                }
+
     return {
         "total_blocks": int(total),
+        "tilt_profile": tilt_profile,
         "orphan_destroyed_ids": orphans,
         "risk": _risk_counts(blocks),
         "stress_median": round(float(blocks["max_stress"].median()), 2),

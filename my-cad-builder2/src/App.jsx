@@ -190,28 +190,48 @@ export default function App() {
     return r >= Math.min(startPos.r, currentPos.r) && r <= Math.max(startPos.r, currentPos.r) && c >= Math.min(startPos.c, currentPos.c) && c <= Math.max(startPos.c, currentPos.c);
   };
 
-  const handleLikeToggle = (bpId) => {
-    if (!user) return;
-    const currentLikedUsers = likesData[bpId] || [];
-    if (currentLikedUsers.includes(user.id)) {
-      setLikesData({ ...likesData, [bpId]: currentLikedUsers.filter(uid => uid !== user.id) });
+  const fetchSocialData = async (bpId) => {
+    const [commentsResult, likesResult] = await Promise.all([
+      supabase.from('comments')
+        .select('id, content, created_at, user_id, users(username)')
+        .eq('blueprint_id', bpId)
+        .order('created_at', { ascending: true }),
+      supabase.from('likes')
+        .select('user_id')
+        .eq('blueprint_id', bpId),
+    ]);
+
+    if (commentsResult.error) {
+      console.error('댓글 불러오기 실패:', commentsResult.error.message);
     } else {
-      setLikesData({ ...likesData, [bpId]: [...currentLikedUsers, user.id] });
+      const mapped = (commentsResult.data || []).map(c => ({ ...c, username: c.users?.username }));
+      setCommentsData(prev => ({ ...prev, [bpId]: mapped }));
+    }
+
+    if (likesResult.error) {
+      console.error('좋아요 불러오기 실패:', likesResult.error.message);
+    } else {
+      setLikesData(prev => ({ ...prev, [bpId]: (likesResult.data || []).map(like => like.user_id) }));
     }
   };
 
+  const handleLikeToggle = async (bpId) => {
+    if (!user) { alert('좋아요는 로그인 후에 누를 수 있습니다.'); return; }
+
+    const alreadyLiked = (likesData[bpId] || []).includes(user.id);
+    const { error } = alreadyLiked
+      ? await supabase.from('likes').delete().eq('blueprint_id', bpId).eq('user_id', user.id)
+      : await supabase.from('likes').insert([{ blueprint_id: bpId, user_id: user.id }]);
+
+    if (error) {
+      alert('좋아요 저장 실패: ' + error.message);
+      return;
+    }
+    await fetchSocialData(bpId);
+  };
+
   useEffect(() => {
-    if (!selectedBp?.id) return;
-    const bpId = selectedBp.id;
-    supabase.from('comments')
-      .select('id, content, created_at, user_id, users(username)')
-      .eq('blueprint_id', bpId)
-      .order('created_at', { ascending: true })
-      .then(({ data, error }) => {
-        if (error) { console.error('댓글 불러오기 실패:', error.message); return; }
-        const mapped = (data || []).map(c => ({ ...c, username: c.users?.username }));
-        setCommentsData(prev => ({ ...prev, [bpId]: mapped }));
-      });
+    if (selectedBp?.id) fetchSocialData(selectedBp.id);
   }, [selectedBp?.id]);
 
   const handleAddComment = async (bpId) => {
@@ -331,6 +351,7 @@ export default function App() {
           hasLiked={(likesData[selectedBp.id] || []).includes(user?.id)}
           onLikeToggle={() => handleLikeToggle(selectedBp.id)}
           onAddComment={() => handleAddComment(selectedBp.id)}
+          isOwner={selectedBp.user_id === user?.id}   // ← 추가
           onEditBlueprint={() => {
             setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
             setHistory([]);

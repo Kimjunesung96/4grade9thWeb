@@ -396,7 +396,8 @@ export const downloadFloorPagesAsPngs = async (csvText, baseName = 'structure', 
   }
 };
 
-// 🌟 쪼갠 grid들을 PNG로 변환해서 다운로드 (6장 미만은 개별, 6장 이상은 zip 하나로 자동 전환)
+// 🌟 쪼갠 grid들을 PNG로 변환해 하나의 ZIP으로 다운로드한다.
+// 브라우저가 연속 PNG 다운로드를 막아 일부 층만 저장되는 문제를 피한다.
 export const downloadFloorPagesAsZip = async (csvText, baseName = 'structure', floorsPerPage = 5) => {
   const pages = csvDataToFloorPages(csvText, floorsPerPage);
   if (pages.length === 0) {
@@ -408,5 +409,5 @@ export const downloadFloorPagesAsZip = async (csvText, baseName = 'structure', f
     const endFloor = Math.min((i + 1) * floorsPerPage, pages.length * floorsPerPage);
     return `${baseName}_p${i + 1}_floors${startFloor}-${endFloor}`;
   });
-  await downloadPagesAsPngOrZip(pages, labels, `${baseName}_floors`);
+  await downloadGridPagesAsZip(pages, labels, `${baseName}_floors`);
 };
