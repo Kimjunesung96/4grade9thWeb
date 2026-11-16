@@ -194,12 +194,21 @@ function GridCanvas({ grid, ghostGrid, mode, paintColor, isInsidePreview, onCell
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, GRID_SIZE, GRID_SIZE);
 
-    // 1) 이전 장 실루엣 (참고용, 반투명)
+    // 1) 이전 장 실루엣 (참고용, 선명한 반투명 + 윤곽선)
     if (ghostGrid) {
       ghostGrid.forEach((row, r) => row.forEach((cell, c) => {
         if (cell >= 1 && cell <= 5) {
-          ctx.globalAlpha = 0.25;
+          ctx.globalAlpha = 0.40;
           ctx.fillStyle = FLOOR_COLORS[cell].hex;
+          ctx.fillRect(c * GRID_CELL, r * GRID_CELL, GRID_CELL, GRID_CELL);
+          // 실루엣 윤곽선
+          ctx.globalAlpha = 0.60;
+          ctx.strokeStyle = '#4b5563';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(c * GRID_CELL + 0.5, r * GRID_CELL + 0.5, GRID_CELL - 1, GRID_CELL - 1);
+        } else if (cell === 9) {
+          ctx.globalAlpha = 0.25;
+          ctx.fillStyle = '#9ca3af';
           ctx.fillRect(c * GRID_CELL, r * GRID_CELL, GRID_CELL, GRID_CELL);
         }
       }));
@@ -312,6 +321,14 @@ export default function EditorView({
   //    CSV를 불러온 상태(csvPages 존재)라면 stackedFloors 대신 csvPages 전부를
   //    각자 올바른 절대 높이(pageIndex*5)에 동시에 쌓아서 이어 보이게 한다.
   //    (수동 그리기 모드일 땐 기존 stackedFloors 기반 로직 그대로 사용)
+    // 🌟 이전 층 실루엣 계산 (CSV 페이지 및 stackedFloors 모두 지원)
+  const currentGhostGrid = useMemo(() => {
+    if (csvPages.length > 0) {
+      return csvPageIndex > 0 ? csvPages[csvPageIndex - 1] : null;
+    }
+    return stackedFloors.length > 0 ? stackedFloors[stackedFloors.length - 1].grid : null;
+  }, [csvPages, csvPageIndex, stackedFloors]);
+
   const allStackedBlocks = useMemo(() => {
     if (csvPages.length > 0) {
       return buildCsvPagesAllBlocks(csvPages, grid, csvPageIndex);
@@ -342,6 +359,37 @@ export default function EditorView({
   const [isExtracting, setIsExtracting] = useState(false);
   const [realHeightMeters, setRealHeightMeters] = useState(''); // 🌟 실제 건물 높이(m) — 백엔드 필수 입력
   const [applyTiltFix, setApplyTiltFix] = useState(true); // 🌟 기울기 자동 보정 여부 (마리나베이샌즈 등 경사 건물은 해제 가능)
+
+  // 🌟 원근 왜곡 보정 참조 박스 (① 앞 / ② 뒤)
+  const [boxMode, setBoxMode] = useState('crop'); // 'crop' | 'ref_front'
+  const [refBoxFront, setRefBoxFront] = useState(null); // { startX, startY, endX, endY }
+  const [refBoxBack, setRefBoxBack] = useState(null); // { x, y, width, height }
+  const [isDrawingRefFront, setIsDrawingRefFront] = useState(false);
+  const [backDragState, setBackDragState] = useState(null); // { type, startMouseX, startMouseY, origX, origY, origW, origH }
+
+  const perspectiveRatio = useMemo(() => {
+    if (!refBoxFront || !refBoxBack) return null;
+    const w1 = Math.abs(refBoxFront.endX - refBoxFront.startX);
+    const w2 = refBoxBack.width;
+    if (w1 <= 5 || w2 <= 5) return null;
+    return Math.round((w1 / w2) * 100) / 100;
+  }, [refBoxFront, refBoxBack]);
+
+  const handleCopyBackBox = () => {
+    if (!refBoxFront) return;
+    const x = Math.min(refBoxFront.startX, refBoxFront.endX) + 25;
+    const y = Math.min(refBoxFront.startY, refBoxFront.endY) - 25;
+    const width = Math.abs(refBoxFront.endX - refBoxFront.startX);
+    const height = Math.abs(refBoxFront.endY - refBoxFront.startY);
+    setRefBoxBack({ x: Math.max(0, x), y: Math.max(0, y), width, height });
+    setBoxMode('crop');
+  };
+
+  const handleResetRefBoxes = () => {
+    setRefBoxFront(null);
+    setRefBoxBack(null);
+    setBoxMode('crop');
+  };
 
   // 🌟 지붕 모서리 A/B/C/D 상세입력 — 4개 다 채워야 보간, 하나라도 비어있으면 평지붕 기본값
   const [roofLabelMap, setRoofLabelMap] = useState(null); // /api/estimate-roof-corners 응답: {A:{original_position,estimated_height_m}, ...}
@@ -541,6 +589,7 @@ export default function EditorView({
       formData.append('endY', realEndY);
       formData.append('realHeightMeters', realHeightMeters);
       formData.append('applyTiltFix', applyTiltFix);
+      if (perspectiveRatio) formData.append('perspectiveRatio', perspectiveRatio);
 
       // 🌟 지붕 A/B/C/D 4개 값이 전부 입력돼 있으면, 추정 시 받은 original_position(TL/TR/BL/BR)
       //    매핑을 그대로 이용해 서버가 기대하는 roofTL/TR/BL/BR 슬롯에 넣어 보낸다.
@@ -782,7 +831,7 @@ export default function EditorView({
                   <div className="bg-white shadow-2xl border border-gray-200 relative" style={{ width: '700px', height: '700px' }}>
                     <GridCanvas
                       grid={grid}
-                      ghostGrid={stackedFloors.length > 0 ? stackedFloors[stackedFloors.length - 1].grid : null}
+                      ghostGrid={currentGhostGrid}
                       mode={mode}
                       paintColor={paintColor}
                       isInsidePreview={isInsidePreview}
@@ -798,14 +847,50 @@ export default function EditorView({
             {editorTab === 'photo' && (
               <div className="h-full p-6 flex flex-col items-center overflow-y-auto relative"
                 onMouseMove={(e) => {
-                  if (!isDrawingBox || !imgRef.current) return;
+                  if (backDragState && refBoxBack) {
+                    const dx = e.clientX - backDragState.startMouseX;
+                    const dy = e.clientY - backDragState.startMouseY;
+                    if (backDragState.type === 'move') {
+                      setRefBoxBack(prev => ({
+                        ...prev,
+                        x: Math.max(0, backDragState.origX + dx),
+                        y: Math.max(0, backDragState.origY + dy)
+                      }));
+                    } else if (backDragState.type === 'resize') {
+                      const aspect = backDragState.origH / Math.max(1, backDragState.origW);
+                      const newW = Math.max(15, backDragState.origW + dx);
+                      setRefBoxBack(prev => ({
+                        ...prev,
+                        width: newW,
+                        height: Math.round(newW * aspect)
+                      }));
+                    }
+                    return;
+                  }
+                  if (!imgRef.current) return;
                   const rect = imgRef.current.getBoundingClientRect();
-                  const currentX = e.clientX - rect.left;
-                  const currentY = e.clientY - rect.top;
-                  setBox(prev => ({ ...prev, endX: currentX, endY: currentY }));
+                  const currentX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+                  const currentY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+
+                  if (isDrawingRefFront) {
+                    setRefBoxFront(prev => ({ ...prev, endX: currentX, endY: currentY }));
+                  } else if (isDrawingBox) {
+                    setBox(prev => ({ ...prev, endX: currentX, endY: currentY }));
+                  }
                 }}
-                onMouseUp={() => setIsDrawingBox(false)}
-                onMouseLeave={() => setIsDrawingBox(false)}
+                onMouseUp={() => {
+                  if (backDragState) setBackDragState(null);
+                  if (isDrawingRefFront) {
+                    setIsDrawingRefFront(false);
+                    setBoxMode('crop');
+                  }
+                  if (isDrawingBox) setIsDrawingBox(false);
+                }}
+                onMouseLeave={() => {
+                  if (backDragState) setBackDragState(null);
+                  if (isDrawingRefFront) setIsDrawingRefFront(false);
+                  if (isDrawingBox) setIsDrawingBox(false);
+                }}
               >
                 {!imageSrc ? (
                   // [사진 업로드 전 화면]
@@ -895,6 +980,52 @@ export default function EditorView({
                       </div>
                     )}
 
+                    {/* 🌟 원근 왜곡(사다리꼴 수축) 보정 컨트롤 바 (① 앞 / ② 뒤) */}
+                    <div className="w-full max-w-2xl flex flex-wrap items-center justify-between gap-3 mb-3 bg-indigo-50/90 border border-indigo-200 rounded-2xl px-4 py-2.5 shadow-sm">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-black text-indigo-900 flex items-center gap-1">
+                          📐 원근 보정:
+                        </span>
+                        <Button
+                          variant={boxMode === 'ref_front' ? 'primary' : 'secondary'}
+                          onClick={() => setBoxMode(prev => prev === 'ref_front' ? 'crop' : 'ref_front')}
+                        >
+                          {boxMode === 'ref_front' ? '✏️ ① 앞박스 드래그 중...' : (refBoxFront ? '✓ ① 앞박스 재설정' : '① 앞박스 그리기')}
+                        </Button>
+                        {refBoxFront && !refBoxBack && (
+                          <Button
+                            variant="dark"
+                            onClick={handleCopyBackBox}
+                          >
+                            📦 ② 뒷박스 복사 생성
+                          </Button>
+                        )}
+                        {(refBoxFront || refBoxBack) && (
+                          <Button
+                            variant="secondary"
+                            onClick={handleResetRefBoxes}
+                          >
+                            ✕ 원근 초기화
+                          </Button>
+                        )}
+                      </div>
+
+                      {perspectiveRatio ? (
+                        <div className="flex items-center gap-2 bg-white px-3 py-1 rounded-xl border border-indigo-200 shadow-sm text-xs font-bold text-indigo-700">
+                          <span className="text-emerald-600">① 앞: {Math.round(Math.abs(refBoxFront.endX - refBoxFront.startX))}px</span>
+                          <span className="text-gray-400">➔</span>
+                          <span className="text-purple-600">② 뒤: {Math.round(refBoxBack.width)}px</span>
+                          <span className="bg-indigo-600 text-white px-2 py-0.5 rounded-md font-extrabold ml-1">
+                            원근 보정 {perspectiveRatio}x
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-indigo-500 font-medium">
+                          {boxMode === 'ref_front' ? '사진에서 앞쪽 기준 영역을 드래그하세요' : (refBoxFront ? '② 뒷박스 복사를 눌러 뒤로 끌고 가세요' : '위에서 내려다본 사진은 앞/뒤 박스로 원근을 펴보세요')}
+                        </span>
+                      )}
+                    </div>
+
                     {/* 🌟 크롭(박스) 에디터 영역 */}
                     <div className="relative inline-block border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl select-none">
                       <img
@@ -907,20 +1038,91 @@ export default function EditorView({
                           const rect = imgRef.current.getBoundingClientRect();
                           const startX = e.clientX - rect.left;
                           const startY = e.clientY - rect.top;
-                          setIsDrawingBox(true);
-                          setBox({ startX, startY, endX: startX, endY: startY });
+                          if (boxMode === 'ref_front') {
+                            setIsDrawingRefFront(true);
+                            setRefBoxFront({ startX, startY, endX: startX, endY: startY });
+                          } else {
+                            setIsDrawingBox(true);
+                            setBox({ startX, startY, endX: startX, endY: startY });
+                          }
                         }}
                       />
+                      {/* 메인 건물 크롭 영역 */}
                       {box && (
                         <div
-                          className="absolute border-2 border-blue-500 bg-blue-400/30 pointer-events-none"
+                          className="absolute border-2 border-blue-500 bg-blue-400/20 pointer-events-none"
                           style={{
                             left: Math.min(box.startX, box.endX),
                             top: Math.min(box.startY, box.endY),
                             width: Math.abs(box.endX - box.startX),
                             height: Math.abs(box.endY - box.startY)
                           }}
-                        />
+                        >
+                          <span className="absolute -top-5 left-0 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow">
+                            건물 추출 영역
+                          </span>
+                        </div>
+                      )}
+
+                      {/* ① 앞박스 */}
+                      {refBoxFront && (
+                        <div
+                          className="absolute border-2 border-emerald-500 bg-emerald-400/30 pointer-events-none shadow-sm"
+                          style={{
+                            left: Math.min(refBoxFront.startX, refBoxFront.endX),
+                            top: Math.min(refBoxFront.startY, refBoxFront.endY),
+                            width: Math.abs(refBoxFront.endX - refBoxFront.startX),
+                            height: Math.abs(refBoxFront.endY - refBoxFront.startY)
+                          }}
+                        >
+                          <span className="absolute top-0 left-0 bg-emerald-600 text-white text-[11px] font-black px-1.5 py-0.5 rounded-br shadow">
+                            ① 앞
+                          </span>
+                        </div>
+                      )}
+
+                      {/* ② 뒷박스 (이동 & 크기조절) */}
+                      {refBoxBack && (
+                        <div
+                          className="absolute border-2 border-purple-500 bg-purple-400/35 cursor-move shadow-md"
+                          style={{
+                            left: refBoxBack.x,
+                            top: refBoxBack.y,
+                            width: refBoxBack.width,
+                            height: refBoxBack.height
+                          }}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            setBackDragState({
+                              type: 'move',
+                              startMouseX: e.clientX,
+                              startMouseY: e.clientY,
+                              origX: refBoxBack.x,
+                              origY: refBoxBack.y
+                            });
+                          }}
+                        >
+                          <span className="absolute top-0 left-0 bg-purple-600 text-white text-[11px] font-black px-1.5 py-0.5 rounded-br shadow select-none pointer-events-none">
+                            ② 뒤 (드래그로 이동)
+                          </span>
+                          {/* 우하단 리사이즈 핸들 */}
+                          <div
+                            className="absolute -right-2.5 -bottom-2.5 w-5 h-5 bg-purple-600 border-2 border-white rounded-full cursor-nwse-resize shadow-lg flex items-center justify-center hover:scale-125 transition-transform"
+                            title="잡고 드래그하여 뒤쪽 크기에 맞게 조절하세요"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              setBackDragState({
+                                type: 'resize',
+                                startMouseX: e.clientX,
+                                startMouseY: e.clientY,
+                                origW: refBoxBack.width,
+                                origH: refBoxBack.height
+                              });
+                            }}
+                          >
+                            <span className="w-1.5 h-1.5 bg-white rounded-full pointer-events-none" />
+                          </div>
+                        </div>
                       )}
                     </div>
                   </div>

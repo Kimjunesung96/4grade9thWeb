@@ -121,7 +121,38 @@ def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
     return mesh
 
 
-def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS, apply_tilt_fix: bool = True):
+
+def apply_perspective_correction(mesh, ratio: float, up_axis_idx=1):
+    """
+    원근감(위에서 내려다보거나 뒤로 가면서 좁아진 사다리꼴 왜곡)을 역보정하여
+    평행한 직육면체 기둥 형태로 펴준다.
+    ratio: 앞박스 너비 / 뒷박스 너비 (예: 1.35)
+    """
+    if abs(ratio - 1.0) < 0.02:
+        return mesh
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    h = verts[:, up_axis_idx]
+    h_min, h_max = h.min(), h.max()
+    H = max(h_max - h_min, 1e-6)
+
+    hor = [i for i in range(3) if i != up_axis_idx]
+    center_hor = verts[:, hor].mean(axis=0)
+
+    # 높이 t (0.0 바닥 ~ 1.0 꼭대기)
+    # 위에서 내려다본 사진의 경우, 바닥(하층부)이 멀어서 작아졌으므로
+    # h가 낮을수록(바닥일수록) ratio만큼 더 크게 확장해야 함
+    t = (h_max - h) / H  # 바닥(멀어서 축소됨)에 가까울수록 t=1.0
+
+    # 스케일 인자: 꼭대기는 1.0, 바닥은 ratio배로 점진적 확장
+    scales = 1.0 + (ratio - 1.0) * t[:, np.newaxis]
+    verts[:, hor] = center_hor + (verts[:, hor] - center_hor) * scales
+
+    mesh.vertices = verts
+    print(f"📐 원근 왜곡 역보정 적용: 비율 {ratio:.2f}배 (바닥 수평 스케일 확장)")
+    return mesh
+
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS, apply_tilt_fix: bool = True, perspective_ratio: float | None = None):
     extents = mesh.bounds[1] - mesh.bounds[0]
     tallest_axis = int(np.argmax(extents))
 
@@ -146,6 +177,10 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
     #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
     if apply_tilt_fix and APPLY_TILT_FIX:
         mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
+
+    # 🌟 원근 왜곡(사다리꼴 수축) 역보정
+    if perspective_ratio and perspective_ratio > 0.1:
+        mesh = apply_perspective_correction(mesh, ratio=perspective_ratio, up_axis_idx=1)
 
     mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
     if mesh_height_raw <= 0:
@@ -398,6 +433,7 @@ async def extract_3d_csv(
     endY: float = Form(...),
     realHeightMeters: float = Form(...),
     applyTiltFix: bool = Form(True),
+    perspectiveRatio: float | None = Form(None),
     # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
     roofTL: float | None = Form(None),
     roofTR: float | None = Form(None),
@@ -427,7 +463,7 @@ async def extract_3d_csv(
     mesh = get_mesh_from_colab(crop_bytes)
     print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
 
-    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters, apply_tilt_fix=applyTiltFix)
+    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters, apply_tilt_fix=applyTiltFix, perspective_ratio=perspectiveRatio)
 
     # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
     corner_heights = None
