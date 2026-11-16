@@ -39,7 +39,12 @@ def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
     resp = requests.post(
         COLAB_API_URL,
         files={"image": ("input.png", img_bytes, "image/png")},
-        params={"flatten_roof": "false", "snap_grid": "false"},
+        params={
+            "flatten_roof": "false",
+            "snap_grid": "false",
+            "fix_perspective": "false",  # 🌟 콜랍의 OpenCV 2D 왜곡 보정이 원본 이미지를 비틀지 않도록 비활성화
+            "fix_tilt": "false",
+        },
         timeout=180,
     )
     resp.raise_for_status()
@@ -122,13 +127,57 @@ def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
 
 
 
+def apply_depth_perspective_correction(mesh, ratio, s_front, s_back,
+                                       depth_axis_idx=0, up_axis_idx=1):
+    if abs(ratio - 1.0) < 0.02:
+        return mesh
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    d = verts[:, depth_axis_idx]
+    d_min, d_max = d.min(), d.max()
+    D = max(d_max - d_min, 1e-6)
+
+    # 앞쪽 끝이 -축인지 +축인지: 양 끝 25% 구간 높이 비교 (큰 쪽이 앞)
+    up = verts[:, up_axis_idx]
+    lo_mask = d <= d_min + 0.25 * D
+    hi_mask = d >= d_max - 0.25 * D
+    if not lo_mask.any() or not hi_mask.any():
+        return mesh
+    front_is_low = np.percentile(up[lo_mask], 90) >= np.percentile(up[hi_mask], 90)
+
+    # 앞쪽 끝 기준 깊이 s (0 = 맨 앞, 1 = 맨 뒤)
+    s = (d - d_min) / D
+    if not front_is_low:
+        s = 1.0 - s
+
+    # 앞~뒤 박스 사이 진행도 t (범위 밖은 clamp)
+    if s_back - s_front < 0.05:
+        s_front, s_back = 0.0, 1.0
+    t = np.clip((s - s_front) / (s_back - s_front), 0.0, 1.0)
+    scale = 1.0 + (ratio - 1.0) * t
+
+    # 높이(바닥 기준) + 단면(깊이축 제외 수평축) 스케일
+    h_min = up.min()
+    verts[:, up_axis_idx] = h_min + (up - h_min) * scale
+    cross = [i for i in range(3) if i not in (up_axis_idx, depth_axis_idx)][0]
+    c_center = verts[:, cross].mean()
+    verts[:, cross] = c_center + (verts[:, cross] - c_center) * scale
+
+    mesh.vertices = verts
+    print(f"📐 깊이 원근 보정: ratio={ratio:.2f}, "
+          f"앞쪽={'-' if front_is_low else '+'}축 끝, "
+          f"s_front={s_front:.2f}, s_back={s_back:.2f}")
+    return mesh
+
+
 def apply_perspective_correction(mesh, ratio: float, up_axis_idx=1):
     """
     원근감(위에서 내려다보거나 뒤로 가면서 좁아진 사다리꼴 왜곡)을 역보정하여
     평행한 직육면체 기둥 형태로 펴준다.
-    ratio: 앞박스 너비 / 뒷박스 너비 (예: 1.35)
+    ratio: 앞박스 너비 / 뒷박스 너비 (안전을 위해 0.8 ~ 1.35 범위로 제한)
     """
-    if abs(ratio - 1.0) < 0.02:
+    clamped_ratio = max(0.8, min(1.35, ratio))
+    if abs(clamped_ratio - 1.0) < 0.02:
         return mesh
 
     verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
@@ -140,47 +189,53 @@ def apply_perspective_correction(mesh, ratio: float, up_axis_idx=1):
     center_hor = verts[:, hor].mean(axis=0)
 
     # 높이 t (0.0 바닥 ~ 1.0 꼭대기)
-    # 위에서 내려다본 사진의 경우, 바닥(하층부)이 멀어서 작아졌으므로
-    # h가 낮을수록(바닥일수록) ratio만큼 더 크게 확장해야 함
     t = (h_max - h) / H  # 바닥(멀어서 축소됨)에 가까울수록 t=1.0
 
-    # 스케일 인자: 꼭대기는 1.0, 바닥은 ratio배로 점진적 확장
-    scales = 1.0 + (ratio - 1.0) * t[:, np.newaxis]
+    # 스케일 인자: 꼭대기는 1.0, 바닥은 clamped_ratio배로 확장
+    scales = 1.0 + (clamped_ratio - 1.0) * t[:, np.newaxis]
     verts[:, hor] = center_hor + (verts[:, hor] - center_hor) * scales
 
     mesh.vertices = verts
-    print(f"📐 원근 왜곡 역보정 적용: 비율 {ratio:.2f}배 (바닥 수평 스케일 확장)")
+    print(f"📐 원근 왜곡 역보정 적용: 입력 비율={ratio:.2f} -> 안전 보정치={clamped_ratio:.2f}배")
     return mesh
 
-def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS, apply_tilt_fix: bool = True, perspective_ratio: float | None = None):
-    extents = mesh.bounds[1] - mesh.bounds[0]
-    tallest_axis = int(np.argmax(extents))
-
-    if tallest_axis == 2:
-        rot = trimesh.transformations.rotation_matrix(
-            angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
-        )
-        mesh.apply_transform(rot)
-    elif tallest_axis == 0:
-        rot = trimesh.transformations.rotation_matrix(
-            angle=np.radians(90), direction=[0, 0, 1], point=mesh.centroid
-        )
-        mesh.apply_transform(rot)
+def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS,
+                   apply_tilt_fix: bool = True, perspective_ratio: float | None = None,
+                   persp_s_front: float | None = None, persp_s_back: float | None = None,
+                   persp_strength: float = 0.8):
+    # 🌟 TripoSR 메쉬의 높이 방향 축은 항상 Z(인덱스 2)입니다.
+    # 건물이 가로로 아무리 넓어도(마리나베이샌즈 340m 가로 > 200m 세로),
+    # 높이 축이 가로축(X)으로 바뀌는 것이 아니므로,
+    # np.argmax(extents)로 높이를 추측하면 가로로 넓은 건물이 90도 옆으로 누워버립니다!
+    # 따라서 TripoSR 메쉬의 Z축을 Unity/웹의 Y축(높이)으로 일관되게 회전(-90도 X축 회전)시킵니다.
+    rot = trimesh.transformations.rotation_matrix(
+        angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
+    )
+    mesh.apply_transform(rot)
 
     mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
     mesh.apply_transform(mirror)
     mesh.invert()
 
-    print(f"📏 축 보정: extents={extents}, tallest_axis={tallest_axis}")
+    extents = mesh.bounds[1] - mesh.bounds[0]
+    print(f"📏 일관된 TripoSR 축 정렬 완료: extents={extents} (X:가로, Y:높이, Z:깊이)")
 
     # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
     #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
     if apply_tilt_fix and APPLY_TILT_FIX:
         mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
 
-    # 🌟 원근 왜곡(사다리꼴 수축) 역보정
+    # 🌟 원근 왜곡 역보정 (깊이 구간별 보정 우선 적용)
     if perspective_ratio and perspective_ratio > 0.1:
-        mesh = apply_perspective_correction(mesh, ratio=perspective_ratio, up_axis_idx=1)
+        ratio = max(1.0, perspective_ratio)                    # 축소 방향 금지
+        ratio_eff = 1.0 + (ratio - 1.0) * persp_strength       # 과보정 완화
+        if persp_s_front is not None and persp_s_back is not None:
+            mesh = apply_depth_perspective_correction(
+                mesh, ratio_eff, persp_s_front, persp_s_back,
+                depth_axis_idx=0, up_axis_idx=1,
+            )
+        else:
+            mesh = apply_perspective_correction(mesh, ratio=ratio_eff, up_axis_idx=1)
 
     mesh_height_raw = mesh.bounds[1][1] - mesh.bounds[0][1]
     if mesh_height_raw <= 0:
@@ -434,6 +489,9 @@ async def extract_3d_csv(
     realHeightMeters: float = Form(...),
     applyTiltFix: bool = Form(True),
     perspectiveRatio: float | None = Form(None),
+    perspectiveSFront: float | None = Form(None),
+    perspectiveSBack: float | None = Form(None),
+    perspectiveStrength: float = Form(0.8),
     # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
     roofTL: float | None = Form(None),
     roofTR: float | None = Form(None),
@@ -463,7 +521,12 @@ async def extract_3d_csv(
     mesh = get_mesh_from_colab(crop_bytes)
     print(f"✅ 메시 수신 완료 (vertices={len(mesh.vertices)}, faces={len(mesh.faces)})")
 
-    raw_blocks = mesh_to_blocks(mesh, real_height_m=realHeightMeters, apply_tilt_fix=applyTiltFix, perspective_ratio=perspectiveRatio)
+    raw_blocks = mesh_to_blocks(
+        mesh, real_height_m=realHeightMeters, apply_tilt_fix=applyTiltFix,
+        perspective_ratio=perspectiveRatio,
+        persp_s_front=perspectiveSFront, persp_s_back=perspectiveSBack,
+        persp_strength=perspectiveStrength,
+    )
 
     # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
     corner_heights = None

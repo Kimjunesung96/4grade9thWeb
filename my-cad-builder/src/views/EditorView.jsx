@@ -372,8 +372,31 @@ export default function EditorView({
     const w1 = Math.abs(refBoxFront.endX - refBoxFront.startX);
     const w2 = refBoxBack.width;
     if (w1 <= 5 || w2 <= 5) return null;
-    return Math.round((w1 / w2) * 100) / 100;
+    return Math.max(1, Math.round((w1 / w2) * 100) / 100); // 뒷박스가 더 크면 1 (보정 안 함)
   }, [refBoxFront, refBoxBack]);
+
+  // 🌟 앞/뒤 구간 위치 (크롭 박스 대비 0~1 비율 변환, 0 = 앞박스 쪽 끝)
+  const perspectiveDepth = useMemo(() => {
+    if (!refBoxFront || !refBoxBack || !box || !perspectiveRatio) return null;
+    const cropL = Math.min(box.startX, box.endX);
+    const cropW = Math.abs(box.endX - box.startX);
+    if (cropW < 10) return null;
+
+    const fL = Math.min(refBoxFront.startX, refBoxFront.endX);
+    const fR = Math.max(refBoxFront.startX, refBoxFront.endX);
+    const bL = refBoxBack.x;
+    const bR = refBoxBack.x + refBoxBack.width;
+
+    const u = (px) => Math.min(1, Math.max(0, (px - cropL) / cropW));
+    const frontIsLeft = (fL + fR) / 2 <= (bL + bR) / 2;
+
+    return {
+      sFront: frontIsLeft ? u(fR) : 1 - u(fL),
+      sBack: frontIsLeft ? u(bL) : 1 - u(bR),
+    };
+  }, [refBoxFront, refBoxBack, box, perspectiveRatio]);
+
+  const [perspectiveStrength, setPerspectiveStrength] = useState(0.8); // 🌟 보정 강도 (기본 0.8)
 
   const handleCopyBackBox = () => {
     if (!refBoxFront) return;
@@ -590,6 +613,11 @@ export default function EditorView({
       formData.append('realHeightMeters', realHeightMeters);
       formData.append('applyTiltFix', applyTiltFix);
       if (perspectiveRatio) formData.append('perspectiveRatio', perspectiveRatio);
+      if (perspectiveDepth) {
+        formData.append('perspectiveSFront', perspectiveDepth.sFront);
+        formData.append('perspectiveSBack', perspectiveDepth.sBack);
+      }
+      formData.append('perspectiveStrength', perspectiveStrength);
 
       // 🌟 지붕 A/B/C/D 4개 값이 전부 입력돼 있으면, 추정 시 받은 original_position(TL/TR/BL/BR)
       //    매핑을 그대로 이용해 서버가 기대하는 roofTL/TR/BL/BR 슬롯에 넣어 보낸다.
@@ -858,7 +886,10 @@ export default function EditorView({
                       }));
                     } else if (backDragState.type === 'resize') {
                       const aspect = backDragState.origH / Math.max(1, backDragState.origW);
-                      const newW = Math.max(15, backDragState.origW + dx);
+                      const maxW = refBoxFront
+                        ? Math.abs(refBoxFront.endX - refBoxFront.startX)
+                        : Infinity;
+                      const newW = Math.min(maxW, Math.max(15, backDragState.origW + dx));
                       setRefBoxBack(prev => ({
                         ...prev,
                         width: newW,
@@ -1011,13 +1042,27 @@ export default function EditorView({
                       </div>
 
                       {perspectiveRatio ? (
-                        <div className="flex items-center gap-2 bg-white px-3 py-1 rounded-xl border border-indigo-200 shadow-sm text-xs font-bold text-indigo-700">
+                        <div className="flex flex-wrap items-center gap-2 bg-white px-3 py-1 rounded-xl border border-indigo-200 shadow-sm text-xs font-bold text-indigo-700">
                           <span className="text-emerald-600">① 앞: {Math.round(Math.abs(refBoxFront.endX - refBoxFront.startX))}px</span>
                           <span className="text-gray-400">➔</span>
                           <span className="text-purple-600">② 뒤: {Math.round(refBoxBack.width)}px</span>
                           <span className="bg-indigo-600 text-white px-2 py-0.5 rounded-md font-extrabold ml-1">
                             원근 보정 {perspectiveRatio}x
                           </span>
+                          <div className="flex items-center gap-1.5 ml-2 border-l pl-2.5 border-indigo-200">
+                            <span className="text-gray-500 font-medium">강도:</span>
+                            <input
+                              type="range"
+                              min="0"
+                              max="1"
+                              step="0.05"
+                              value={perspectiveStrength}
+                              onChange={(e) => setPerspectiveStrength(Number(e.target.value))}
+                              className="w-16 h-1 bg-indigo-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                              title={`보정 강도: ${Math.round(perspectiveStrength * 100)}%`}
+                            />
+                            <span className="text-indigo-900 w-7 text-right">{Math.round(perspectiveStrength * 100)}%</span>
+                          </div>
                         </div>
                       ) : (
                         <span className="text-xs text-indigo-500 font-medium">
