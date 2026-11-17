@@ -226,10 +226,11 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
     # 높이 축이 가로축(X)으로 바뀌는 것이 아니므로,
     # np.argmax(extents)로 높이를 추측하면 가로로 넓은 건물이 90도 옆으로 누워버립니다!
     # 따라서 TripoSR 메쉬의 Z축을 Unity/웹의 Y축(높이)으로 일관되게 회전(-90도 X축 회전)시킵니다.
-    rot = trimesh.transformations.rotation_matrix(
-        angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
-    )
-    mesh.apply_transform(rot)
+    print("raw extents:", mesh.bounds[1] - mesh.bounds[0])
+    #rot = trimesh.transformations.rotation_matrix(
+     #   angle=np.radians(-90), direction=[1, 0, 0], point=mesh.centroid
+    #)
+    #mesh.apply_transform(rot)
 
     mirror = trimesh.transformations.scale_matrix(-1, direction=[0, 0, 1], origin=mesh.centroid)
     mesh.apply_transform(mirror)
