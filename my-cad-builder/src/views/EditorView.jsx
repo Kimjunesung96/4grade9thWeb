@@ -393,6 +393,7 @@ export default function EditorView({
     return {
       sFront: frontIsLeft ? u(fR) : 1 - u(fL),
       sBack: frontIsLeft ? u(bL) : 1 - u(bR),
+      frontIsLeft,  // ✅ 사용자가 지정한 앞뒤 방향을 백엔드에 전달
     };
   }, [refBoxFront, refBoxBack, box, perspectiveRatio]);
 
@@ -616,6 +617,8 @@ export default function EditorView({
       if (perspectiveDepth) {
         formData.append('perspectiveSFront', perspectiveDepth.sFront);
         formData.append('perspectiveSBack', perspectiveDepth.sBack);
+        // ✅ 사용자 지정 앞뒤 방향을 백엔드에 전달 (AI 추정 대신 사용자 선택 100% 신뢰)
+        formData.append('perspectiveFrontIsLeft', perspectiveDepth.frontIsLeft ? 'true' : 'false');
       }
       formData.append('perspectiveStrength', perspectiveStrength);
 

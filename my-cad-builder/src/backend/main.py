@@ -42,11 +42,13 @@ def get_mesh_from_colab(img_bytes: bytes) -> trimesh.Trimesh:
         params={
             "flatten_roof": "false",
             "snap_grid": "false",
-            "fix_perspective": "false",  # 🌟 콜랍의 OpenCV 2D 왜곡 보정이 원본 이미지를 비틀지 않도록 비활성화
+            "fix_perspective": "false",
             "fix_tilt": "false",
         },
         timeout=180,
     )
+    if not resp.ok:
+        print(f"❌ 콜랍 서버 에러 응답 ({resp.status_code}): {resp.text}")
     resp.raise_for_status()
 
     mesh = trimesh.load(io.BytesIO(resp.content), file_type="glb")
@@ -128,7 +130,15 @@ def straighten_tilt(mesh, up_axis_idx=1, mode="shear", low=0.2, high=0.8,
 
 
 def apply_depth_perspective_correction(mesh, ratio, s_front, s_back,
-                                       depth_axis_idx=0, up_axis_idx=1):
+                                       depth_axis_idx=2, up_axis_idx=1,
+                                       front_is_left=None):
+    """
+    사용자가 지정한 앞/뒤 박스 위치를 100% 신뢰하여 높이(Y축)만 보정.
+    - depth_axis_idx=2 : 회전 후 Z축이 카메라 깊이 방향 (X는 좌우, Y는 높이)
+    - front_is_left : 프론트엔드에서 계산한 frontIsLeft 를 그대로 받아 사용.
+                      None이면 메쉬 높이로 추정 (레거시 폴백).
+    - 수평 단면(cross축)은 건드리지 않는다 — 타워 두께 뚱뚱 현상 방지.
+    """
     if abs(ratio - 1.0) < 0.02:
         return mesh
 
@@ -137,35 +147,42 @@ def apply_depth_perspective_correction(mesh, ratio, s_front, s_back,
     d_min, d_max = d.min(), d.max()
     D = max(d_max - d_min, 1e-6)
 
-    # 앞쪽 끝이 -축인지 +축인지: 양 끝 25% 구간 높이 비교 (큰 쪽이 앞)
-    up = verts[:, up_axis_idx]
-    lo_mask = d <= d_min + 0.25 * D
-    hi_mask = d >= d_max - 0.25 * D
-    if not lo_mask.any() or not hi_mask.any():
-        return mesh
-    front_is_low = np.percentile(up[lo_mask], 90) >= np.percentile(up[hi_mask], 90)
+    # 앞쪽 판정: 사용자가 지정했으면 그대로, 없으면 메쉬 높이 비교(폴백)
+    if front_is_left is None:
+        up = verts[:, up_axis_idx]
+        lo_mask = d <= d_min + 0.25 * D
+        hi_mask = d >= d_max - 0.25 * D
+        if not lo_mask.any() or not hi_mask.any():
+            return mesh
+        # 낮은-d 끝이 높으면 그쪽이 앞
+        front_is_low = np.percentile(up[lo_mask], 90) >= np.percentile(up[hi_mask], 90)
+    else:
+        # frontIsLeft=True  → 앞박스 중심 X 가 뒷박스보다 작음 → 메쉬 X 작은 쪽이 앞
+        # depth_axis_idx=2(Z) 기준: 앞이 Z 작은 쪽인지 큰 쪽인지는
+        # EditorView가 s_front/s_back을 크롭 왼쪽→오른쪽(X 화면좌표)으로 계산하므로
+        # Z축 깊이에 대해 별도 판정이 필요 없다.
+        # 사용자 s_front/s_back은 이미 "0=앞, 1=뒤"로 정규화돼 있으므로 그대로 쓴다.
+        front_is_low = True  # s 방향을 그대로 사용하겠다는 의미 (아래 로직에서 반전 없음)
 
-    # 앞쪽 끝 기준 깊이 s (0 = 맨 앞, 1 = 맨 뒤)
+    # 앞쪽 기준 깊이 s (0 = 맨 앞, 1 = 맨 뒤)
     s = (d - d_min) / D
     if not front_is_low:
         s = 1.0 - s
 
-    # 앞~뒤 박스 사이 진행도 t (범위 밖은 clamp)
+    # 앞~뒤 박스 사이 진행도 t
     if s_back - s_front < 0.05:
         s_front, s_back = 0.0, 1.0
     t = np.clip((s - s_front) / (s_back - s_front), 0.0, 1.0)
     scale = 1.0 + (ratio - 1.0) * t
 
-    # 높이(바닥 기준) + 단면(깊이축 제외 수평축) 스케일
+    # ✅ 높이(Y축, 바닥 기준)만 스케일 — 수평 단면은 건드리지 않는다
+    up = verts[:, up_axis_idx]
     h_min = up.min()
     verts[:, up_axis_idx] = h_min + (up - h_min) * scale
-    cross = [i for i in range(3) if i not in (up_axis_idx, depth_axis_idx)][0]
-    c_center = verts[:, cross].mean()
-    verts[:, cross] = c_center + (verts[:, cross] - c_center) * scale
 
     mesh.vertices = verts
-    print(f"📐 깊이 원근 보정: ratio={ratio:.2f}, "
-          f"앞쪽={'-' if front_is_low else '+'}축 끝, "
+    print(f"📐 깊이 원근 보정(Y축 전용): ratio={ratio:.2f}, "
+          f"depth_axis={depth_axis_idx}, front_is_low={front_is_low}, "
           f"s_front={s_front:.2f}, s_back={s_back:.2f}")
     return mesh
 
@@ -202,7 +219,8 @@ def apply_perspective_correction(mesh, ratio: float, up_axis_idx=1):
 def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int = MAX_BLOCKS,
                    apply_tilt_fix: bool = True, perspective_ratio: float | None = None,
                    persp_s_front: float | None = None, persp_s_back: float | None = None,
-                   persp_strength: float = 0.8):
+                   persp_strength: float = 0.8,
+                   persp_front_is_left: bool | None = None):
     # 🌟 TripoSR 메쉬의 높이 방향 축은 항상 Z(인덱스 2)입니다.
     # 건물이 가로로 아무리 넓어도(마리나베이샌즈 340m 가로 > 200m 세로),
     # 높이 축이 가로축(X)으로 바뀌는 것이 아니므로,
@@ -221,18 +239,20 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
     print(f"📏 일관된 TripoSR 축 정렬 완료: extents={extents} (X:가로, Y:높이, Z:깊이)")
 
     # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
-    #    (균등 스케일이라 스케일링 전/후 어디서 해도 결과 동일)
+    #    비대칭 캔틸레버 건물(MBS 등)은 이 보정이 오히려 왜곡시키므로
+    #    max_deg를 15도로 타이트하게 클램프한다.
     if apply_tilt_fix and APPLY_TILT_FIX:
-        mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear")
+        mesh = straighten_tilt(mesh, up_axis_idx=1, mode="shear", max_deg=15.0)
 
-    # 🌟 원근 왜곡 역보정 (깊이 구간별 보정 우선 적용)
+    # 🌟 원근 왜곡 역보정 (사용자가 지정한 앞/뒤 박스 기반, Y축 높이만 보정)
     if perspective_ratio and perspective_ratio > 0.1:
         ratio = max(1.0, perspective_ratio)                    # 축소 방향 금지
         ratio_eff = 1.0 + (ratio - 1.0) * persp_strength       # 과보정 완화
         if persp_s_front is not None and persp_s_back is not None:
             mesh = apply_depth_perspective_correction(
                 mesh, ratio_eff, persp_s_front, persp_s_back,
-                depth_axis_idx=0, up_axis_idx=1,
+                depth_axis_idx=2, up_axis_idx=1,              # ✅ Z축이 깊이, Y축이 높이
+                front_is_left=persp_front_is_left,            # ✅ 사용자 지정 앞뒤 방향
             )
         else:
             mesh = apply_perspective_correction(mesh, ratio=ratio_eff, up_axis_idx=1)
@@ -492,6 +512,7 @@ async def extract_3d_csv(
     perspectiveSFront: float | None = Form(None),
     perspectiveSBack: float | None = Form(None),
     perspectiveStrength: float = Form(0.8),
+    perspectiveFrontIsLeft: str | None = Form(None),  # "true" / "false" 문자열로 수신
     # 🌟 지붕 모서리 4개 높이(미터) — 상세입력 안 하면 전부 None → 평지붕 기본값
     roofTL: float | None = Form(None),
     roofTR: float | None = Form(None),
@@ -526,6 +547,7 @@ async def extract_3d_csv(
         perspective_ratio=perspectiveRatio,
         persp_s_front=perspectiveSFront, persp_s_back=perspectiveSBack,
         persp_strength=perspectiveStrength,
+        persp_front_is_left=(perspectiveFrontIsLeft == "true") if perspectiveFrontIsLeft is not None else None,
     )
 
     # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
