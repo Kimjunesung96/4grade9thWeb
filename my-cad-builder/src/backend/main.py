@@ -220,12 +220,13 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
                    apply_tilt_fix: bool = True, perspective_ratio: float | None = None,
                    persp_s_front: float | None = None, persp_s_back: float | None = None,
                    persp_strength: float = 0.8,
-                   persp_front_is_left: bool | None = None):
-    # 🌟 TripoSR 메쉬의 높이 방향 축은 항상 Z(인덱스 2)입니다.
-    # 건물이 가로로 아무리 넓어도(마리나베이샌즈 340m 가로 > 200m 세로),
-    # 높이 축이 가로축(X)으로 바뀌는 것이 아니므로,
-    # np.argmax(extents)로 높이를 추측하면 가로로 넓은 건물이 90도 옆으로 누워버립니다!
-    # 따라서 TripoSR 메쉬의 Z축을 Unity/웹의 Y축(높이)으로 일관되게 회전(-90도 X축 회전)시킵니다.
+                   persp_front_is_left: bool | None = None,
+                   crop_aspect: float = 1.0):
+    """
+    crop_aspect = 크롭 높이 / 크롭 너비.
+      > 1.0 : 세로가 긴 사진 (피사탑 등) → 최종 메쉬에서 Y가 가장 긴 축이어야 함
+      < 1.0 : 가로가 긴 사진 (MBS 등)   → X가 Y보다 길어도 허용
+    """
     extents_raw = mesh.bounds[1] - mesh.bounds[0]
     print(f"📏 raw TripoSR extents: {extents_raw}")
 
@@ -242,7 +243,27 @@ def mesh_to_blocks(mesh: trimesh.Trimesh, real_height_m: float, max_blocks: int 
     mesh.invert()
 
     extents = mesh.bounds[1] - mesh.bounds[0]
-    print(f"📏 축 정렬 완료: extents={extents} (X:가로, Y:높이, Z:깊이)")
+    print(f"📏 1차 축 정렬 완료: extents={extents}")
+
+    # 🌟 자동 축 보정: 세로가 긴 사진인데 Y가 가장 긴 축이 아니면 추가 회전
+    # (TripoSR이 가끔 건물을 X방향으로 눕혀서 출력하는 버그 대응)
+    if crop_aspect > 1.1:  # 세로가 가로보다 10% 이상 긴 사진
+        longest = int(np.argmax(extents))
+        if longest == 0:  # X가 가장 길면: Rz(-90)로 X→Y 변환
+            rot2 = trimesh.transformations.rotation_matrix(
+                angle=np.radians(-90), direction=[0, 0, 1], point=mesh.centroid
+            )
+            mesh.apply_transform(rot2)
+            print(f"📏 자동 보정: X->Y 축 교체 (Rz-90)")
+        elif longest == 2:  # Z가 가장 길면: Rx(90)로 Z→Y 변환
+            rot2 = trimesh.transformations.rotation_matrix(
+                angle=np.radians(90), direction=[1, 0, 0], point=mesh.centroid
+            )
+            mesh.apply_transform(rot2)
+            print(f"📏 자동 보정: Z->Y 축 교체 (Rx+90)")
+
+    extents = mesh.bounds[1] - mesh.bounds[0]
+    print(f"📏 최종 축 정렬: extents={extents} (X:가로, Y:높이, Z:깊이)")
 
     # 🌟 기울기(쏠림) 보정: 여기서는 축 정리가 끝나 y가 높이인 상태라 축을 추측할 필요가 없다.
     #    비대칭 캔틸레버 건물(MBS 등)은 이 보정이 오히려 왜곡시키므로
@@ -540,6 +561,12 @@ async def extract_3d_csv(
     ex, ey = min(image.width, int(endX)), min(image.height, int(endY))
     cropped = image.crop((sx, sy, ex, ey))
 
+    # 크롭 종횡비 계산 (세로/가로): > 1 이면 세로가 긴 사진 (피사탑 등)
+    crop_w = max(1, ex - sx)
+    crop_h = max(1, ey - sy)
+    crop_aspect = crop_h / crop_w
+    print(f"📐 크롭 종횡비: {crop_aspect:.2f} ({'세로가 긴 사진' if crop_aspect > 1.1 else '가로가 긴 사진' if crop_aspect < 0.9 else '정방형에 가까운 사진'})")
+
     crop_bytes_io = io.BytesIO()
     cropped.save(crop_bytes_io, format="PNG")
     crop_bytes = crop_bytes_io.getvalue()
@@ -554,6 +581,7 @@ async def extract_3d_csv(
         persp_s_front=perspectiveSFront, persp_s_back=perspectiveSBack,
         persp_strength=perspectiveStrength,
         persp_front_is_left=(perspectiveFrontIsLeft == "true") if perspectiveFrontIsLeft is not None else None,
+        crop_aspect=crop_aspect,
     )
 
     # 🌟 지붕 보정: 4개 값이 모두 들어오면 상세 보간, 하나라도 비어있으면 평지붕 기본값
