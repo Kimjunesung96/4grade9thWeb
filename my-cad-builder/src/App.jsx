@@ -246,6 +246,30 @@ export default function App() {
     setCommentInput('');
   };
 
+  const handleDeleteBlueprint = async (bpId) => {
+    if (!window.confirm("정말로 이 게시물(도면)을 삭제하시겠습니까?\n삭제 후에는 복구할 수 없습니다.")) return;
+
+    try {
+      // 1. 좋아요 및 댓글 먼저 정리 (외래키 제약조건 대비)
+      await supabase.from('likes').delete().eq('blueprint_id', bpId);
+      await supabase.from('comments').delete().eq('blueprint_id', bpId);
+
+      // 2. 본 게시물(도면) 삭제
+      const { error } = await supabase.from('blueprints').delete().eq('id', bpId);
+      if (error) {
+        alert("삭제 실패: " + error.message);
+        return;
+      }
+
+      alert("게시물이 성공적으로 삭제되었습니다.");
+      setSelectedBp(null);
+      await fetchBlueprints();
+      handleSetView('dashboard');
+    } catch (err) {
+      alert("삭제 중 오류가 발생했습니다: " + err.message);
+    }
+  };
+
   return (
     <>
       {/* 🌟 커스텀 업로드 모달 팝업 */}
@@ -352,6 +376,7 @@ export default function App() {
           onLikeToggle={() => handleLikeToggle(selectedBp.id)}
           onAddComment={() => handleAddComment(selectedBp.id)}
           isOwner={selectedBp.user_id === user?.id}   // ← 추가
+          onDeleteBlueprint={() => handleDeleteBlueprint(selectedBp.id)}
           onEditBlueprint={() => {
             setGrid(selectedBp.grid_data || Array(50).fill().map(() => Array(50).fill(0)));
             setHistory([]);

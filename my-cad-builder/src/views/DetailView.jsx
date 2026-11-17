@@ -45,7 +45,8 @@ export default function DetailView({
   onLikeToggle,
   onAddComment,
   onEditBlueprint,
-  isOwner = true
+  onDeleteBlueprint,
+  isOwner = false
 }) {
   // 하중 테스트 결과 업로드 팝업
   const [stressOpen, setStressOpen] = useState(false);
@@ -110,8 +111,19 @@ export default function DetailView({
           <div className="h-6 w-[1px] bg-gray-200" />
           <h2 className="text-xl font-black text-gray-900">{selectedBp.name}</h2>
         </div>
-        <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
-          설계도 뷰어 모드
+        <div className="flex items-center space-x-3">
+          {isOwner && onDeleteBlueprint && (
+            <button
+              onClick={onDeleteBlueprint}
+              className="px-3.5 py-1.5 bg-red-50 text-red-600 border border-red-200 hover:bg-red-600 hover:text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center space-x-1"
+              title="이 게시물 삭제하기"
+            >
+              <span>🗑️</span> <span>삭제</span>
+            </button>
+          )}
+          <div className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full">
+            설계도 뷰어 모드
+          </div>
         </div>
       </header>
 
@@ -219,6 +231,11 @@ export default function DetailView({
             {is3D && (
               <button onClick={() => setStressOpen(true)} className="w-full p-4 bg-white text-gray-800 border border-gray-300 rounded-xl text-sm font-bold hover:bg-gray-50 shadow-sm transition-all">
                 🧪 하중 테스트 결과 업로드 · AI 분석
+              </button>
+            )}
+            {isOwner && onDeleteBlueprint && (
+              <button onClick={onDeleteBlueprint} className="w-full p-3.5 bg-red-50 text-red-600 border border-red-200 rounded-xl text-xs font-bold hover:bg-red-600 hover:text-white transition-all shadow-sm flex items-center justify-center space-x-1">
+                <span>🗑️</span> <span>이 게시물(도면) 삭제하기</span>
               </button>
             )}
           </div>
