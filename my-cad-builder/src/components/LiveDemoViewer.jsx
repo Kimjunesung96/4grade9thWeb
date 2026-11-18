@@ -190,7 +190,7 @@ function FixedCornerGizmo({ rotationQuat, onRotationChange }) {
 }
 
 export default function LiveDemoViewer({
-  grid = null, data = null, mode = 'static', maxBlocks = 10000,
+  grid = null, data = null, mode = 'static', maxBlocks = 10000, warnThreshold = 10000,
   rotationQuat = [0, 0, 0, 1], onRotationChange = null, enableGizmo = false
 }) {
   // 🌟 배경색 밝기 슬라이더: 0(완전 검정) ~ 100(완전 흰색), 기본값 10(차분한 다크톤)
@@ -230,25 +230,33 @@ export default function LiveDemoViewer({
       blocks = data;
     }
 
-    if (blocks.length > maxBlocks) {
-      return blocks.slice(0, maxBlocks);
-    }
+    // ⭐ 10,000개 이상도 임의로 자르지 않고 전체 렌더링 (경고만 UI로 표시)
     return blocks;
-  }, [grid, data, maxBlocks]);
+  }, [grid, data]);
+
+  const threshold = warnThreshold || maxBlocks || 10000;
+  const isHighBlockCount = displayData.length >= threshold;
 
   const center = useMemo(() => getBlocksCenter(displayData), [displayData]);
 
   return (
     <div className="w-full h-full min-h-[400px] bg-gray-900 rounded-2xl overflow-hidden relative shadow-inner">
-      <div className="absolute top-4 left-4 z-10 bg-black/60 backdrop-blur-sm text-white px-4 py-2 rounded-xl text-sm font-bold flex flex-col gap-1">
+      <div className="absolute top-4 left-4 z-10 bg-black/60 backdrop-blur-sm text-white px-4 py-2.5 rounded-xl text-sm font-bold flex flex-col gap-1.5 border border-white/10 shadow-lg">
         <span className="text-blue-400">
           {mode === 'realtime' ? '🟢 실시간 에디터 모드' : '🌐 갤러리 감상 모드'}
         </span>
-        <span>
-          블록 렌더링: <span className={displayData.length >= maxBlocks ? "text-red-400" : "text-green-400"}>
-            {displayData.length.toLocaleString()}
-          </span> / {maxBlocks.toLocaleString()} MAX
-        </span>
+        <div className="flex items-center gap-1.5">
+          <span>블록 렌더링:</span>
+          <span className={isHighBlockCount ? "text-amber-400 font-extrabold" : "text-green-400 font-extrabold"}>
+            {displayData.length.toLocaleString()}개
+          </span>
+        </div>
+        {isHighBlockCount && (
+          <div className="text-[11px] text-amber-300 font-medium flex items-center gap-1 bg-amber-500/20 px-2 py-0.5 rounded border border-amber-500/30">
+            <span>⚠️</span>
+            <span>{threshold.toLocaleString()}개 이상 (저사양 환경 렉 주의)</span>
+          </div>
+        )}
       </div>
 
       {/* 🌟 배경색 밝기 슬라이더 (검은색 ~ 흰색 드래그 조절) */}
