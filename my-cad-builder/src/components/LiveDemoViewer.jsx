@@ -193,6 +193,13 @@ export default function LiveDemoViewer({
   grid = null, data = null, mode = 'static', maxBlocks = 10000,
   rotationQuat = [0, 0, 0, 1], onRotationChange = null, enableGizmo = false
 }) {
+  // 🌟 배경색 밝기 슬라이더: 0(완전 검정) ~ 100(완전 흰색), 기본값 10(차분한 다크톤)
+  const [bgBrightness, setBgBrightness] = useState(10);
+
+  const bgColor = useMemo(() => {
+    const v = Math.round((bgBrightness / 100) * 255);
+    return `rgb(${v}, ${v}, ${v})`;
+  }, [bgBrightness]);
 
   const displayData = useMemo(() => {
     let blocks = [];
@@ -244,6 +251,25 @@ export default function LiveDemoViewer({
         </span>
       </div>
 
+      {/* 🌟 배경색 밝기 슬라이더 (검은색 ~ 흰색 드래그 조절) */}
+      <div
+        className="absolute bottom-4 left-4 z-10 bg-black/60 backdrop-blur-md text-white px-3 py-1.5 rounded-xl text-xs flex items-center gap-2.5 border border-white/10 shadow-lg select-none"
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <span className="text-sm" title="검은색">🌑</span>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          value={bgBrightness}
+          onChange={(e) => setBgBrightness(Number(e.target.value))}
+          className="w-24 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+          title="배경 밝기 조절 (0%: 검정 ~ 100%: 흰색)"
+        />
+        <span className="text-sm" title="흰색">⚪</span>
+        <span className="text-[11px] text-gray-300 w-8 text-right font-mono font-bold">{bgBrightness}%</span>
+      </div>
+
       <div className="absolute bottom-4 right-4 z-10 bg-black/60 backdrop-blur-sm text-gray-300 px-3 py-1 rounded-lg text-xs">
         {enableGizmo
           ? '우측 상단 미니 기즈모 드래그: 회전 | 좌클릭(빈공간): 시점회전 | 휠: 확대/축소'
@@ -255,7 +281,7 @@ export default function LiveDemoViewer({
       )}
 
       <Canvas camera={{ position: [50, 50, 50], fov: 45 }} gl={{ preserveDrawingBuffer: true }}>
-        <color attach="background" args={['#0f172a']} />
+        <color attach="background" args={[bgColor]} />
         <ambientLight intensity={0.6} />
         <directionalLight position={[20, 40, 20]} intensity={1.5} castShadow />
         {/* 🌟 environment={null} 을 추가하여 깃허브에서 HDR 조명 파일을 다운로드하지 않도록 강제 차단 (429 에러 방지) */}
